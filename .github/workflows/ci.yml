@@ -1,20 +1,91 @@
+# PR validation: lint, typecheck, test. Each job fans out through the shared
+# reusable-setup workflow and only runs when files it cares about changed (the
+# `changes` gate). `ci-pass` is the one status check branch protection requires.
+#
+# Scaffolded by the `sdlc` plugin (/sdlc:init), node-bun shape.
 name: CI
+
 on:
+  # No `branches:` filter (spec.md pattern 1): it filters on the PR's BASE, so a
+  # stacked PR would skip CI and report clean. `edited` fires when a PR's base
+  # changes, so a retargeted stacked PR re-runs.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
+  # main is validated after merge too, so a tag is never cut from a red tree.
   push:
     branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
 jobs:
-  check:
+  # Always-runs path gate. A docs-only PR runs nothing heavy and still goes green;
+  # a required check is always satisfied (unlike top-level paths-ignore).
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 2
+    # paths-filter lists PR files through the API, which needs pull-requests: read
+    # (job-level permissions replace the workflow block). On push it diffs locally,
+    # so it also needs the checkout.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
         with:
-          bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
-      - run: bun run lint
-      - run: bun run typecheck
-      - run: bun test
+          # 'every' is required for exclusion-only filters: under 'some', a root
+          # .md file would still match and mark a docs-only PR as code.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!LICENSE'
+              - '!.editorconfig'
+
+  lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      command: "bun run lint"
+
+  typecheck:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      command: "bun run typecheck"
+
+  test:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      command: "bun test"
+
+  # Enforcement aggregator (spec.md pattern 2). Needs EVERY job, including the
+  # gate: a failed gate makes downstream jobs report `skipped`, which would
+  # otherwise read as OK. Skipped is accepted so docs-only PRs stay satisfiable.
+  ci-pass:
+    needs: [changes, lint, typecheck, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify all required jobs passed
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "dependency results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "A required job did not pass."; exit 1
+            fi
+          done
