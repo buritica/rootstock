@@ -1,0 +1,31 @@
+{
+  "name": "@buritica/rootstock",
+  "version": "0.0.1",
+  "description": "Shared capabilities for Bun + Postgres knowledge systems: ingestion, chunking, embeddings, retrieval, judgments, and the goldens that prove extractions change nothing.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "repository": "github:buritica/rootstock",
+  "engines": {
+    "bun": ">=1.3"
+  },
+  "files": [
+    "src",
+    "!src/**/*.test.ts"
+  ],
+  "exports": {
+    "./golden": "./src/golden/index.ts",
+    "./golden/bun-test": "./src/golden/bun-test.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}
