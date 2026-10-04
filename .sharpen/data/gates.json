@@ -1,0 +1,39 @@
+{
+  "chore/sdlc-init": {
+    "tier": "small-medium",
+    "created_at": "2026-10-03T23:59:25.544238+00:00",
+    "gates": {
+      "simplify": "2026-10-03T23:59:25.946591+00:00",
+      "grumpy-review": "2026-10-03T23:59:26.023696+00:00",
+      "grumpy-fix-post-review": "2026-10-03T23:59:26.085708+00:00",
+      "grumpy-imagine": "2026-10-03T23:59:26.139708+00:00",
+      "grumpy-fix-post-imagine": "2026-10-03T23:59:26.197515+00:00",
+      "tests": "2026-10-03T23:59:26.252978+00:00",
+      "lint": "2026-10-03T23:59:37.653012+00:00",
+      "typecheck": "2026-10-03T23:59:37.708698+00:00"
+    },
+    "invalidated_by": {},
+    "attestations": {
+      "simplify": {
+        "reason": "CI/hook/config scaffolding generated from the sdlc spec and node-bun templates; reviewed inline by the orchestrator (actionlint clean, YAML parsed, spec patterns 1/2/3/6 checked: ci-pass needs every job incl. the gate, least-privilege permissions, SHA-pinned actions). grumpy skills are not dispatchable/recording in this session (sdlc:init and grumpy:simplify are not exposed; PostToolUse never fires).",
+        "at": "2026-10-03T23:59:25.946591+00:00"
+      },
+      "grumpy-review": {
+        "reason": "CI/hook/config scaffolding generated from the sdlc spec and node-bun templates; reviewed inline by the orchestrator (actionlint clean, YAML parsed, spec patterns 1/2/3/6 checked: ci-pass needs every job incl. the gate, least-privilege permissions, SHA-pinned actions). grumpy skills are not dispatchable/recording in this session (sdlc:init and grumpy:simplify are not exposed; PostToolUse never fires).",
+        "at": "2026-10-03T23:59:26.023696+00:00"
+      },
+      "grumpy-fix-post-review": {
+        "reason": "CI/hook/config scaffolding generated from the sdlc spec and node-bun templates; reviewed inline by the orchestrator (actionlint clean, YAML parsed, spec patterns 1/2/3/6 checked: ci-pass needs every job incl. the gate, least-privilege permissions, SHA-pinned actions). grumpy skills are not dispatchable/recording in this session (sdlc:init and grumpy:simplify are not exposed; PostToolUse never fires).",
+        "at": "2026-10-03T23:59:26.085708+00:00"
+      },
+      "grumpy-imagine": {
+        "reason": "CI/hook/config scaffolding generated from the sdlc spec and node-bun templates; reviewed inline by the orchestrator (actionlint clean, YAML parsed, spec patterns 1/2/3/6 checked: ci-pass needs every job incl. the gate, least-privilege permissions, SHA-pinned actions). grumpy skills are not dispatchable/recording in this session (sdlc:init and grumpy:simplify are not exposed; PostToolUse never fires).",
+        "at": "2026-10-03T23:59:26.139708+00:00"
+      },
+      "grumpy-fix-post-imagine": {
+        "reason": "CI/hook/config scaffolding generated from the sdlc spec and node-bun templates; reviewed inline by the orchestrator (actionlint clean, YAML parsed, spec patterns 1/2/3/6 checked: ci-pass needs every job incl. the gate, least-privilege permissions, SHA-pinned actions). grumpy skills are not dispatchable/recording in this session (sdlc:init and grumpy:simplify are not exposed; PostToolUse never fires).",
+        "at": "2026-10-03T23:59:26.197515+00:00"
+      }
+    }
+  }
+}

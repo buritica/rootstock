@@ -18,6 +18,7 @@
     "./golden/bun-test": "./src/golden/bun-test.ts"
   },
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks",
     "lint": "biome check .",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",

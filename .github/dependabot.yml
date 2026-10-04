@@ -1,0 +1,21 @@
+# Keeps pinned action SHAs and Bun dependencies current; bumps arrive as PRs
+# and go through ci-pass like any other change.
+#
+# Scaffolded by the `sdlc` plugin (/sdlc:init). Lives at .github/dependabot.yml.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-deps:
+        dependency-type: "development"
