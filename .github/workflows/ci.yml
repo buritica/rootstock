@@ -71,11 +71,24 @@ jobs:
     with:
       command: "bun test"
 
+  # Consumers install rootstock as a git dependency and run it on THEIR Bun;
+  # compass's image pins 1.3.x, and package.json engines says >=1.3. That Bun
+  # can't read our lockfile v2 (consumers never read it anyway), so this job
+  # installs fresh and runs the suite on the oldest supported Bun.
+  test-oldest-bun:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      bun-version: "1.3.14"
+      install-args: "--no-save"
+      command: "bun test"
+
   # Enforcement aggregator (spec.md pattern 2). Needs EVERY job, including the
   # gate: a failed gate makes downstream jobs report `skipped`, which would
   # otherwise read as OK. Skipped is accepted so docs-only PRs stay satisfiable.
   ci-pass:
-    needs: [changes, lint, typecheck, test]
+    needs: [changes, lint, typecheck, test, test-oldest-bun]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
