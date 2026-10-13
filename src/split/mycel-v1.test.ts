@@ -20,7 +20,7 @@ describe("mycelV1.chunkText frontmatter", () => {
     ],
     [
       "a leading BOM trims away",
-      "﻿---\nk\n---\nbody",
+      "\uFEFF---\nk\n---\nbody",
       [{ chunkIndex: 0, startLine: 4, endLine: 4, text: "body" }],
     ],
     [
@@ -178,9 +178,9 @@ describe("mycelV1.wordCount", () => {
     ["a", 1],
     [" a  b\tc\nd ", 4],
     ["a\rb", 2],
-    ["a b", 2],
-    ["a b", 2],
-    ["﻿a", 1],
+    ["a\u00A0b", 2],
+    ["a\u2028b", 2],
+    ["\uFEFFa", 1],
     ["a\u0085b", 1],
   ];
   for (const [text, count] of cases) {

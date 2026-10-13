@@ -116,10 +116,23 @@ describe("windowBody plans", () => {
 
 describe("windowBody sections", () => {
   test("only a block starting with 1-6 '#', a space and a non-space opens a section", () => {
-    const body = ["# a", "t", "#x", "####### g", "## b", "#  y", "###### c", "# z"].join("\n\n");
+    const body = [
+      "# a",
+      "t",
+      "#x",
+      "####### g",
+      "## b",
+      "#  y",
+      "#### d",
+      "##### e",
+      "###### c",
+      "# z",
+    ].join("\n\n");
     expect(bodies(plan(body, 21, U))).toEqual([
       "# a\n\nt\n\n#x\n\n####### g",
       "## b\n\n#  y",
+      "#### d",
+      "##### e",
       "###### c",
       "# z",
     ]);

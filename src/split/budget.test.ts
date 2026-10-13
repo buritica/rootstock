@@ -27,6 +27,15 @@ describe("packWithinBudget", () => {
     ["oversize item gets a group of its own", [2, 9, 1, 1], 4, 1, undefined, [[2], [9], [1, 1]]],
     ["the breaking item pays no separator in its new group", [4, 3], 6, 2, undefined, [[4], [3]]],
     ["zero-cost separator fills to the budget", [1, 1, 1, 1], 4, 0, true, [[1, 1, 1, 1]]],
+    [
+      "oversize item first gets a group of its own, no empty group before it",
+      [9, 1],
+      4,
+      1,
+      undefined,
+      [[9], [1]],
+    ],
+    ["an item over the budget with the separator charged on first", [4], 4, 1, true, [[4]]],
     ["empty input", [], 4, 1, undefined, []],
   ];
   for (const [name, items, budget, separatorCost, onFirst, groups] of cases) {
@@ -85,6 +94,12 @@ describe("sliceLongLines", () => {
     ["a line of exactly the width is kept", ["abc"], 3, ["abc"]],
     ["width 1", ["abc"], 1, ["a", "b", "c"]],
     ["a cut can split a surrogate pair", ["a😀b"], 2, ["a\uD83D", "\uDE00b"]],
+    [
+      "a fractional width slices at its floor and the remainder is the last piece",
+      ["abcde"],
+      2.5,
+      ["ab", "cde"],
+    ],
     ["empty input", [], 5, []],
   ];
   for (const [name, lines, width, out] of cases) {

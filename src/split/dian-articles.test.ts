@@ -208,6 +208,16 @@ describe("dianArticles.splitTableForChunking", () => {
     });
   }
 
+  test("a separator row padded with whitespace still splits by rows, kept verbatim", () => {
+    const sep = "  | --- | --- |  ";
+    const block = ["| a | b |", sep, "| 1 | 2 |", "| 3 | 4 |"].join("\n");
+    expect(block.length).toBe(47);
+    expect(splitTableForChunking(block, 40)).toEqual([
+      `| a | b |\n${sep}\n| 1 | 2 |`,
+      `| a | b |\n${sep}\n| 3 | 4 |`,
+    ]);
+  });
+
   test("a pipe-less header still splits by rows", () => {
     const block = ["Encabezado sin tubos", "| --- | --- |", "| 1 | 2 |", "| 3 | 4 |"].join("\n");
     expect(splitTableForChunking(block, 50)).toEqual([
@@ -256,6 +266,12 @@ describe("dianArticles.splitProseForChunking and splitBlockForChunking", () => {
       "Tres cuatro.",
       "Cinco seis.",
     ]);
+  });
+
+  test("block: a table piece whose first line has no space after the pipe is not re-split as prose", () => {
+    const block = ["|x|y|", "|---|---|", "|Uno. Dos|2|"].join("\n");
+    expect(block.length).toBe(28);
+    expect(splitBlockForChunking(block, 20)).toEqual([block]);
   });
 
   test("block: pieces of a pipe-less-header table are re-split as prose", () => {
