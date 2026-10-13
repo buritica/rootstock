@@ -21,10 +21,25 @@ const EPOCH = { date: new Date(0) };
 
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 
-async function zipOf(entries: Record<string, string>): Promise<Uint8Array> {
+async function zipOf(
+  entries: Record<string, string>,
+  compression: "STORE" | "DEFLATE" = "STORE",
+): Promise<Uint8Array> {
   const zip = new JSZip();
   for (const [name, body] of Object.entries(entries)) zip.file(name, body, EPOCH);
-  return zip.generateAsync({ type: "uint8array", compression: "STORE" });
+  return zip.generateAsync({ type: "uint8array", compression });
+}
+
+/** The plain `Error` a promise rejects with; fails the test otherwise. */
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+  const error = await promise.then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).constructor).toBe(Error);
+  expect((error as Error).name).toBe("Error");
+  return error as Error;
 }
 
 /** Rewrites one entry's declared uncompressed size in the central directory. */
@@ -185,14 +200,7 @@ describe("unsupported MIME type", () => {
     test(`${JSON.stringify(mime)} rejects with a plain Error`, async () => {
       const bytes = new Uint8Array([1, 2, 3]);
       for (const extract of [extractOfficeText, extractOfficeTextWithPages]) {
-        const error = await extract(mime, bytes, CEILING).then(
-          () => undefined,
-          (e: unknown) => e,
-        );
-        expect(error).toBeInstanceOf(Error);
-        expect((error as Error).constructor).toBe(Error);
-        expect((error as Error).name).toBe("Error");
-        expect((error as Error).message).toBe(message);
+        expect((await rejection(extract(mime, bytes, CEILING))).message).toBe(message);
       }
     });
   }
@@ -599,26 +607,10 @@ describe("unpacked-size ceiling", () => {
   const ceilingMessage = (total: number, ceiling: number) =>
     `office-extract: this archive unpacks to ${total} bytes, over the ${ceiling} ceiling — refusing to materialise it. A file small enough to download can still unpack into gigabytes, and an ingest run walks thousands of files unattended.`;
 
-  async function rejection(promise: Promise<unknown>): Promise<Error> {
-    const error = await promise.then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).name).toBe("Error");
-    return error as Error;
-  }
-
   test("jszip 3.10.2 entries carry _data.uncompressedSize; empty entries and folders count as 0", async () => {
     expect(jszipPkg.version).toBe("3.10.2");
     const entries = { "a.txt": "12345", "b/c.txt": "xyz", "empty.txt": "" };
-    const stored = await zipOf(entries);
-    const deflated = await (() => {
-      const zip = new JSZip();
-      for (const [name, body] of Object.entries(entries)) zip.file(name, body, EPOCH);
-      return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-    })();
-    for (const bytes of [stored, deflated]) {
+    for (const bytes of [await zipOf(entries), await zipOf(entries, "DEFLATE")]) {
       const zip = await JSZip.loadAsync(bytes);
       const sizes = Object.entries(zip.files).map(([name, file]) => [
         name,
