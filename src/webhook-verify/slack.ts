@@ -56,7 +56,8 @@ export function slackSignatureMatches(
  *    `bad_signature` on mismatch;
  * 5. otherwise `ok`, carrying the body.
  *
- * The body is never read for a request refused at steps 1–3.
+ * The body is never read for a request refused at steps 1–3. A `now()` of NaN makes the
+ * skew NaN, which the window comparison does not refuse; supply a real clock.
  */
 export async function verifySlackRequest(
   input: SlackVerifyInput,

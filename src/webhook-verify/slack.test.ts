@@ -272,3 +272,12 @@ describe("verifySlackRequest: the window is the caller's", () => {
     });
   }
 });
+
+// A NaN clock makes the skew NaN, and `Math.abs(NaN) > window` is false, so the window
+// check does not refuse: the request goes on to the signature check. Pinned as the frozen
+// behavior; callers must supply a real clock.
+test("verifySlackRequest: a NaN clock does not trip the window", async () => {
+  const { input, calls } = spied({}, Number.NaN);
+  expect(await verifySlackRequest(input, WINDOW)).toEqual({ ok: true, body: BODY });
+  expect(calls).toEqual({ now: 1, readBody: 1 });
+});

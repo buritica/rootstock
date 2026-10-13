@@ -192,3 +192,10 @@ describe("notionEventAge: the bounds are the caller's", () => {
     });
   }
 });
+
+test("notionEventAge: a NaN clock fails neither bound and reads as plausible", () => {
+  expect(notionEventAge("1970-01-01T00:00:00Z", () => Number.NaN, BOUNDS)).toEqual({
+    kind: "plausible",
+    ageSeconds: Number.NaN,
+  });
+});
