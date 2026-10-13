@@ -41,7 +41,10 @@ export function notionSignatureMatches(
  * - Otherwise `ageSeconds = now() / 1000 - parsed / 1000`, unrounded. An age above
  *   `maxEventAgeSeconds`, or below `-maxFutureSkewSeconds`, is `implausible`; both bounds
  *   are inclusive on the plausible side. A `now()` of NaN gives a NaN age, which fails
- *   neither bound and so reads as plausible.
+ *   neither bound and so reads as plausible. The same holds for the bounds: a non-finite
+ *   or missing `maxEventAgeSeconds` or `maxFutureSkewSeconds` (NaN, or `undefined` from a
+ *   JS caller or an unset `Number(env.X)`) disables that check (fail-open), so an event of
+ *   any age on that side reads as plausible. Callers must pass finite numbers.
  */
 export function notionEventAge(
   timestamp: unknown,

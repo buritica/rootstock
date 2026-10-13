@@ -281,3 +281,16 @@ test("verifySlackRequest: a NaN clock does not trip the window", async () => {
   expect(await verifySlackRequest(input, WINDOW)).toEqual({ ok: true, body: BODY });
   expect(calls).toEqual({ now: 1, readBody: 1 });
 });
+
+// Frozen behavior, not a goal: a NaN window compares false against every skew, so the
+// replay check is disabled (fail-open). A correctly signed request 25 years stale is
+// accepted. Callers must pass a finite window (see the verifySlackRequest JSDoc).
+test("verifySlackRequest: a NaN window disables the replay check (fail-open)", async () => {
+  const twentyFiveYearsMs = 25 * 365 * 86_400 * 1000;
+  const { input, calls } = spied({}, AT_TS + twentyFiveYearsMs);
+  expect(await verifySlackRequest(input, { timestampWindowSeconds: Number.NaN })).toEqual({
+    ok: true,
+    body: BODY,
+  });
+  expect(calls).toEqual({ now: 1, readBody: 1 });
+});

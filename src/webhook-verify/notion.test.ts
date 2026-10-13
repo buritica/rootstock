@@ -199,3 +199,21 @@ test("notionEventAge: a NaN clock fails neither bound and reads as plausible", (
     ageSeconds: Number.NaN,
   });
 });
+
+// Frozen behavior, not a goal: a NaN bound compares false against every age, so that side
+// of the check is disabled (fail-open). Callers must pass finite bounds (see the
+// notionEventAge JSDoc).
+test("notionEventAge: NaN bounds disable both checks and read as plausible (fail-open)", () => {
+  const nan = { maxEventAgeSeconds: Number.NaN, maxFutureSkewSeconds: Number.NaN };
+  const day = 86_400_000;
+  // 25 years old.
+  expect(notionEventAge("1970-01-01T00:00:00Z", () => 25 * 365 * day, nan)).toEqual({
+    kind: "plausible",
+    ageSeconds: 25 * 365 * 86_400,
+  });
+  // A year in the future.
+  expect(notionEventAge("1971-01-01T00:00:00Z", () => 0, nan)).toEqual({
+    kind: "plausible",
+    ageSeconds: -365 * 86_400,
+  });
+});

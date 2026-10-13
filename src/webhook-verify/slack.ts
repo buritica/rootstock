@@ -57,7 +57,11 @@ export function slackSignatureMatches(
  * 5. otherwise `ok`, carrying the body.
  *
  * The body is never read for a request refused at steps 1–3. A `now()` of NaN makes the
- * skew NaN, which the window comparison does not refuse; supply a real clock.
+ * skew NaN, which the window comparison does not refuse; supply a real clock. The same
+ * holds for the window: a non-finite or missing `timestampWindowSeconds` (NaN, or
+ * `undefined` from a JS caller or an unset `Number(env.X)`) compares false against every
+ * skew, so the replay check silently disappears (fail-open) and any correctly signed
+ * request passes whatever its age. Callers must pass a finite number.
  */
 export async function verifySlackRequest(
   input: SlackVerifyInput,
