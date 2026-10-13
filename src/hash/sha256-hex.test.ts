@@ -98,8 +98,30 @@ describe("sha256Hex", () => {
     expect(sha256Hex(new TextEncoder().encode(text))).toBe(sha256Hex(text));
   });
 
-  test("the golden harness keeps its own separate implementation", () => {
+  test("the golden harness keeps its own node:crypto implementation, not the hash subpath", async () => {
     expect(goldenSha256Hex).not.toBe(sha256Hex);
+
+    const goldenDir = new URL("../golden/", import.meta.url).pathname;
+    const sources = [...new Bun.Glob("*.ts").scanSync(goldenDir)].filter(
+      (name) => !name.endsWith(".test.ts"),
+    );
+    expect(sources).toContain("canonical.ts");
+
+    // Collect every module specifier the harness sources import or re-export.
+    const specifier = /(?:\bfrom|\bimport)\s*\(?\s*["']([^"']+)["']/g;
+    const hashSubpath = /(^|\/)(hash|sha256-hex)(\/|\.|$)|^@buritica\/rootstock\/hash/;
+    const offending: string[] = [];
+    for (const name of sources) {
+      const text = await Bun.file(`${goldenDir}${name}`).text();
+      for (const match of text.matchAll(specifier)) {
+        if (hashSubpath.test(match[1] ?? "")) offending.push(`${name}: ${match[1]}`);
+      }
+    }
+    expect(offending).toEqual([]);
+
+    const canonical = await Bun.file(`${goldenDir}canonical.ts`).text();
+    expect(canonical).toMatch(/from\s+["']node:crypto["']/);
+    expect(canonical).toMatch(/createHash\(\s*["']sha256["']\s*\)/);
   });
 });
 

@@ -1,4 +1,4 @@
-/** Thrown by `chunkingParamFingerprint` when `params` cannot be trusted to fingerprint. */
+/** Raised by `chunkingParamFingerprint` when the key list or a parameter value is refused. */
 export class InvalidChunkingParamsError extends Error {
   override readonly name = "InvalidChunkingParamsError";
 }
