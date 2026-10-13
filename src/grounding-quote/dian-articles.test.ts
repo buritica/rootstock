@@ -243,17 +243,18 @@ describe("quoteIsSupported", () => {
 
 describe("quoteRowsAreIntact", () => {
   const BODY = "Intro line.\n| a cell | b cell |\n| c cell | d cell |\nOutro.";
-  const cases: [string, string, boolean][] = [
-    ["no pipe in the quote", "Intro line. a cell", true],
-    ["blank quote", "", true],
-    ["inside one row", "| a cell | b cell |", true],
-    ["straddles two rows", "b cell | | c cell", false],
-    ["straddles via newline", "b cell |\n| c cell", false],
-    ["table fragment absent from the body", "| z cell |", false],
-    ["crlf body row", "| c cell | d cell |", true],
+  const BODY_CRLF = "Intro line.\r\n| a cell | b cell |\r\n| c cell | d cell |\r\nOutro.";
+  const cases: [string, string, string, boolean][] = [
+    ["no pipe in the quote", BODY, "Intro line. a cell", true],
+    ["blank quote", BODY, "", true],
+    ["inside one row", BODY, "| a cell | b cell |", true],
+    ["straddles two rows", BODY, "b cell | | c cell", false],
+    ["straddles via newline", BODY, "b cell |\n| c cell", false],
+    ["table fragment absent from the body", BODY, "| z cell |", false],
+    ["crlf body row", BODY_CRLF, "| c cell | d cell |", true],
+    ["crlf body straddle", BODY_CRLF, "b cell | | c cell", false],
   ];
-  test.each(cases)("%s", (label, quote, expected) => {
-    const body = label === "crlf body row" ? BODY.replaceAll("\n", "\r\n") : BODY;
+  test.each(cases)("%s", (_label, body, quote, expected) => {
     expect(quoteRowsAreIntact(body, quote)).toBe(expected);
   });
 

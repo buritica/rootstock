@@ -13,8 +13,10 @@ function normalizeForQuoteMatch(text: string): string {
     .trim();
 }
 
-// Eleven quotation code points are dropped and seven dash code points become
-// "-". U+201B and U+2033 are deliberately not in the first set.
+// Eleven quotation code points are dropped: U+0022, U+0027, U+2018, U+2019,
+// U+201A, U+201C, U+201D, U+201E, U+2032, U+00AB, U+00BB (U+201B and U+2033
+// are not). Seven dash code points become "-": U+2010, U+2011, U+2012,
+// U+2013, U+2014, U+2212 and the invisible soft hyphen U+00AD.
 const QUOTE_CHARS = /["'‘’‚“”„′«»]/g;
 const DASHES = /[‐‑‒–—−­]/g;
 
