@@ -79,6 +79,37 @@ describe("mycelV1.chunkText lines", () => {
     });
   }
 
+  describe("what separates paragraphs", () => {
+    // 200 + 201 words: one paragraph if the middle line is part of it (401 words ships alone), two if it is blank.
+    const span = (separator: string) =>
+      chunkText(`${words(200)}\n${separator}\n${words(201)}`).map((c) => [
+        c.chunkIndex,
+        c.startLine,
+        c.endLine,
+      ]);
+    for (const [name, separator] of [
+      ["spaces", "   "],
+      ["a single space", " "],
+      ["a \\r and a tab", "\r\t"],
+    ] as const) {
+      test(`a whitespace-only line (${name}) is a paragraph break`, () => {
+        expect(span(separator)).toEqual([
+          [0, 1, 1],
+          [1, 3, 3],
+        ]);
+      });
+    }
+    test("a NEL-only line is content, not a break", () => {
+      expect(span("\u0085")).toEqual([[0, 1, 3]]);
+    });
+    test("an empty line is a paragraph break", () => {
+      expect(span("")).toEqual([
+        [0, 1, 1],
+        [1, 3, 3],
+      ]);
+    });
+  });
+
   test("text is the raw line slice, blank runs and whitespace lines included", () => {
     const doc = [
       "---",

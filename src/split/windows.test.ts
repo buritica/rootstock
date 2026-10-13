@@ -270,6 +270,33 @@ describe("windowBody parameters", () => {
     ]);
   });
 
+  test("a pair merges when it fits the budget exactly, not when one char over", () => {
+    const body = "# aaaaaa\n\n# b\n\n# cccccccccc";
+    expect(plan(body, 13, { ...U, minSectionChars: 5 })).toEqual({
+      kind: "windows",
+      windows: [
+        { body: "# aaaaaa\n\n# b", charStart: 0, charEnd: 13 },
+        { body: "# cccccccccc", charStart: 15, charEnd: 27 },
+      ],
+    });
+    expect(bodies(plan(body, 12, { ...U, minSectionChars: 5 }))).toEqual([
+      "# aaaaaa",
+      "# b",
+      "# cccccccccc",
+    ]);
+  });
+
+  test("sections are trimmed and whitespace-only blocks are dropped", () => {
+    expect(plan(" \n\n# aaaa\n\n# bbbb  ", 10, U)).toEqual({
+      kind: "windows",
+      windows: [
+        { body: "# aaaa", charStart: 3, charEnd: 9 },
+        { body: "# bbbb", charStart: 11, charEnd: 17 },
+      ],
+    });
+    expect(bodies(plan("# aaaa\n\n \n\n# bbbb", 12, U))).toEqual(["# aaaa", "# bbbb"]);
+  });
+
   test("refusalLabel names the caller in the refusal", () => {
     expect(messageOf(() => plan("x", Number.NaN, { ...U, refusalLabel: "my-label" }, "t"))).toBe(
       'my-label: char budget for title "t" is NaN — the title alone exceeds the embedding window',

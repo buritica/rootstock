@@ -170,6 +170,12 @@ describe("dianArticles.splitTableForChunking", () => {
       [`${head}\n| 1 | 2 |\n| 3 | 4 |`, `${head}\n| 5 | 6 |`],
     ],
     [
+      "a row joining to exactly max still fits (43 = header + two rows)",
+      table,
+      43,
+      [`${head}\n| 1 | 2 |\n| 3 | 4 |`, `${head}\n| 5 | 6 |`],
+    ],
+    [
       "one row per chunk when only one fits",
       table,
       40,
