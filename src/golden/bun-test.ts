@@ -1,10 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import { canonicalJson } from "./canonical.ts";
-import { type GoldenSuite, goldenPath, readGoldenFile, runCase, validateSuites } from "./suite.ts";
+import {
+  type GoldenSuite,
+  goldenPath,
+  readGoldenFile,
+  runSuiteCase,
+  validateSuites,
+} from "./suite.ts";
 
 /**
  * Registers one `bun test` per golden case, plus a case-set check per suite.
  * Kept in its own entry point because it imports `bun:test`.
+ *
+ * A case compares its indented canonical output first, so Bun prints a line
+ * diff, then its input hash. A case that throws fails with the
+ * `GoldenCaseError` message naming the suite, the case and the phase.
  */
 export function registerGoldenTests(suites: GoldenSuite[], opts: { dir: string }): void {
   validateSuites(suites);
@@ -23,11 +33,16 @@ export function registerGoldenTests(suites: GoldenSuite[], opts: { dir: string }
           const file = await readGoldenFile(path);
           const expected = file?.cases.find((x) => x.id === c.id);
           expect(expected, `case ${c.id} not recorded in ${path}`).toBeDefined();
-          const actual = await runCase(c);
-          expect(actual.inputSha256, "fixture input changed since capture").toBe(
-            expected?.inputSha256 ?? "",
+          const actual = await runSuiteCase(suite, c);
+          const recordedInput = expected?.inputSha256 ?? "";
+          const inputChanged = actual.inputSha256 !== recordedInput;
+          expect(
+            canonicalJson(actual.output, 2),
+            inputChanged ? "output differs (fixture input also changed)" : "output differs",
+          ).toBe(canonicalJson(expected?.output, 2));
+          expect(actual.inputSha256, "fixture input changed since capture (output unchanged)").toBe(
+            recordedInput,
           );
-          expect(actual.canonical).toBe(canonicalJson(expected?.output));
         });
       }
     });
