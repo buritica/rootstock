@@ -680,6 +680,30 @@ describe("unpacked-size ceiling", () => {
     ).toBe(ceilingMessage(200000001, 200000000));
   });
 
+  test("the ceiling runs before any entry is decompressed, even on the parts that get read", async () => {
+    // The declared size sits on the part the extractor reads. Were the guard to
+    // run after the read, jszip would fail with a size mismatch instead.
+    const pptx = declareSize(
+      await zipOf({ "ppt/slides/slide1.xml": slideXml(para("ok")) }),
+      "ppt/slides/slide1.xml",
+      5000,
+    );
+    const xlsx = declareSize(
+      await zipOf({
+        "xl/worksheets/sheet1.xml": sheetXml('<row r="1"><c r="A1"><v>1</v></c></row>'),
+      }),
+      "xl/worksheets/sheet1.xml",
+      5000,
+    );
+    const tight = { maxUnpackedBytes: 100 };
+    expect((await rejection(extractOfficeText(PPTX_MIME, pptx, tight))).message).toBe(
+      ceilingMessage(5000, 100),
+    );
+    expect((await rejection(extractOfficeTextWithPages(XLSX_MIME, xlsx, tight))).message).toBe(
+      ceilingMessage(5000, 100),
+    );
+  });
+
   test("a NaN ceiling never rejects", async () => {
     const bytes = await zipOf({ "ppt/slides/slide1.xml": slideXml(para("ok")) });
     expect(await extractOfficeText(PPTX_MIME, bytes, { maxUnpackedBytes: Number.NaN })).toBe("ok");
