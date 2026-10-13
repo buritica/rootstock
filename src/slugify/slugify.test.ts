@@ -26,6 +26,11 @@ describe("slugify/mycel-v1 readable slugs", () => {
     ["hyphen and space runs collapse", "a - -  b", "a-b"],
     ["ideographic space separates", "a\u3000b", "a-b"],
     ["already slug-shaped", "x-abc", "x-abc"],
+    // Stripping a mark must differ from dropping it: a stripped mark leaves one clean letter
+    // (readable slug), a kept mark counts as a dropped character and forces the digest fallback.
+    ["grave decomposes to U+0300, stripped", "\u00e0", "a"],
+    ["bare U+0300 stripped", "a\u0300", "a"],
+    ["U+036F stripped", "a\u036f", "a"],
     ["dotted capital I", "\u0130STANBUL", "istanbul"],
     ["stroked L dropped", "\u0141\u00f3d\u017a \u00dcn\u00efcode", "odz-unicode"],
     ["sharp s dropped", "\u00dftra\u00dfe", "trae"],
@@ -48,6 +53,8 @@ describe("slugify/mycel-v1 digest fallback", () => {
     ["one Latin letter left after a drop", "\u03a9 q", "x-bbd7b65dd7f5"],
     ["digest is of the folded name", "  \u03a9   Q ", "x-bbd7b65dd7f5"],
     ["hyphens only", "---", "x-cb3f91d54eee"],
+    ["U+02FF just below the mark range is not stripped", "a\u02ff", "x-5037a844c822"],
+    ["U+0370 just above the mark range is not stripped", "a\u0370", "x-2d88371f15df"],
     ["hangul", "\uac00\ub098", "x-91e6619744ca"],
     ["ideographs with one Latin letter", "\u5c71\u5ddd A", "x-2e1aab45fe52"],
     ["titlecase digraph", "\u01c5", "x-bfbc93eb6625"],

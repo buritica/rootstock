@@ -40,6 +40,12 @@ describe("normalize.name/mycel-v1", () => {
       "\u038c\u03a3\u039f\u03a3",
       "\u03bf\u03c3\u03bf\u03c2",
     ],
+    // Pin both ends of the stripped range U+0300 to U+036F and the code points just outside it.
+    ["grave decomposes to U+0300, stripped", "\u00e0", "a"],
+    ["bare U+0300 stripped", "a\u0300", "a"],
+    ["U+036F stripped", "a\u036f", "a"],
+    ["U+02FF just below the range kept", "a\u02ff", "a\u02ff"],
+    ["U+0370 just above the range kept and lowercased", "a\u0370", "a\u0371"],
     ["dotted capital I", "\u0130", "i"],
     ["dotted capital I in a word", "\u0130STANBUL", "istanbul"],
     ["titlecase digraph", "\u01c5", "\u01c6"],
