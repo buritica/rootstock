@@ -7,10 +7,16 @@ import { canonicalJson } from "./canonical.ts";
  * first differing UTF-16 code unit.
  */
 export interface PathDiff {
-  /** "$", "$.a", "$[\"a b\"]", "$[\"10\"]", "$.list[3]": dot form only for /^[A-Za-z_$][\w$]*$/ keys. */
+  /**
+   * "$", "$.a", "$[\"a b\"]", "$[\"10\"]", "$.list[3]": dot form only for /^[A-Za-z_$][\w$]*$/ keys.
+   * A bracket key containing U+2028/U+2029 has them escaped as \\u2028/\\u2029.
+   */
   path: string;
   change: "changed" | "added" | "removed" | "type";
-  /** Canonical JSON, cut to <= 160 UTF-16 code units + "…(+N)"; never splits a surrogate pair. */
+  /**
+   * Canonical JSON, cut to <= 160 UTF-16 code units + "…(+N)"; never splits a surrogate pair. U+2028/U+2029 are
+   * escaped after the cut, so each one adds five code units.
+   */
   expected?: string;
   actual?: string;
   /** Strings only: first differing UTF-16 code-unit index; expected/actual are then JSON-escaped ±32-unit excerpts
@@ -24,6 +30,11 @@ const DIFF_LIMIT = 20;
 const VALUE_UNITS = 160;
 const EXCERPT_RADIUS = 32;
 const DOT_KEY = /^[A-Za-z_$][\w$]*$/;
+
+/** JSON.stringify leaves U+2028/U+2029 raw; escape them so a diff never carries a line separator. */
+function escapeSeparators(text: string): string {
+  return text.replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+}
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -79,7 +90,9 @@ function walk(expected: Json, actual: Json, path: string, emit: (diff: PathDiff)
     const a = actual as { [key: string]: Json };
     const keys = [...new Set([...Object.keys(e), ...Object.keys(a)])].sort();
     for (const key of keys) {
-      const keyPath = DOT_KEY.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`;
+      const keyPath = DOT_KEY.test(key)
+        ? `${path}.${key}`
+        : `${path}[${escapeSeparators(JSON.stringify(key))}]`;
       if (!Object.hasOwn(a, key)) {
         emit({ path: keyPath, change: "removed", expected: render(e[key] as Json) });
       } else if (!Object.hasOwn(e, key)) {
@@ -130,9 +143,9 @@ function splitsPair(s: string, i: number): boolean {
 
 function render(value: Json): string {
   const text = canonicalJson(value);
-  if (text.length <= VALUE_UNITS) return text;
+  if (text.length <= VALUE_UNITS) return escapeSeparators(text);
   const cut = splitsPair(text, VALUE_UNITS) ? VALUE_UNITS - 1 : VALUE_UNITS;
-  return `${text.slice(0, cut)}…(+${text.length - cut})`;
+  return `${escapeSeparators(text.slice(0, cut))}…(+${text.length - cut})`;
 }
 
 function excerpt(s: string, at: number): string {
@@ -140,7 +153,5 @@ function excerpt(s: string, at: number): string {
   let end = Math.min(s.length, at + EXCERPT_RADIUS);
   if (splitsPair(s, start)) start++;
   if (splitsPair(s, end)) end--;
-  return JSON.stringify(s.slice(start, end))
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
+  return escapeSeparators(JSON.stringify(s.slice(start, end)));
 }

@@ -27,7 +27,11 @@ export interface GoldenCliOptions {
   base?: string;
   /** Default `process.argv.slice(2)`. */
   argv?: string[];
-  /** Receives each stdout line, without its newline. Default `process.stdout`. */
+  /**
+   * Receives each stdout message, without its trailing newline. Default `process.stdout`.
+   * A message is one line except the capture refusal, which keeps the v0.0.1 text: the header and the
+   * changed-file list are one message joined by newlines.
+   */
   write?: (line: string) => void;
   /** Receives each stderr line, without its newline. Default `process.stderr`. */
   writeErr?: (line: string) => void;
@@ -50,7 +54,10 @@ function stderrLine(line: string): void {
   process.stderr.write(`${line}\n`);
 }
 
-function short(sha: string): string {
+/** A golden file is committed data: a hash may be missing or not a string. */
+function short(sha: unknown): string {
+  if (sha === undefined) return "(missing)";
+  if (typeof sha !== "string") return `(${sha === null ? "null" : typeof sha})`;
   return `${sha.slice(0, 8)}…`;
 }
 

@@ -215,6 +215,19 @@ describe("strings", () => {
     ]);
   });
 
+  test("U+2028 and U+2029 are escaped in rendered values and bracket paths", () => {
+    expect(diff({ [`k${LS}`]: `x${LS}y`, z: `p${PS}` }, { [`k${LS}`]: 1, z: null }).diffs).toEqual([
+      { path: '$["k\\u2028"]', change: "type", expected: '"x\\u2028y"', actual: "1" },
+      { path: "$.z", change: "type", expected: '"p\\u2029"', actual: "null" },
+    ]);
+    expect(diff({ a: [`q${LS}`] }, { a: [] }).diffs).toEqual([
+      { path: "$.a[0]", change: "removed", expected: '"q\\u2028"' },
+    ]);
+    const long = diff({ s: `${LS}${"a".repeat(200)}` }, { s: 1 }).diffs[0];
+    expect(long?.expected).toStartWith('"\\u2028aaa');
+    expect(long?.expected).toEndWith("…(+43)"); // 203 canonical units - 160
+  });
+
   test("a string that changes type is canonical JSON, not an excerpt", () => {
     expect(diff({ s: "1" }, { s: 1 }).diffs).toEqual([
       { path: "$.s", change: "type", expected: '"1"', actual: "1" },

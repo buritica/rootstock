@@ -91,6 +91,23 @@ describe("check", () => {
     ]);
   });
 
+  test("a case with a missing or non-string inputSha256 is a problem line, not an ABORT", async () => {
+    const dir = await capturedDir(suite(upper));
+    const path = goldenPath(dir, suite(upper));
+    const file = JSON.parse(await readFile(path, "utf8"));
+    delete file.cases[0].inputSha256;
+    file.cases[1].inputSha256 = 7;
+    await writeFile(path, JSON.stringify(file));
+    const result = await cli([suite(upper)], ["check"], { dir });
+    expect(result.code).toBe(1);
+    expect(result.err).toEqual([]);
+    expect(result.out).toEqual([
+      "FAIL chunk.split/test-v1",
+      "     input-drift one: fixture input changed since capture ((missing) -> 5aa762ae…)",
+      "     input-drift two: fixture input changed since capture ((number) -> ba2df490…)",
+    ]);
+  });
+
   test("added, removed, type and omitted lines", async () => {
     const wide = (n: number) =>
       Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, i]));
@@ -205,6 +222,7 @@ describe("capture", () => {
     ]);
   });
 
+  // The header and the file list are ONE write call, joined by "\n": the v0.0.1 text, kept on purpose.
   test("2 with the refusal hint when sources changed, and nothing written", async () => {
     const result = await cli([suite(upper)], ["capture"], { git: fakeGit("src/a.ts").git });
     expect(result.code).toBe(2);
