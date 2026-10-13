@@ -212,14 +212,14 @@ describe("mergePdfPages", () => {
     ["one page", ["a"], "a"],
     ["pages join with a newline", ["a", "b", "c"], "a\nb\nc"],
     ["space and tab runs collapse", ["a  b\t\tc \t d"], "a b c d"],
-    ["NBSP collapses to a space", ["a  b"], "a b"],
-    ["U+3000 collapses to a space", ["a　b　　c"], "a b c"],
-    ["lone NBSP becomes a space", [" "], " "],
-    ["U+2028 is whitespace, not a newline", ["a b"], "a b"],
-    ["U+200B is not whitespace", ["a​b"], "a​b"],
+    ["NBSP collapses to a space", ["a\u00a0\u00a0b"], "a b"],
+    ["U+3000 collapses to a space", ["a\u3000b\u3000\u3000c"], "a b c"],
+    ["lone NBSP becomes a space", ["\u00a0"], " "],
+    ["U+2028 is whitespace, not a newline", ["a\u2028b"], "a b"],
+    ["U+200B is not whitespace", ["a\u200bb"], "a\u200bb"],
     ["NUL is left alone", ["a\u0000b"], "a\u0000b"],
     ["spaces around a newline drop", ["a \n b"], "a\nb"],
-    ["collapsed runs around a newline drop", ["a  \t\n  b"], "a\nb"],
+    ["collapsed runs around a newline drop", ["a  \t\n\u00a0 b"], "a\nb"],
     ["CRLF becomes LF", ["a\r\nb"], "a\nb"],
     ["lone CR becomes a space", ["a\rb"], "a b"],
     ["blank pages cut to one blank line", ["a", "", "", "b"], "a\n\nb"],
@@ -457,6 +457,31 @@ describe("XLSX", () => {
       "1",
     ],
     [
+      "a part whose name merely starts like a sheet is ignored",
+      {
+        sheet1: '<row r="1"><c r="A1"><v>1</v></c></row>',
+        "xl/worksheets/sheet2.xml.bak": '<row r="1"><c r="A1"><v>96</v></c></row>',
+        "xl/worksheets/sheet3.xmlx": '<row r="1"><c r="A1"><v>95</v></c></row>',
+      },
+      undefined,
+      "1",
+    ],
+    [
+      "an attribute that merely ends in t is not the cell type",
+      { sheet1: '<row r="1"><c r="A1" xt="s"><v>0</v></c></row>' },
+      shared,
+      "0",
+    ],
+    [
+      "a shared-string cell with an empty or non-numeric index adds nothing",
+      {
+        sheet1:
+          '<row r="1"><c r="A1" t="s"><v></v></c><c r="B1" t="s"><v>x</v></c><c r="C1" t="s"></c></row>',
+      },
+      shared,
+      "",
+    ],
+    [
       "trim, then a leading NUL becomes a space",
       { sheet1: '<row r="1"><c r="A1" t="inlineStr"><is><t>\u0000x</t></is></c></row>' },
       undefined,
@@ -535,6 +560,18 @@ describe("PPTX", () => {
       [0, 7],
     ],
     [
+      "the probe cuts by UTF-16 code unit: an astral character split at index 59 matches inside an earlier slide",
+      [[`${"q".repeat(60)}\u{1F601}`], [`${"q".repeat(59)}\u{1F600}`]],
+      `${"q".repeat(60)}\u{1F601}\n\n${"q".repeat(59)}\u{1F600}`,
+      [0, 1],
+    ],
+    [
+      "the probe keeps a trailing lone surrogate, so it does not match a shorter prefix",
+      [[`${"q".repeat(60)}x`], [`${"q".repeat(59)}\u{1F600}`]],
+      `${"q".repeat(60)}x\n\n${"q".repeat(59)}\u{1F600}`,
+      [0, 63],
+    ],
+    [
       "the probe stops at 60 code units, so a longer run in an earlier slide can match first",
       [[`${"r".repeat(61)}A`], [`${"r".repeat(60)}B`]],
       `${"r".repeat(61)}A\n\n${"r".repeat(60)}B`,
@@ -599,6 +636,18 @@ describe("PPTX", () => {
     expect(await extractOfficeTextWithPages(PPTX_MIME, bytes, CEILING)).toEqual({
       text: "one\n\ntwo\n\nten",
       starts: [0, 5, 10],
+    });
+  });
+
+  test("parts whose name merely starts like a slide are ignored", async () => {
+    const bytes = await zipOf({
+      "ppt/slides/slide1.xml": slideXml(para("one")),
+      "ppt/slides/slide2.xml.bak": slideXml(para("backup")),
+      "ppt/slides/slide3.xmlx": slideXml(para("suffixed")),
+    });
+    expect(await extractOfficeTextWithPages(PPTX_MIME, bytes, CEILING)).toEqual({
+      text: "one",
+      starts: [0],
     });
   });
 });
