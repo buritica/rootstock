@@ -1,0 +1,14 @@
+# Test files pin published HMAC/sha256 test vectors next to constants named
+# TOKEN, SECRET or *_KEYS, which trips generic-api-key. Allow exactly that
+# shape — a bare 64-hex digest, optionally with the v0=/sha256= signature
+# prefix — and only inside *.test.ts. Anything else still fails the scan.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "64-hex test digests in test files"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/.+\.test\.ts$''']
+regexTarget = "secret"
+regexes = ['''^(v0=|sha256=)?[0-9a-f]{64}$''']
