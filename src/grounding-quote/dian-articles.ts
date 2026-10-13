@@ -2,8 +2,9 @@
 // a source text actually appears in it, tolerating case, accent, whitespace and
 // punctuation noise but never a changed, added or removed word.
 
-// Folds case, combining marks and whitespace runs, then trims. Hyphens are left
-// alone, so labels such as "12-3" survive.
+// Folds case, strips the combining diacritical marks block (U+0300-U+036F) and
+// collapses whitespace runs, then trims. Hyphens are left alone, so labels such
+// as "12-3" survive.
 function normalizeForQuoteMatch(text: string): string {
   return text
     .normalize("NFD")

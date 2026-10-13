@@ -253,6 +253,18 @@ describe("quoteRowsAreIntact", () => {
     ["table fragment absent from the body", BODY, "| z cell |", false],
     ["crlf body row", BODY_CRLF, "| c cell | d cell |", true],
     ["crlf body straddle", BODY_CRLF, "b cell | | c cell", false],
+    [
+      "body row is normalized line by line (case, accents, curly quotes, spaces)",
+      "Intro.\n| A\u00d1O  Base | \u201cTarifa\u201d |\nEnd.",
+      "| ano base | tarifa |",
+      true,
+    ],
+    [
+      "a normalized fragment still cannot straddle two body rows",
+      "Intro.\n| A\u00d1O  Base |\n| \u201cTarifa\u201d |\nEnd.",
+      "| ano base | tarifa |",
+      false,
+    ],
   ];
   test.each(cases)("%s", (_label, body, quote, expected) => {
     expect(quoteRowsAreIntact(body, quote)).toBe(expected);
@@ -298,9 +310,9 @@ describe("nearestSupportingSpan", () => {
     ],
     [
       "words under 4 letters are ignored",
-      "The cat sat on the mat with amber birch cedar delta.",
-      "the cat sat amber birch cedar delta",
-      "The cat sat on the mat with amber birch cedar delta.",
+      "Amber birch cedar delta.",
+      "amber birch cedar delta cat sat mat",
+      "Amber birch cedar delta.",
     ],
     [
       "accents fold before matching",
