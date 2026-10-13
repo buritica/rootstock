@@ -24,8 +24,12 @@ before starting a wave.
 - Every dependency is injected: SQL client (the tagged-template subset that
   postgres.js and `Bun.SQL` share), `fetch`, clock, logger, randomness.
   No `process.env`, no `console` (biome enforces `noConsole`).
-- Behavior that differs between consumers is a named **profile**, never a
-  flag soup. Phase 1 profiles reproduce each consumer's current behavior
+- Code here is rootstock's, never a consumer's identity. Generic mechanisms
+  that started in compass ship as primitives that take every policy value as
+  a parameter; compass keeps its own values, wording and vocabulary.
+  `src/hygiene.test.ts` fails on consumer internals and on compass's name.
+- Behavior that differs between mycel and dian is a named **profile**, never
+  a flag soup. Phase 1 profiles reproduce each consumer's current behavior
   byte-for-byte. The neutrality proof is the consumer repo's own goldens,
   so a profile is not done until a consumer PR shows its goldens unchanged.
 - Peer dependencies for anything a consumer also loads (better-auth, ai,
@@ -33,8 +37,13 @@ before starting a wave.
 
 ## Releases
 
-Tag `vX.Y.Z` on main; consumers pin tags. While on 0.x, a breaking change
-bumps the minor version and says so in the tag message.
+Bump `version` in `package.json` on main, then tag `vX.Y.Z` on that commit.
+`release.yml` publishes the tag to npm as `@buritica/rootstock` through npm
+trusted publishing (no tokens); it refuses a tag that does not match
+`package.json`. Tags are immutable (repo ruleset), so a bad release is fixed by
+a new version, never a moved tag. Consumers exact-pin the npm version and
+install with `--frozen-lockfile`. While on 0.x, a breaking change bumps the
+minor version and says so in the tag message.
 
 ## Agents
 

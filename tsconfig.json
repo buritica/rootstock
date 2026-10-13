@@ -12,7 +12,9 @@
     "skipLibCheck": true,
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["@types/bun"]
+    "types": ["@types/bun"],
+    "noImplicitOverride": true,
+    "erasableSyntaxOnly": true
   },
   "include": ["src"]
 }
