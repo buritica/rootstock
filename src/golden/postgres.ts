@@ -1,3 +1,5 @@
+import { hostname } from "node:os";
+
 /**
  * A throwaway Postgres in Docker for DB-backed goldens: run-unique name,
  * Docker-assigned loopback port, removed on stop. Never point goldens at a
@@ -8,6 +10,19 @@ export interface ThrowawayPostgres {
   name: string;
   stop: () => Promise<void>;
 }
+
+/**
+ * Docker labels every throwaway container carries, so a later sweep can find
+ * the containers this harness started and tell which process and host own
+ * them: `marker` is `"1"`, `pid` the owning process id, `host` its
+ * `os.hostname()`, and `ownerStart` the process start time in epoch ms.
+ */
+export const GOLDEN_LABELS = {
+  marker: "rootstock.golden",
+  pid: "rootstock.golden.pid",
+  host: "rootstock.golden.host",
+  ownerStart: "rootstock.golden.owner-start",
+} as const;
 
 let counter = 0;
 
@@ -32,6 +47,14 @@ export async function startThrowawayPostgres(
     "--rm",
     "--name",
     name,
+    "--label",
+    `${GOLDEN_LABELS.marker}=1`,
+    "--label",
+    `${GOLDEN_LABELS.pid}=${process.pid}`,
+    "--label",
+    `${GOLDEN_LABELS.host}=${hostname()}`,
+    "--label",
+    `${GOLDEN_LABELS.ownerStart}=${Math.round(performance.timeOrigin)}`,
     "-e",
     "POSTGRES_USER=golden",
     "-e",
@@ -45,8 +68,18 @@ export async function startThrowawayPostgres(
   if (started.code !== 0) {
     throw new Error(`startThrowawayPostgres: docker run failed: ${started.err}`);
   }
+  // Always resolves: a failed `docker stop` falls back to `docker rm -f`.
   const stop = async () => {
-    await run(["stop", name]);
+    try {
+      const stopped = await run(["stop", name]);
+      if (stopped.code !== 0) await run(["rm", "-f", name]);
+    } catch {
+      try {
+        await run(["rm", "-f", name]);
+      } catch {
+        // Nothing left to try; the labels let a later sweep find it.
+      }
+    }
   };
   try {
     const port = await run(["port", name, "5432/tcp"]);

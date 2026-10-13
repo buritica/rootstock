@@ -1,8 +1,16 @@
 export { canonicalJson, sha256Hex } from "./canonical.ts";
 export { CAPABILITIES, type CapabilityId, isCapabilityId } from "./capabilities.ts";
-export { runGoldenCli } from "./cli.ts";
+export {
+  type GitRunner,
+  GOLDEN_EXIT,
+  type GoldenCliOptions,
+  type GoldenExitCode,
+  runGoldenCli,
+} from "./cli.ts";
+export type { PathDiff } from "./diff.ts";
+export { GoldenCaseError, GoldenFileError } from "./errors.ts";
 export { createRecordingFetch, type RecordedRequest, redactUrl } from "./fetch.ts";
-export { startThrowawayPostgres, type ThrowawayPostgres } from "./postgres.ts";
+export { GOLDEN_LABELS, startThrowawayPostgres, type ThrowawayPostgres } from "./postgres.ts";
 export {
   captureSuites,
   checkSuites,
