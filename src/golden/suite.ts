@@ -1,7 +1,10 @@
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { canonicalJson, sha256Hex } from "./canonical.ts";
 import { type CapabilityId, isCapabilityId } from "./capabilities.ts";
+import { diffCanonicalTexts, type PathDiff } from "./diff.ts";
+import { GoldenCaseError, GoldenFileError } from "./errors.ts";
 
 export const GOLDEN_FORMAT = 1;
 
@@ -46,7 +49,15 @@ export type GoldenProblem =
   | { kind: "missing-case"; id: string }
   | { kind: "extra-case"; id: string }
   | { kind: "input-drift"; id: string; expected: string; actual: string }
-  | { kind: "output-mismatch"; id: string; expected: string; actual: string };
+  | {
+      kind: "output-mismatch";
+      id: string;
+      expected: string;
+      actual: string;
+      /** Where the outputs differ, at most 20 entries; `diffsOmitted` counts the rest. */
+      diffs: PathDiff[];
+      diffsOmitted: number;
+    };
 
 export interface SuiteReport {
   capability: CapabilityId;
@@ -99,18 +110,54 @@ export async function runCase(
   return { inputSha256, output, canonical: canonicalJson(output) };
 }
 
-/** Runs every suite and writes its golden file. Returns the written paths. */
+/**
+ * Like `runCase`, but a throw is rethrown as a `GoldenCaseError` naming the
+ * suite, the case and the phase that threw.
+ */
+export async function runSuiteCase(
+  suite: GoldenSuite,
+  c: GoldenCase,
+): Promise<{ inputSha256: string; output: unknown; canonical: string }> {
+  const fail = (phase: "input" | "run" | "output", cause: unknown) =>
+    new GoldenCaseError(suite.capability, suite.profile, c.id, phase, { cause });
+  let inputSha256: string;
+  try {
+    inputSha256 = sha256Hex(canonicalJson(c.input));
+  } catch (cause) {
+    throw fail("input", cause);
+  }
+  let output: unknown;
+  try {
+    output = await c.run();
+  } catch (cause) {
+    throw fail("run", cause);
+  }
+  try {
+    return { inputSha256, output, canonical: canonicalJson(output) };
+  } catch (cause) {
+    throw fail("output", cause);
+  }
+}
+
+/**
+ * Runs every suite and writes its golden file. Returns the written paths.
+ *
+ * Every case of every suite runs before anything is written, so a case that
+ * throws (rejecting with `GoldenCaseError`) leaves every existing golden file
+ * as it was. The files are then written in one synchronous pass, each to
+ * `<path>.rootstock-tmp` and renamed into place.
+ */
 export async function captureSuites(
   suites: GoldenSuite[],
   opts: { dir: string; repo: string; capturedFrom: string },
 ): Promise<string[]> {
   validateSuites(suites);
-  const written: string[] = [];
+  const pending: { dir: string; path: string; text: string }[] = [];
   for (const suite of suites) {
     const cases: GoldenFileCase[] = [];
     // Sequential on purpose: cases share fixtures and must not race.
     for (const c of suite.cases) {
-      const { inputSha256, output } = await runCase(c);
+      const { inputSha256, output } = await runSuiteCase(suite, c);
       cases.push({ id: c.id, inputSha256, output });
     }
     const file: GoldenFile = {
@@ -121,9 +168,27 @@ export async function captureSuites(
       capturedFrom: opts.capturedFrom,
       cases,
     };
-    const path = goldenPath(opts.dir, suite);
-    await mkdir(join(opts.dir, suite.capability), { recursive: true });
-    await writeFile(path, `${canonicalJson(file, 2)}\n`);
+    pending.push({
+      dir: join(opts.dir, suite.capability),
+      path: goldenPath(opts.dir, suite),
+      text: `${canonicalJson(file, 2)}\n`,
+    });
+  }
+  const written: string[] = [];
+  for (const { dir, path, text } of pending) {
+    mkdirSync(dir, { recursive: true });
+    const temp = `${path}.rootstock-tmp`;
+    try {
+      writeFileSync(temp, text);
+      renameSync(temp, path);
+    } catch (err) {
+      try {
+        rmSync(temp, { force: true });
+      } catch {
+        // The write error is the one worth reporting.
+      }
+      throw err;
+    }
     written.push(path);
   }
   return written;
@@ -140,7 +205,28 @@ export async function readGoldenFile(path: string): Promise<GoldenFile | undefin
   return JSON.parse(text) as GoldenFile;
 }
 
-/** Re-runs every suite against its committed golden file. */
+/** Reads a committed golden file for `checkSuites`; anything unusable is a `GoldenFileError`. */
+async function readCommittedFile(path: string): Promise<GoldenFile | undefined> {
+  let file: GoldenFile | undefined;
+  try {
+    file = await readGoldenFile(path);
+  } catch (cause) {
+    throw new GoldenFileError(path, { cause });
+  }
+  if (
+    file &&
+    (!Array.isArray(file.cases) || file.cases.some((c) => typeof c !== "object" || c === null))
+  ) {
+    throw new GoldenFileError(path, { cause: new TypeError("cases is not a list of objects") });
+  }
+  return file;
+}
+
+/**
+ * Re-runs every suite against its committed golden file. The first case that
+ * throws, in suite order, rejects with `GoldenCaseError`; a golden file that
+ * cannot be parsed rejects with `GoldenFileError`.
+ */
 export async function checkSuites(
   suites: GoldenSuite[],
   opts: { dir: string },
@@ -150,7 +236,7 @@ export async function checkSuites(
   for (const suite of suites) {
     const path = goldenPath(opts.dir, suite);
     const problems: GoldenProblem[] = [];
-    const file = await readGoldenFile(path);
+    const file = await readCommittedFile(path);
     if (!file) {
       problems.push({ kind: "missing-file", path });
     } else {
@@ -173,7 +259,7 @@ export async function checkSuites(
           continue;
         }
         recorded.delete(c.id);
-        const actual = await runCase(c);
+        const actual = await runSuiteCase(suite, c);
         if (actual.inputSha256 !== expected.inputSha256) {
           problems.push({
             kind: "input-drift",
@@ -182,13 +268,19 @@ export async function checkSuites(
             actual: actual.inputSha256,
           });
         }
-        const expectedCanonical = canonicalJson(expected.output);
+        let expectedCanonical: string;
+        try {
+          expectedCanonical = canonicalJson(expected.output);
+        } catch (cause) {
+          throw new GoldenFileError(path, { cause });
+        }
         if (actual.canonical !== expectedCanonical) {
           problems.push({
             kind: "output-mismatch",
             id: c.id,
             expected: expectedCanonical,
             actual: actual.canonical,
+            ...diffCanonicalTexts(expectedCanonical, actual.canonical),
           });
         }
       }
