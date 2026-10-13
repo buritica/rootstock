@@ -1,7 +1,7 @@
 /**
  * The shared capability vocabulary. Every golden suite names one of these, so
  * the same capability is recorded under the same id in every consumer repo —
- * that is what lets a Phase 1 extraction say "compass's and mycel's
+ * that is what lets a Phase 1 extraction say "every consumer's
  * `chunk.split` goldens are unchanged" without a translation table.
  *
  * Adding an id is a minor release; renaming or removing one is breaking.

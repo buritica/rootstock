@@ -19,7 +19,7 @@ export interface GoldenCase {
 
 export interface GoldenSuite {
   capability: CapabilityId;
-  /** Names the behavior variant, e.g. "mycel-v1", "compass-drive", "dian-articles". */
+  /** Names the behavior variant, e.g. "mycel-v1", "dian-articles". */
   profile: string;
   cases: GoldenCase[];
 }

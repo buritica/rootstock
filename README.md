@@ -8,11 +8,14 @@ Plain TypeScript with no build step. Bun runs the source directly.
 
 ## Install
 
-Pin a tag:
+Pin an exact version from npm:
 
 ```sh
-bun add github:buritica/rootstock#v0.0.1
+bun add --exact @buritica/rootstock
 ```
+
+The office-document extractor needs its optional peers (`jszip`, `mammoth`,
+`unpdf`); nothing else pulls them in.
 
 Each capability is a subpath export:
 

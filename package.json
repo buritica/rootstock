@@ -1,11 +1,14 @@
 {
   "name": "@buritica/rootstock",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Shared capabilities for Bun + Postgres knowledge systems: ingestion, chunking, embeddings, retrieval, judgments, and the goldens that prove extractions change nothing.",
   "license": "MIT",
   "type": "module",
   "private": false,
-  "repository": "github:buritica/rootstock",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buritica/rootstock.git"
+  },
   "engines": {
     "bun": ">=1.3"
   },
@@ -15,7 +18,15 @@
   ],
   "exports": {
     "./golden": "./src/golden/index.ts",
-    "./golden/bun-test": "./src/golden/bun-test.ts"
+    "./golden/bun-test": "./src/golden/bun-test.ts",
+    "./hash": "./src/hash/index.ts",
+    "./chunking-version": "./src/chunking-version/index.ts",
+    "./normalize": "./src/normalize/index.ts",
+    "./slugify": "./src/slugify/index.ts",
+    "./split": "./src/split/index.ts",
+    "./webhook-verify": "./src/webhook-verify/index.ts",
+    "./office-extract": "./src/office-extract/index.ts",
+    "./grounding-quote": "./src/grounding-quote/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
@@ -27,6 +38,29 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
     "@types/bun": "1.4.2",
-    "typescript": "7.0.2"
+    "jszip": "3.10.2",
+    "mammoth": "1.13.0",
+    "typescript": "7.0.2",
+    "unpdf": "1.8.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "peerDependencies": {
+    "jszip": "~3.10.2",
+    "mammoth": "^1.13.0",
+    "unpdf": "^1.8.1"
+  },
+  "peerDependenciesMeta": {
+    "jszip": {
+      "optional": true
+    },
+    "mammoth": {
+      "optional": true
+    },
+    "unpdf": {
+      "optional": true
+    }
   }
 }
