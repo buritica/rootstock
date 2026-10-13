@@ -6,6 +6,16 @@ import {
   splitBodyWithinBudget,
 } from "./index.ts";
 
+/** The message `fn` throws, so a refusal is matched exactly rather than as a substring. */
+function messageOf(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (e) {
+    return (e as Error).message;
+  }
+  throw new Error("expected a throw");
+}
+
 const len = (n: number) => n;
 
 describe("packWithinBudget", () => {
@@ -63,9 +73,9 @@ describe("packWithinBudget", () => {
   }
 
   test("refuses before measuring anything, even for empty input", () => {
-    expect(() => packWithinBudget([], { budget: 0, sizeOf: len, separatorCost: 1 })).toThrow(
-      "packWithinBudget: budget must be at least 1 char, got 0",
-    );
+    expect(
+      messageOf(() => packWithinBudget([], { budget: 0, sizeOf: len, separatorCost: 1 })),
+    ).toBe("packWithinBudget: budget must be at least 1 char, got 0");
   });
 });
 
@@ -193,16 +203,18 @@ describe("splitBodyWithinBudget", () => {
   ];
   for (const [charBudget, message] of budgetRefusals) {
     test(`refuses char budget ${charBudget}, naming the JSON-encoded title`, () => {
-      expect(() => splitBodyWithinBudget('My "T"\n', "x", { charBudget, adapter: "lbl" })).toThrow(
-        message,
-      );
+      expect(
+        messageOf(() => splitBodyWithinBudget('My "T"\n', "x", { charBudget, adapter: "lbl" })),
+      ).toBe(message);
     });
   }
 
   test("refuses when packing yields zero parts", () => {
     // Only reachable when the body's split yields nothing, which a real string never does.
     const body = { split: () => [] } as unknown as string;
-    expect(() => splitBodyWithinBudget("t", body, { charBudget: 5, adapter: "lbl" })).toThrow(
+    expect(
+      messageOf(() => splitBodyWithinBudget("t", body, { charBudget: 5, adapter: "lbl" })),
+    ).toBe(
       'lbl: splitter produced zero parts for title "t" — the packer dropped every block, which must never happen',
     );
   });

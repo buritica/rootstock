@@ -8,6 +8,16 @@ import {
   windowBody,
 } from "./index.ts";
 
+/** The message `fn` throws, so a refusal is matched exactly rather than as a substring. */
+function messageOf(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (e) {
+    return (e as Error).message;
+  }
+  throw new Error("expected a throw");
+}
+
 // A production parameter set (numeric values as a consumer runs them), as test literals.
 const P: WindowParams = Object.freeze({
   charsPerToken: 2.8,
@@ -91,7 +101,7 @@ describe("windowBody plans", () => {
   }
 
   test("NaN maxInputTokens takes the windows path and the splitter refuses, naming the title", () => {
-    expect(() => plan("x", Number.NaN, P, 'My "T"')).toThrow(
+    expect(messageOf(() => plan("x", Number.NaN, P, 'My "T"'))).toBe(
       'windower: char budget for title "My \\"T\\"" is NaN — the title alone exceeds the embedding window',
     );
   });
@@ -261,7 +271,7 @@ describe("windowBody parameters", () => {
   });
 
   test("refusalLabel names the caller in the refusal", () => {
-    expect(() => plan("x", Number.NaN, { ...U, refusalLabel: "my-label" }, "t")).toThrow(
+    expect(messageOf(() => plan("x", Number.NaN, { ...U, refusalLabel: "my-label" }, "t"))).toBe(
       'my-label: char budget for title "t" is NaN — the title alone exceeds the embedding window',
     );
   });
