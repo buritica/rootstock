@@ -1,6 +1,6 @@
 {
   "name": "@buritica/rootstock",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Shared capabilities for Bun + Postgres knowledge systems: ingestion, chunking, embeddings, retrieval, judgments, and the goldens that prove extractions change nothing.",
   "license": "MIT",
   "type": "module",
@@ -26,7 +26,9 @@
     "./split": "./src/split/index.ts",
     "./webhook-verify": "./src/webhook-verify/index.ts",
     "./office-extract": "./src/office-extract/index.ts",
-    "./grounding-quote": "./src/grounding-quote/index.ts"
+    "./grounding-quote": "./src/grounding-quote/index.ts",
+    "./retry": "./src/retry/index.ts",
+    "./slack": "./src/slack/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",

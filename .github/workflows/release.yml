@@ -49,4 +49,13 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       # Trusted publishing needs npm >= 11.5.1.
       - run: npm install --global npm@^11.5.1
-      - run: npm publish --provenance --access public
+      # A tag push can trigger this workflow twice; npm refuses to republish a
+      # version, so skip when this exact version is already on the registry.
+      - name: Publish unless already published
+        run: |
+          version="$(jq -r .version package.json)"
+          if npm view "@buritica/rootstock@${version}" version >/dev/null 2>&1; then
+            echo "@buritica/rootstock@${version} is already published; nothing to do."
+          else
+            npm publish --provenance --access public
+          fi

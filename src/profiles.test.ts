@@ -72,3 +72,47 @@ test("webhook-verify depends on node:crypto only", async () => {
   }
   expect(offenders).toEqual([]);
 });
+
+const PURE_SUBPATHS = ["src/retry/", "src/slack/"] as const;
+const FORBIDDEN_GLOBALS =
+  /\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|AbortSignal|crypto|process|console|Bun|globalThis|require)\b/;
+
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+}
+
+describe("transport subpaths are pure (every clock, timer and I/O is injected)", () => {
+  test("non-test files import only their own subpath", async () => {
+    const offenders: string[] = [];
+    for (const path of await sourceFiles()) {
+      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || path.endsWith(".test.ts")) continue;
+      for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
+        if (!spec.startsWith("./")) offenders.push(`${path} imports ${spec}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("non-test files reach no ambient global once comments are stripped", async () => {
+    const offenders: string[] = [];
+    for (const path of await sourceFiles()) {
+      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || path.endsWith(".test.ts")) continue;
+      const code = stripComments(await Bun.file(`${ROOT}/${path}`).text());
+      code.split("\n").forEach((line, i) => {
+        const m = line.match(FORBIDDEN_GLOBALS);
+        if (m) offenders.push(`${path}:${i + 1} uses ${m[0]}`);
+      });
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("they export no profiles", async () => {
+    for (const sub of ["retry", "slack"]) {
+      const mod: Record<string, unknown> = await import(`${ROOT}/src/${sub}/index.ts`);
+      for (const [name, value] of Object.entries(mod)) {
+        const isProfile = value !== null && typeof value === "object" && "id" in value;
+        expect(isProfile, `${sub}.${name}`).toBe(false);
+      }
+    }
+  });
+});
