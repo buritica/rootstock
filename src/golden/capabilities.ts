@@ -4,7 +4,7 @@
  * that is what lets a Phase 1 extraction say "every consumer's
  * `chunk.split` goldens are unchanged" without a translation table.
  *
- * Adding an id is a minor release; renaming or removing one is breaking.
+ * Adding an id is additive (a patch release while on 0.x); renaming or removing one is breaking.
  */
 export const CAPABILITIES = [
   // Text identity and normalization
@@ -35,6 +35,9 @@ export const CAPABILITIES = [
   "search.envelope",
   "citation.display",
   "grounding.quote",
+  // Outbound transport
+  "transport.retry", // retry, backoff, rate-limit and wait schedules of an outbound client
+  "transport.slack", // Slack Web API request construction, cursor pagination and error mapping
 ] as const;
 
 export type CapabilityId = (typeof CAPABILITIES)[number];
