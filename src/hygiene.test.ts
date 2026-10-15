@@ -16,6 +16,8 @@ const FORBIDDEN: readonly RegExp[] = [
   new RegExp(["\\b", "Tec", "\\b"].join("")),
   new RegExp(["sev", "ero|half", "moon|estan", "li"].join("")),
   /[\w.+-]+@[\w-]+\.[a-z]{2,}/i,
+  new RegExp(["Run", "Fatal"].join("")),
+  new RegExp(["storm", ".?breaker"].join(""), "i"),
 ];
 
 const SELF = "hygiene.test.ts";
