@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { createTokenBucketPacer } from "./token-bucket-pacer.ts";
 
 // A fake clock: sleeping advances it by exactly the requested time and settles immediately, so
-// every wait the pacer asks for is observable as a literal.
+// every wait the pacer asks for is observable as a literal. A pacer that spins (a rounding bug
+// asking for 0 ms forever) hits the sleep cap and fails its case instead of hanging the suite.
+const SLEEP_CAP = 1000;
+
 function fakeClock(startMs = 1_000_000) {
   const state = { t: startMs, nowCalls: 0, sleeps: [] as number[] };
   return {
@@ -12,6 +15,7 @@ function fakeClock(startMs = 1_000_000) {
       return state.t;
     },
     sleep: async (ms: number) => {
+      if (state.sleeps.length >= SLEEP_CAP) throw new Error("fake clock: sleep cap exceeded");
       state.sleeps.push(ms);
       state.t += ms;
     },

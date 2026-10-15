@@ -23,6 +23,11 @@ describe("mentionsRateLimitExhausted", () => {
       false,
     ],
     ["non-numeric count", "x rate-limited 1x times — halting rather than hammering", false],
+    [
+      "empty count between two spaces",
+      "x rate-limited  times — halting rather than hammering",
+      false,
+    ],
     ["missing count", "x rate-limited times — halting rather than hammering", false],
     [
       "no leading space before the phrase",
