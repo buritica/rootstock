@@ -23,7 +23,7 @@ export function parseMigration(filename: string, bytes: Uint8Array): RootstockMi
   const kind = MARKER.exec(head)?.[1] as MigrationKind | undefined;
   if (kind === undefined) {
     throw new Error(
-      `rootstockMigrations: ${filename} has no "-- rootstock-migration: additive|heavy" line in its first 40 lines`,
+      `rootstockMigrations: ${filename} has no "-- rootstock-migration: additive|heavy" line in its first ${MARKER_WINDOW_LINES} lines`,
     );
   }
   return Object.freeze({

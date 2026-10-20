@@ -6,6 +6,7 @@ import { parseMigration, rootstockMigrations } from "./migrations.ts";
 const DIR = new URL("./migrations/", import.meta.url);
 const FILE = "20261020000000_schema_migrations.sql";
 const NAME = /^\d{14}_[a-z0-9_]+\.sql$/;
+const FILES = readdirSync(DIR).sort();
 
 function encode(text: string): Uint8Array {
   return new TextEncoder().encode(text);
@@ -13,10 +14,10 @@ function encode(text: string): Uint8Array {
 
 describe("the shipped files", () => {
   test("the manifest is the directory, sorted", () => {
-    expect([...MANIFEST]).toEqual(readdirSync(DIR).sort());
+    expect([...MANIFEST]).toEqual(FILES);
   });
 
-  for (const file of readdirSync(DIR).sort()) {
+  for (const file of FILES) {
     test(`${file} follows the file rules`, () => {
       expect(file).toMatch(NAME);
       const text = readFileSync(new URL(file, DIR), "utf8");

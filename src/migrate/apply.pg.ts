@@ -34,16 +34,12 @@ const HEAVY = fixture(
 );
 const FUTURE = "20991231000000_future.sql";
 
-function freshSchema(): string {
-  return `rs_t_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-}
-
 let main: TestTransactor;
 let sql: Sql;
 const made: string[] = [];
 
 function schema(): string {
-  const s = freshSchema();
+  const s = `rs_t_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
   made.push(s);
   return s;
 }
@@ -87,7 +83,7 @@ beforeAll(() => {
 
 afterAll(async () => {
   await sql.unsafe("RESET ROLE");
-  for (const s of made) await sql.unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
+  await sql.unsafe(`DROP SCHEMA IF EXISTS ${made.map((s) => `"${s}"`).join(", ")} CASCADE`);
   await main.close();
 });
 

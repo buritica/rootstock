@@ -1,5 +1,4 @@
-import type { Sql } from "./db-surface.ts";
-import { quoted } from "./db-surface.ts";
+import { quoted, type Sql } from "./db-surface.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 
@@ -43,18 +42,16 @@ export async function statusOf(
     : [];
   const recorded = new Map(rows.map((r) => [r.filename, r.sha256]));
   const shipped = new Set(list.map((m) => m.filename));
-  const byName = (a: { filename: string }, b: { filename: string }) =>
-    a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
-  const pending = list.filter((m) => !recorded.has(m.filename)).sort(byName);
+  const pending: RootstockMigration[] = [];
+  const tampered: RootstockMigrationStatus["tampered"][number][] = [];
+  for (const m of [...list].sort((a, b) => (a.filename < b.filename ? -1 : 1))) {
+    const sha = recorded.get(m.filename);
+    if (sha === undefined) pending.push(m);
+    else if (sha !== m.sha256) {
+      tampered.push(Object.freeze({ filename: m.filename, recorded: sha, shipped: m.sha256 }));
+    }
+  }
   const ahead = rows.map((r) => r.filename).filter((f) => !shipped.has(f));
-  const tampered = list
-    .filter((m) => recorded.has(m.filename) && recorded.get(m.filename) !== m.sha256)
-    .map((m) => ({
-      filename: m.filename,
-      recorded: recorded.get(m.filename) ?? "",
-      shipped: m.sha256,
-    }))
-    .sort(byName);
   return Object.freeze({
     schema,
     schemaExists,
@@ -62,7 +59,7 @@ export async function statusOf(
     applied: Object.freeze(rows.map((r) => r.filename)),
     pending: Object.freeze(pending),
     ahead: Object.freeze(ahead),
-    tampered: Object.freeze(tampered.map((t) => Object.freeze(t))),
+    tampered: Object.freeze(tampered),
     red:
       pending.length > 0 || tampered.length > 0 || (ahead.length > 0 && slice.ahead === "refuse"),
   });

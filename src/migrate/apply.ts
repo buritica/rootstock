@@ -1,5 +1,4 @@
-import type { Transactor, TxSql } from "./db-surface.ts";
-import { quoted } from "./db-surface.ts";
+import { quoted, type Transactor, type TxSql } from "./db-surface.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import { statusOf } from "./status.ts";
@@ -60,6 +59,7 @@ export async function applyMigrationList(
   assertMigrateSlice("applyRootstockMigrations", slice);
   const { schema } = slice;
   return transactor.begin(async (tx) => {
+    // Selected FROM the call so no driver has to decode a void column.
     await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${schema}`}::text)::bigint)`;
     const { exists } = await preflight(tx, schema);
     if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoted(schema)}`);
@@ -70,10 +70,10 @@ export async function applyMigrationList(
         `applyRootstockMigrations: ${schema}.schema_migrations records ${tamper.filename} with sha256 ${tamper.recorded}, but this package ships ${tamper.shipped} — an applied migration changed after it ran; refusing, and re-running will not fix this`,
       );
     }
-    const pending = status.pending.map((m) => m.filename);
-    if (status.ahead.length > 0 && pending.length > 0) {
+    const pendingNames = status.pending.map((m) => m.filename);
+    if (status.ahead.length > 0 && pendingNames.length > 0) {
       throw new Error(
-        `applyRootstockMigrations: schema "${schema}" has applied ${status.ahead.join(", ")}, which this package does not ship, and is missing ${pending.join(", ")} — the database and this package have diverged; refusing`,
+        `applyRootstockMigrations: schema "${schema}" has applied ${status.ahead.join(", ")}, which this package does not ship, and is missing ${pendingNames.join(", ")} — the database and this package have diverged; refusing`,
       );
     }
     if (status.ahead.length > 0 && slice.ahead === "refuse") {
@@ -100,7 +100,7 @@ export async function applyMigrationList(
     return Object.freeze({
       schema,
       schemaCreated: !exists,
-      applied: Object.freeze(pending),
+      applied: Object.freeze(pendingNames),
       alreadyApplied: status.applied.length - status.ahead.length,
       ahead: Object.freeze([...status.ahead]),
     });
