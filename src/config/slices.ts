@@ -5,7 +5,8 @@ import type * as migrate from "../migrate/index.ts";
 // The parts of the db, migrate and concurrency surfaces that config reads,
 // declared from their frozen signatures. While a subpath exports nothing,
 // config uses these views; once it exports its parser, `Parser` below picks
-// up the real signature, branded slice type included, with no edit here.
+// up the real signature, so both the input and the branded slice types come
+// from that subpath and the views here go unused.
 
 export type DriverDefault = "driver-default";
 
@@ -72,6 +73,14 @@ export interface SliceParsers {
 type Slice<K extends keyof SliceParsers> = SliceParsers[K] extends (input: never) => infer S
   ? S
   : never;
+
+type Input<K extends keyof SliceParsers> = SliceParsers[K] extends (input: infer I) => unknown
+  ? I
+  : never;
+
+export type ClientInput = Input<"clientSlice">;
+export type MigrateInput = Input<"migrateSlice">;
+export type ConcurrencyInput = Input<"concurrencySlice">;
 
 export type ClientSlice = Slice<"clientSlice">;
 export type MigrateSlice = Slice<"migrateSlice">;

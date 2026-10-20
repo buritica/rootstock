@@ -1,10 +1,10 @@
 import type {
+  ClientInput,
   ClientSlice,
-  ClientSliceInput,
+  ConcurrencyInput,
   ConcurrencySlice,
-  ConcurrencySliceInput,
+  MigrateInput,
   MigrateSlice,
-  MigrateSliceInput,
   SliceParsers,
 } from "./slices.ts";
 
@@ -16,9 +16,9 @@ export interface Invariant {
 }
 
 export interface RootstockConfigInput {
-  client: ClientSliceInput;
-  migrate: MigrateSliceInput;
-  concurrency: ConcurrencySliceInput;
+  client: ClientInput;
+  migrate: MigrateInput;
+  concurrency: ConcurrencyInput;
   invariants?: readonly Invariant[];
 }
 
@@ -28,14 +28,14 @@ export interface RootstockConfig {
   readonly client: ClientSlice;
   readonly migrate: MigrateSlice;
   readonly concurrency: ConcurrencySlice;
-  /** The ids that were checked and held, in input order. */
+  /** Every invariant id, in input order; all of them held, or define threw. */
   readonly invariants: readonly string[];
 }
 
 const built = new WeakSet<object>();
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
-/** True when `config` came from this module, and is safe to read as one. */
+/** True when `config` was built by composeRootstockConfig and every invariant held. */
 export function isRootstockConfig(config: unknown): config is RootstockConfig {
   return typeof config === "object" && config !== null && built.has(config);
 }
@@ -65,29 +65,49 @@ export function composeRootstockConfig(
   }
 
   // Branded before the checks run, so a check may print the config it is
-  // judging; a failed build takes the brand back.
-  const config = deepFreeze({ client, migrate, concurrency, invariants: ids });
+  // judging; any way out of the checks other than success takes it back.
+  const config = deepFreeze({
+    client,
+    migrate,
+    concurrency,
+    invariants: ids,
+  } satisfies Omit<RootstockConfig, typeof rootstockConfigBrand>);
   built.add(config);
   const branded = config as unknown as RootstockConfig;
 
-  const failures: string[] = [];
-  for (const inv of invariants) {
-    let message: string | null;
-    try {
-      message = inv.check(branded);
-    } catch (err) {
-      // A check that cannot run is a check that did not hold.
-      message = err instanceof Error ? err.message : String(err);
+  let held = false;
+  try {
+    const failures: string[] = [];
+    for (const inv of invariants) {
+      let message: unknown;
+      try {
+        message = inv.check(branded);
+      } catch (err) {
+        // A check that cannot run is a check that did not hold.
+        message = err instanceof Error ? err.message : err;
+      }
+      if (message !== null) failures.push(`${inv.id}: ${describe(message)}`);
     }
-    if (message !== null) failures.push(`${inv.id}: ${message}`);
+    if (failures.length > 0) {
+      throw new Error(
+        `defineRootstockConfig: ${failures.length} invariant(s) failed — ${failures.join("; ")}`,
+      );
+    }
+    held = true;
+    return branded;
+  } finally {
+    if (!held) built.delete(config);
   }
-  if (failures.length > 0) {
-    built.delete(config);
-    throw new Error(
-      `defineRootstockConfig: ${failures.length} invariant(s) failed — ${failures.join("; ")}`,
-    );
+}
+
+/** A failure message as text, whatever a check returned or threw. */
+function describe(message: unknown): string {
+  if (typeof message === "string") return message;
+  try {
+    return String(message);
+  } catch {
+    return Object.prototype.toString.call(message);
   }
-  return branded;
 }
 
 function deepFreeze<T extends object>(value: T): T {

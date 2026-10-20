@@ -15,13 +15,32 @@ export function printRootstockConfig(config: RootstockConfig): string {
       "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return",
     );
   }
-  // The slices are frozen plain data, so they print as they are: a field a
-  // slice gains later shows up in every config golden without an edit here.
+  // The view is the frozen field list, not whatever a slice object holds,
+  // so nothing a parser keeps for itself reaches a golden. A slice field a
+  // later stage adds is printed only once it is named here.
+  const profiles: Record<string, unknown> = {};
+  for (const [name, p] of Object.entries(config.client.profiles)) {
+    profiles[name] = {
+      connectTimeoutSeconds: p.connectTimeoutSeconds,
+      idleTimeoutSeconds: p.idleTimeoutSeconds,
+      keepAliveSeconds: p.keepAliveSeconds,
+      max: p.max,
+      maxCeiling: p.maxCeiling,
+      maxLifetimeSeconds: p.maxLifetimeSeconds,
+      prepare: p.prepare,
+      readOnly: p.readOnly,
+      statementTimeoutMs: p.statementTimeoutMs,
+    };
+  }
+  const widths: Record<string, unknown> = {};
+  for (const [name, w] of Object.entries(config.concurrency.widths)) {
+    widths[name] = { default: w.default, max: w.max };
+  }
   const view: Record<string, unknown> = {
-    client: config.client,
-    concurrency: config.concurrency,
-    invariants: config.invariants,
-    migrate: config.migrate,
+    client: { profiles },
+    concurrency: { widths },
+    invariants: [...config.invariants],
+    migrate: { ahead: config.migrate.ahead, schema: config.migrate.schema },
   };
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;

@@ -13,6 +13,8 @@ function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined
  * free. A "driver-default" pool max cannot be compared, so it fails.
  */
 export function widthBelowPool(widthName: string, profileName: string): Invariant {
+  // Lowercased, so widths "fooBar" and "foobar" against one profile share an
+  // id and the second is refused as a duplicate.
   return Object.freeze({
     id: `width-below-pool.${widthName.toLowerCase()}.${profileName.toLowerCase()}`,
     check(config: RootstockConfig): string | null {

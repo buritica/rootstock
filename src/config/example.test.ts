@@ -14,7 +14,7 @@ import type {
 
 // Test doubles of the three slice parsers, built from their frozen
 // signatures: each copies its input and returns it unfrozen, so every freeze
-// these tests observe is config's own. The composition test replaces them
+// these tests observe is config's own. The O3 composition test replaces them
 // with the real parsers once those exist. The cast is what lets them stand
 // in for a real parser whose result also carries its slice's brand type.
 const doubles = {
@@ -66,7 +66,8 @@ const exampleInput: RootstockConfigInput = {
       write: { default: 2, max: 8 },
     },
   },
-  invariants: [widthBelowPool("fetch", "app")],
+  // Not in sorted order, so the print is seen to keep input order.
+  invariants: [widthBelowPool("fetch", "app"), { id: "app-pool-sane", check: () => null }],
 };
 
 const EXAMPLE_PRINT = `{
@@ -110,7 +111,8 @@ const EXAMPLE_PRINT = `{
   },
   "embed": "absent",
   "invariants": [
-    "width-below-pool.fetch.app"
+    "width-below-pool.fetch.app",
+    "app-pool-sane"
   ],
   "lock": "absent",
   "migrate": {
@@ -153,17 +155,18 @@ describe("print", () => {
     const text = JSON.stringify(view);
     expect(text).not.toContain("://");
     expect(text).not.toContain("@");
-    const invariantIds = new Set<string>(view.invariants);
     const hostLike = /[a-z0-9-]+\.[a-z]{2,}(?![a-z0-9_])/i;
     const offenders: string[] = [];
     const walk = (v: unknown): void => {
       if (typeof v === "string") {
-        if (hostLike.test(v) && !invariantIds.has(v)) offenders.push(v);
+        if (hostLike.test(v)) offenders.push(v);
       } else if (v !== null && typeof v === "object") {
         for (const child of Object.values(v)) walk(child);
       }
     };
-    walk(view);
+    // Invariant ids are dotted by design, so only their array is exempt.
+    const { invariants: _ids, ...rest } = view;
+    walk(rest);
     expect(offenders).toEqual([]);
   });
 
@@ -307,7 +310,111 @@ describe("define", () => {
 
   test("input-left-unfrozen", () => {
     define(exampleInput);
-    expect(Object.isFrozen(exampleInput)).toBe(false);
+    expect(Object.isFrozen(exampleInput.client.profiles.app)).toBe(false);
+    expect(Object.isFrozen(exampleInput.concurrency.widths.fetch)).toBe(false);
+    expect(Object.isFrozen(exampleInput.migrate)).toBe(false);
+  });
+});
+
+describe("brand and failure paths", () => {
+  test("check-may-print-the-config-it-judges", () => {
+    let printed = "";
+    let frozen = false;
+    const peek: Invariant = {
+      id: "peek",
+      check: (config) => {
+        printed = printRootstockConfig(config);
+        frozen = Object.isFrozen(config) && Object.isFrozen(config.client.profiles.app);
+        return null;
+      },
+    };
+    define({ ...exampleInput, invariants: [peek] });
+    expect(JSON.parse(printed).invariants).toEqual(["peek"]);
+    expect(frozen).toBe(true);
+  });
+
+  test("failed-build-takes-the-brand-back", () => {
+    let kept: unknown;
+    const stash: Invariant = {
+      id: "stash",
+      check: (config) => {
+        kept = config;
+        return "no";
+      },
+    };
+    expect(messageOf(() => define({ ...exampleInput, invariants: [stash] }))).toBe(
+      "defineRootstockConfig: 1 invariant(s) failed — stash: no",
+    );
+    // biome-ignore lint/suspicious/noExplicitAny: the config a failed build leaked
+    expect(messageOf(() => printRootstockConfig(kept as any))).toBe(UNBRANDED);
+  });
+
+  test("unprintable-throw-still-reported-and-brand-taken-back", () => {
+    let kept: unknown;
+    const odd: Invariant = {
+      id: "odd",
+      check: (config) => {
+        kept = config;
+        throw Object.create(null);
+      },
+    };
+    expect(
+      messageOf(() => define({ ...exampleInput, invariants: [odd, fails("next", "x")] })),
+    ).toBe("defineRootstockConfig: 2 invariant(s) failed — odd: [object Object]; next: x");
+    // biome-ignore lint/suspicious/noExplicitAny: the config a failed build leaked
+    expect(messageOf(() => printRootstockConfig(kept as any))).toBe(UNBRANDED);
+  });
+
+  test("non-error-throw-and-empty-message-are-failures", () => {
+    const throwsText: Invariant = {
+      id: "text",
+      check: () => {
+        throw "plain text";
+      },
+    };
+    expect(
+      messageOf(() => define({ ...exampleInput, invariants: [throwsText, fails("empty", "")] })),
+    ).toBe("defineRootstockConfig: 2 invariant(s) failed — text: plain text; empty: ");
+  });
+
+  test("invariant-without-a-string-id-refused", () => {
+    const noId = { check: () => null } as unknown as Invariant;
+    expect(messageOf(() => define({ ...exampleInput, invariants: [noId] }))).toBe(
+      "defineRootstockConfig: invariant id undefined must match [a-z0-9][a-z0-9.-]* and be unique",
+    );
+    const numeric = { id: 7, check: () => null } as unknown as Invariant;
+    expect(messageOf(() => define({ ...exampleInput, invariants: [numeric] }))).toBe(
+      "defineRootstockConfig: invariant id 7 must match [a-z0-9][a-z0-9.-]* and be unique",
+    );
+  });
+
+  test("parser-errors-come-before-invariant-ids", () => {
+    const boom = new Error("concurrencySlice: widths is required");
+    const failing = {
+      ...doubles,
+      concurrencySlice: () => {
+        throw boom;
+      },
+    } as unknown as SliceParsers;
+    let caught: unknown;
+    try {
+      composeRootstockConfig(failing, { ...exampleInput, invariants: [holds("Bad")] });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBe(boom);
+  });
+
+  test("hand-built-config-fails-typecheck", () => {
+    const real = define(exampleInput);
+    const literal = {
+      client: real.client,
+      migrate: real.migrate,
+      concurrency: real.concurrency,
+      invariants: [],
+    };
+    // @ts-expect-error a literal lacks the config brand
+    expect(messageOf(() => printRootstockConfig(literal))).toBe(UNBRANDED);
   });
 });
 
@@ -327,7 +434,7 @@ describe("widthBelowPool", () => {
   });
 
   test("id-is-lowercased", () => {
-    expect(widthBelowPool("embedWrite", "app").id).toBe("width-below-pool.embedwrite.app");
+    expect(widthBelowPool("fetchWrite", "App").id).toBe("width-below-pool.fetchwrite.app");
   });
 
   test("width-below-pool-holds", () => {
@@ -359,6 +466,16 @@ describe("widthBelowPool", () => {
     };
     expect(messageOf(() => define(input))).toBe(
       'defineRootstockConfig: 2 invariant(s) failed — width-below-pool.nope.app: no width "nope" is declared; width-below-pool.fetch.gone: no profile "gone" is declared',
+    );
+  });
+
+  test("inherited-profile-name-is-not-declared", () => {
+    expect(
+      messageOf(() =>
+        define({ ...exampleInput, invariants: [widthBelowPool("fetch", "toString")] }),
+      ),
+    ).toBe(
+      'defineRootstockConfig: 1 invariant(s) failed — width-below-pool.fetch.tostring: no profile "toString" is declared',
     );
   });
 
