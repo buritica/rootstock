@@ -1,6 +1,6 @@
 {
   "name": "@buritica/rootstock",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Shared capabilities for Bun + Postgres knowledge systems: ingestion, chunking, embeddings, retrieval, judgments, and the goldens that prove extractions change nothing.",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,9 @@
   },
   "files": [
     "src",
-    "!src/**/*.test.ts"
+    "!src/**/*.test.ts",
+    "!src/**/*.pg.ts",
+    "!src/**/*.pg-support.ts"
   ],
   "exports": {
     "./golden": "./src/golden/index.ts",
@@ -28,20 +30,27 @@
     "./office-extract": "./src/office-extract/index.ts",
     "./grounding-quote": "./src/grounding-quote/index.ts",
     "./retry": "./src/retry/index.ts",
-    "./slack": "./src/slack/index.ts"
+    "./slack": "./src/slack/index.ts",
+    "./db": "./src/db/index.ts",
+    "./migrate": "./src/migrate/index.ts",
+    "./concurrency": "./src/concurrency/index.ts",
+    "./config": "./src/config/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
     "lint": "biome check .",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:db": "bun scripts/test-db.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
     "@types/bun": "1.4.2",
+    "drizzle-orm": "0.45.3",
     "jszip": "3.10.2",
     "mammoth": "1.13.0",
+    "postgres": "3.4.9",
     "typescript": "7.0.2",
     "unpdf": "1.8.1"
   },

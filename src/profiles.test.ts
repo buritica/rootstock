@@ -3,6 +3,16 @@ import pkg from "../package.json";
 
 const ROOT = `${import.meta.dir}/..`;
 const OFFICE_PEERS = new Set(["jszip", "mammoth", "unpdf"]);
+// Unit tests, DB suites (`*.pg.ts`) and their support modules (`*.pg-support.ts`)
+// import drivers and read the environment by design; every scan skips them.
+const TEST_FILE = /\.(test|pg|pg-support)\.ts$/;
+
+test("the published files exclude every test-file suffix", () => {
+  for (const suffix of ["test", "pg", "pg-support"]) {
+    expect(TEST_FILE.test(`x.${suffix}.ts`)).toBe(true);
+    expect(pkg.files).toContain(`!src/**/*.${suffix}.ts`);
+  }
+});
 
 function walk(value: unknown, seen: Set<object>, visit: (v: object) => void): void {
   if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
@@ -64,7 +74,7 @@ test("webhook-verify depends on node:crypto only", async () => {
   const offenders: string[] = [];
   for (const path of await sourceFiles()) {
     if (!path.startsWith("src/webhook-verify/")) continue;
-    const isTest = path.endsWith(".test.ts");
+    const isTest = TEST_FILE.test(path);
     for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
       const ok = spec === "node:crypto" || spec.startsWith("./") || (isTest && spec === "bun:test");
       if (!ok) offenders.push(`${path} imports ${spec}`);
@@ -73,7 +83,7 @@ test("webhook-verify depends on node:crypto only", async () => {
   expect(offenders).toEqual([]);
 });
 
-const PURE_SUBPATHS = ["src/retry/", "src/slack/"] as const;
+const PURE_SUBPATHS = ["src/retry/", "src/slack/", "src/db/", "src/concurrency/"] as const;
 const FORBIDDEN_GLOBALS =
   /\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|AbortSignal|crypto|process|console|Bun|globalThis|require)\b/;
 
@@ -81,11 +91,11 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 }
 
-describe("transport subpaths are pure (every clock, timer and I/O is injected)", () => {
+describe("pure subpaths (every clock, timer and I/O is injected)", () => {
   test("non-test files import only their own subpath", async () => {
     const offenders: string[] = [];
     for (const path of await sourceFiles()) {
-      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || path.endsWith(".test.ts")) continue;
+      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || TEST_FILE.test(path)) continue;
       for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
         if (!spec.startsWith("./")) offenders.push(`${path} imports ${spec}`);
       }
@@ -96,7 +106,7 @@ describe("transport subpaths are pure (every clock, timer and I/O is injected)",
   test("non-test files reach no ambient global once comments are stripped", async () => {
     const offenders: string[] = [];
     for (const path of await sourceFiles()) {
-      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || path.endsWith(".test.ts")) continue;
+      if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || TEST_FILE.test(path)) continue;
       const code = stripComments(await Bun.file(`${ROOT}/${path}`).text());
       code.split("\n").forEach((line, i) => {
         const m = line.match(FORBIDDEN_GLOBALS);
@@ -107,12 +117,89 @@ describe("transport subpaths are pure (every clock, timer and I/O is injected)",
   });
 
   test("they export no profiles", async () => {
-    for (const sub of ["retry", "slack"]) {
-      const mod: Record<string, unknown> = await import(`${ROOT}/src/${sub}/index.ts`);
+    for (const sub of PURE_SUBPATHS) {
+      const mod: Record<string, unknown> = await import(`${ROOT}/${sub}index.ts`);
       for (const [name, value] of Object.entries(mod)) {
         const isProfile = value !== null && typeof value === "object" && "id" in value;
         expect(isProfile, `${sub}.${name}`).toBe(false);
       }
     }
   });
+});
+
+// Non-test files of these subpaths may import only what is listed. A prefix
+// entry ending in "/" admits any specifier starting with it.
+const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
+  "src/migrate/": ["./", "../db/index.ts", "../hash/index.ts", "node:fs"],
+  "src/config/": [
+    "./",
+    "../db/index.ts",
+    "../migrate/index.ts",
+    "../concurrency/index.ts",
+    "../golden/canonical.ts",
+  ],
+};
+
+function allowed(spec: string, list: readonly string[]): boolean {
+  return list.some((entry) => (entry.endsWith("/") ? spec.startsWith(entry) : spec === entry));
+}
+
+test("migrate and config import only their allowlist", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    const prefix = Object.keys(IMPORT_ALLOWLIST).find((p) => path.startsWith(p));
+    if (prefix === undefined) continue;
+    const list = IMPORT_ALLOWLIST[prefix] ?? [];
+    for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
+      if (!allowed(spec, list)) offenders.push(`${path} imports ${spec}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
+// The published `./golden/bun-test` adapter exists to wrap bun:test, so it is
+// the one non-test file that may import it.
+const BUN_TEST_ADAPTER = "src/golden/bun-test.ts";
+
+const DRIVER = /^(postgres|pg|bun|drizzle-orm)(\/|$)|^bun:(?!test$)/;
+
+test("no non-test file imports a database driver, and bun:test stays in tests", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
+      const bunTest = spec === "bun:test" && path !== BUN_TEST_ADAPTER;
+      if (DRIVER.test(spec) || bunTest) offenders.push(`${path} imports ${spec}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
+// Test files are left out of the published package, so a shipped file that
+// imports one would fail to load for every consumer.
+test("no non-test file imports a test file", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
+      // Bundler resolution lets a specifier drop its `.ts`, so match the stem too.
+      if (/\.(test|pg|pg-support)(\.ts)?$/.test(spec)) offenders.push(`${path} imports ${spec}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
+test("no non-test file reads the environment", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    const code = stripComments(await Bun.file(`${ROOT}/${path}`).text());
+    code.split("\n").forEach((line, i) => {
+      if (/\b(process|Bun)\.env\b|\bprocess\[|import\.meta\.env/.test(line)) {
+        offenders.push(`${path}:${i + 1}`);
+      }
+    });
+  }
+  expect(offenders).toEqual([]);
 });
