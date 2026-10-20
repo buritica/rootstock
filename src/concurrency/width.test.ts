@@ -44,6 +44,12 @@ describe("concurrencySlice", () => {
   test.each<[string, unknown, string]>([
     ["missing widths", {}, "concurrencySlice: widths is required"],
     ["null input", null, "concurrencySlice: widths is required"],
+    ["array input", [], "concurrencySlice: widths is required"],
+    [
+      "unknown key with widths absent",
+      { width: {} },
+      "concurrencySlice: width must be a known key — got {}",
+    ],
     [
       "empty widths",
       { widths: {} },
@@ -140,22 +146,24 @@ describe("concurrencySlice", () => {
 });
 
 describe("width", () => {
-  const slice = concurrencySlice(input);
+  // Built inside each test, not at collection or in a hook, so a parser
+  // regression fails these tests by name instead of erroring the whole block.
+  const slice = (): ConcurrencySlice => concurrencySlice(input);
 
   test("an undefined request gives the default", () => {
-    expect(width(slice, "fetch")).toBe(4);
-    expect(width(slice, "fetch", undefined)).toBe(4);
-    expect(width(slice, "write")).toBe(2);
+    expect(width(slice(), "fetch")).toBe(4);
+    expect(width(slice(), "fetch", undefined)).toBe(4);
+    expect(width(slice(), "write")).toBe(2);
   });
 
   test("a request inside the bound is returned as is", () => {
-    expect(width(slice, "fetch", 1)).toBe(1);
-    expect(width(slice, "fetch", 6)).toBe(6);
+    expect(width(slice(), "fetch", 1)).toBe(1);
+    expect(width(slice(), "fetch", 6)).toBe(6);
   });
 
   test("width-at-max-accepted", () => {
-    expect(width(slice, "fetch", 8)).toBe(8);
-    expect(width(slice, "write", 2)).toBe(2);
+    expect(width(slice(), "fetch", 8)).toBe(8);
+    expect(width(slice(), "write", 2)).toBe(2);
   });
 
   test.each<[string, number, string]>([
@@ -165,17 +173,17 @@ describe("width", () => {
     ["fractional", 1.5, 'width: "fetch" requested 1.5 — must be an integer from 1 to 8'],
     ["NaN", Number.NaN, 'width: "fetch" requested null — must be an integer from 1 to 8'],
   ])("refuses a request %s with the exact text", (_label, requested, text) => {
-    expect(message(() => width(slice, "fetch", requested))).toBe(text);
+    expect(message(() => width(slice(), "fetch", requested))).toBe(text);
   });
 
   test("refuses a request that is not a number", () => {
-    expect(message(() => width(slice, "fetch", "2" as unknown as number))).toBe(
+    expect(message(() => width(slice(), "fetch", "2" as unknown as number))).toBe(
       'width: "fetch" requested "2" — must be an integer from 1 to 8',
     );
   });
 
   test.each(["missing", "toString", "constructor"])("refuses an undeclared name %s", (name) => {
-    expect(message(() => width(slice, name))).toBe(
+    expect(message(() => width(slice(), name))).toBe(
       `width: no width "${name}" — declared: fetch, write`,
     );
   });
@@ -186,7 +194,7 @@ describe("width", () => {
       "width: expected a ConcurrencySlice built by concurrencySlice() — got an object that parser did not return";
     expect(message(() => width(literal, "fetch"))).toBe(text);
     // A copy of a real slice is not the slice.
-    expect(message(() => width({ ...slice } as ConcurrencySlice, "fetch"))).toBe(text);
+    expect(message(() => width({ ...slice() } as ConcurrencySlice, "fetch"))).toBe(text);
     expect(message(() => width(null as unknown as ConcurrencySlice, "fetch"))).toBe(text);
   });
 

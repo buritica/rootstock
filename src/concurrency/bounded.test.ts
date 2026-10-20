@@ -121,6 +121,22 @@ describe("forEachBounded", () => {
     expect(h.events).toEqual(["run:0", "done:0"]);
   });
 
+  test("first-error-wins when a gate throws after an in-flight item rejected", async () => {
+    const h = harness(3);
+    const gate1 = Promise.withResolvers<void>();
+    const before = async (i: number) => {
+      if (i === 1) await gate1.promise;
+    };
+    const pass = forEachBounded(range(3), { width: 2, before }, h.run);
+    await flush();
+    const boom = new Error("boom");
+    h.runs[0]?.reject(boom);
+    await flush();
+    gate1.reject(new Error("gate refused"));
+    expect(await rejection(pass)).toBe(boom);
+    expect(h.events).toEqual(["run:0", "done:0"]);
+  });
+
   test("a synchronous throw from run is a rejection, and in-flight work finishes", async () => {
     const h = harness(3);
     const sync = new Error("sync");

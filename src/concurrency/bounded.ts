@@ -17,7 +17,8 @@ export interface BoundedOptions<T> {
  *   one finishes, so one slow item cannot idle the others.
  * - `before` is awaited in item order, before its item is dispatched. Gating
  *   inside the worker would let up to `width` items start against a gate
- *   nobody had re-checked yet.
+ *   nobody had re-checked yet, and gating once for the whole pass would miss
+ *   a gate that stops holding partway through.
  * - The first throw, from `before` or `run`, aborts the pass: nothing new is
  *   pulled, gated or dispatched after it. In-flight items are allowed to
  *   finish, because killing them mid-write leaves half-done work, and then the

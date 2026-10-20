@@ -3,8 +3,8 @@
  * the results in item order. A new call starts as soon as one finishes, and
  * `fn` gets each item's index.
  *
- * It does not validate `limit`. With `limit` 0, negative or `NaN` it starts no
- * workers and resolves to a sparse array, `new Array(items.length)` with every
+ * It does not validate `limit`. With `limit` 0, negative or `NaN` (indeed any
+ * limit below 1) it starts no workers and resolves to a sparse array, `new Array(items.length)` with every
  * slot a hole, so a caller that `.map`s the result skips the holes silently.
  * A fractional limit such as 1.5 starts one worker. Callers that need a
  * refusal check the limit themselves before calling.

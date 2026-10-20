@@ -85,6 +85,15 @@ describe("mapWithConcurrency", () => {
     expect(calls).toBe(0);
   });
 
+  test("an infinite limit starts every item, one worker per item", async () => {
+    const h = harness(3);
+    const call = mapWithConcurrency(["a", "b", "c"], Number.POSITIVE_INFINITY, h.fn);
+    await flush();
+    expect(h.started.length).toBe(3);
+    for (const [i, g] of h.gates.entries()) g.resolve(String(i));
+    expect(await call).toEqual(["0", "1", "2"]);
+  });
+
   test("a fractional limit of 1.5 starts one worker", async () => {
     const h = harness(2);
     const call = mapWithConcurrency(["a", "b"], 1.5, h.fn);
