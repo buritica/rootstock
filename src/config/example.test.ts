@@ -1,0 +1,361 @@
+import { describe, expect, test } from "bun:test";
+import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
+import { widthBelowPool } from "./invariants.ts";
+import { printRootstockConfig } from "./print.ts";
+import type { SliceParsers } from "./slices.ts";
+
+// Test doubles of the three slice parsers, built from their frozen
+// signatures: each copies its input and returns it unfrozen, so every freeze
+// these tests observe is config's own. The composition test replaces them
+// with the real parsers once those exist.
+const doubles: SliceParsers = {
+  clientSlice: (input) => ({
+    profiles: Object.fromEntries(Object.entries(input.profiles).map(([k, p]) => [k, { ...p }])),
+  }),
+  migrateSlice: (input) => ({ schema: input.schema ?? "rootstock", ahead: input.ahead }),
+  concurrencySlice: (input) => ({
+    widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
+  }),
+};
+
+const define = (input: RootstockConfigInput) => composeRootstockConfig(doubles, input);
+
+const exampleInput: RootstockConfigInput = {
+  client: {
+    profiles: {
+      app: {
+        max: 5,
+        maxCeiling: 20,
+        idleTimeoutSeconds: 20,
+        maxLifetimeSeconds: 600,
+        connectTimeoutSeconds: 30,
+        prepare: "driver-default",
+        keepAliveSeconds: "driver-default",
+        statementTimeoutMs: 0,
+        readOnly: false,
+      },
+      reader: {
+        max: "driver-default",
+        maxCeiling: 4,
+        idleTimeoutSeconds: "driver-default",
+        maxLifetimeSeconds: "never",
+        connectTimeoutSeconds: "driver-default",
+        prepare: false,
+        keepAliveSeconds: 60,
+        statementTimeoutMs: 30000,
+        readOnly: true,
+      },
+    },
+  },
+  migrate: { ahead: "refuse" },
+  concurrency: {
+    widths: {
+      fetch: { default: 4, max: 4 },
+      write: { default: 2, max: 8 },
+    },
+  },
+  invariants: [widthBelowPool("fetch", "app")],
+};
+
+const EXAMPLE_PRINT = `{
+  "client": {
+    "profiles": {
+      "app": {
+        "connectTimeoutSeconds": 30,
+        "idleTimeoutSeconds": 20,
+        "keepAliveSeconds": "driver-default",
+        "max": 5,
+        "maxCeiling": 20,
+        "maxLifetimeSeconds": 600,
+        "prepare": "driver-default",
+        "readOnly": false,
+        "statementTimeoutMs": 0
+      },
+      "reader": {
+        "connectTimeoutSeconds": "driver-default",
+        "idleTimeoutSeconds": "driver-default",
+        "keepAliveSeconds": 60,
+        "max": "driver-default",
+        "maxCeiling": 4,
+        "maxLifetimeSeconds": "never",
+        "prepare": false,
+        "readOnly": true,
+        "statementTimeoutMs": 30000
+      }
+    }
+  },
+  "concurrency": {
+    "widths": {
+      "fetch": {
+        "default": 4,
+        "max": 4
+      },
+      "write": {
+        "default": 2,
+        "max": 8
+      }
+    }
+  },
+  "embed": "absent",
+  "invariants": [
+    "width-below-pool.fetch.app"
+  ],
+  "lock": "absent",
+  "migrate": {
+    "ahead": "refuse",
+    "schema": "rootstock"
+  },
+  "queue": "absent",
+  "runner": "absent"
+}
+`;
+
+/** The whole message of what `fn` throws, so a test can pin it with toBe. */
+function messageOf(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error("expected a throw");
+}
+
+const holds = (id: string): Invariant => ({ id, check: () => null });
+const fails = (id: string, message: string): Invariant => ({ id, check: () => message });
+
+describe("print", () => {
+  test("example-print-pinned", () => {
+    expect(printRootstockConfig(define(exampleInput))).toBe(EXAMPLE_PRINT);
+  });
+
+  test("absent-slices-printed", () => {
+    const view = JSON.parse(printRootstockConfig(define(exampleInput)));
+    for (const name of ["embed", "lock", "queue", "runner"]) expect(view[name]).toBe("absent");
+  });
+
+  test("print-carries-no-url-host-or-credential", () => {
+    const view = JSON.parse(printRootstockConfig(define(exampleInput)));
+    const text = JSON.stringify(view);
+    expect(text).not.toContain("://");
+    expect(text).not.toContain("@");
+    const invariantIds = new Set<string>(view.invariants);
+    const hostLike = /[a-z0-9-]+\.[a-z]{2,}(?![a-z0-9_])/i;
+    const offenders: string[] = [];
+    const walk = (v: unknown): void => {
+      if (typeof v === "string") {
+        if (hostLike.test(v) && !invariantIds.has(v)) offenders.push(v);
+      } else if (v !== null && typeof v === "object") {
+        for (const child of Object.values(v)) walk(child);
+      }
+    };
+    walk(view);
+    expect(offenders).toEqual([]);
+  });
+
+  test("swapped-schema-changes-only-migrate-schema", () => {
+    const schema = "rs_t_0a1b2c3d";
+    const before = printRootstockConfig(define(exampleInput)).split("\n");
+    const after = printRootstockConfig(
+      define({ ...exampleInput, migrate: { ...exampleInput.migrate, schema } }),
+    ).split("\n");
+    expect(after.length).toBe(before.length);
+    const changed = before.flatMap((line, i) => (line === after[i] ? [] : [[line, after[i]]]));
+    expect(changed).toEqual([['    "schema": "rootstock"', `    "schema": "${schema}"`]]);
+  });
+
+  test("unbranded-config-refused", () => {
+    const real = define(exampleInput);
+    const copy = { ...real };
+    expect(messageOf(() => printRootstockConfig(copy))).toBe(
+      "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return",
+    );
+  });
+
+  test("unbranded-slice-refused", () => {
+    const slice = doubles.migrateSlice({ ahead: "refuse" });
+    // biome-ignore lint/suspicious/noExplicitAny: an unbranded object on purpose
+    expect(messageOf(() => printRootstockConfig(slice as any))).toBe(
+      "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return",
+    );
+  });
+});
+
+describe("define", () => {
+  test("calls-parsers-in-order-and-propagates-their-errors", () => {
+    const calls: string[] = [];
+    const boom = new Error("migrateSlice: ahead is required");
+    const spy: SliceParsers = {
+      clientSlice: (i) => {
+        calls.push("client");
+        return doubles.clientSlice(i);
+      },
+      migrateSlice: () => {
+        calls.push("migrate");
+        throw boom;
+      },
+      concurrencySlice: (i) => {
+        calls.push("concurrency");
+        return doubles.concurrencySlice(i);
+      },
+    };
+    let caught: unknown;
+    try {
+      composeRootstockConfig(spy, exampleInput);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBe(boom);
+    expect(calls).toEqual(["client", "migrate"]);
+  });
+
+  test("invariant-ids-recorded-in-order", () => {
+    const config = define({ ...exampleInput, invariants: [holds("b.two"), holds("a.one")] });
+    expect(config.invariants).toEqual(["b.two", "a.one"]);
+  });
+
+  test("no-invariants-means-empty-list", () => {
+    const { invariants: _, ...rest } = exampleInput;
+    expect(define(rest).invariants).toEqual([]);
+  });
+
+  test("two-invariants-both-reported", () => {
+    const input = {
+      ...exampleInput,
+      invariants: [fails("first.one", "x is wrong"), holds("ok"), fails("second", "y is wrong")],
+    };
+    expect(messageOf(() => define(input))).toBe(
+      "defineRootstockConfig: 2 invariant(s) failed — first.one: x is wrong; second: y is wrong",
+    );
+  });
+
+  test("throwing-invariant-is-a-failure", () => {
+    const throwing: Invariant = {
+      id: "throws",
+      check: () => {
+        throw new Error("cannot read max");
+      },
+    };
+    expect(messageOf(() => define({ ...exampleInput, invariants: [throwing] }))).toBe(
+      "defineRootstockConfig: 1 invariant(s) failed — throws: cannot read max",
+    );
+  });
+
+  test("invariant-sees-the-assembled-config", () => {
+    let seen: unknown;
+    const spy: Invariant = {
+      id: "spy",
+      check: (config) => {
+        seen = config.migrate.schema;
+        return null;
+      },
+    };
+    define({ ...exampleInput, invariants: [spy] });
+    expect(seen).toBe("rootstock");
+  });
+
+  test("duplicate-invariant-id-refused", () => {
+    let ran = false;
+    const marker: Invariant = {
+      id: "dup",
+      check: () => {
+        ran = true;
+        return null;
+      },
+    };
+    expect(messageOf(() => define({ ...exampleInput, invariants: [marker, holds("dup")] }))).toBe(
+      'defineRootstockConfig: invariant id "dup" must match [a-z0-9][a-z0-9.-]* and be unique',
+    );
+    expect(ran).toBe(false);
+  });
+
+  test.each(["", "Upper", ".lead", "under_score", "sp ace"])(
+    "bad-invariant-id %p refused",
+    (id) => {
+      expect(messageOf(() => define({ ...exampleInput, invariants: [holds(id)] }))).toBe(
+        `defineRootstockConfig: invariant id ${JSON.stringify(id)} must match [a-z0-9][a-z0-9.-]* and be unique`,
+      );
+    },
+  );
+
+  test("nested-frozen", () => {
+    const config = define(exampleInput);
+    expect(Object.isFrozen(config)).toBe(true);
+    expect(Object.isFrozen(config.invariants)).toBe(true);
+    const app = config.client.profiles.app as { max: unknown };
+    expect(() => {
+      app.max = 99;
+    }).toThrow(TypeError);
+    const fetch = config.concurrency.widths.fetch as { max: unknown };
+    expect(() => {
+      fetch.max = 99;
+    }).toThrow(TypeError);
+    expect(() => {
+      (config.migrate as { schema: string }).schema = "other";
+    }).toThrow(TypeError);
+  });
+
+  test("input-left-unfrozen", () => {
+    define(exampleInput);
+    expect(Object.isFrozen(exampleInput)).toBe(false);
+  });
+});
+
+describe("widthBelowPool", () => {
+  const app = exampleInput.client.profiles.app;
+  if (app === undefined) throw new Error("example has no app profile");
+  const withWidthMax = (max: number, poolMax: number | "driver-default") => ({
+    ...exampleInput,
+    client: {
+      profiles: {
+        ...exampleInput.client.profiles,
+        app: { ...app, max: poolMax },
+      },
+    },
+    concurrency: { widths: { ...exampleInput.concurrency.widths, fetch: { default: 1, max } } },
+    invariants: [widthBelowPool("fetch", "app")],
+  });
+
+  test("id-is-lowercased", () => {
+    expect(widthBelowPool("embedWrite", "app").id).toBe("width-below-pool.embedwrite.app");
+  });
+
+  test("width-below-pool-holds", () => {
+    expect(define(withWidthMax(4, 5)).invariants).toEqual(["width-below-pool.fetch.app"]);
+  });
+
+  test("width-equal-to-pool-fails", () => {
+    expect(messageOf(() => define(withWidthMax(5, 5)))).toBe(
+      'defineRootstockConfig: 1 invariant(s) failed — width-below-pool.fetch.app: width "fetch" max 5 must be below profile "app" max 5',
+    );
+  });
+
+  test("width-above-pool-fails", () => {
+    expect(messageOf(() => define(withWidthMax(8, 5)))).toBe(
+      'defineRootstockConfig: 1 invariant(s) failed — width-below-pool.fetch.app: width "fetch" max 8 must be below profile "app" max 5',
+    );
+  });
+
+  test("driver-default-pool-fails", () => {
+    expect(messageOf(() => define(withWidthMax(1, "driver-default")))).toBe(
+      'defineRootstockConfig: 1 invariant(s) failed — width-below-pool.fetch.app: width "fetch" cannot be checked against profile "app": its max is "driver-default"',
+    );
+  });
+
+  test("missing-width-or-profile-named", () => {
+    const input = {
+      ...exampleInput,
+      invariants: [widthBelowPool("nope", "app"), widthBelowPool("fetch", "gone")],
+    };
+    expect(messageOf(() => define(input))).toBe(
+      'defineRootstockConfig: 2 invariant(s) failed — width-below-pool.nope.app: no width "nope" is declared; width-below-pool.fetch.gone: no profile "gone" is declared',
+    );
+  });
+
+  test("inherited-name-is-not-declared", () => {
+    expect(
+      messageOf(() => define({ ...exampleInput, invariants: [widthBelowPool("toString", "app")] })),
+    ).toBe(
+      'defineRootstockConfig: 1 invariant(s) failed — width-below-pool.tostring.app: no width "toString" is declared',
+    );
+  });
+});
