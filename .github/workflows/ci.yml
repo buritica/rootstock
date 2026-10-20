@@ -84,11 +84,32 @@ jobs:
       install-args: "--no-save"
       command: "bun test"
 
+  # The DB matrix (scripts/test-db.ts): every src/**/*.pg.ts suite per
+  # transactor kind against digest-pinned pg17 and pg18 throwaway containers.
+  # Hosted runners ship docker. It fails red when no suite or no test runs.
+  test-db:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      command: "bun run test:db"
+
+  # Same matrix on the oldest supported Bun; the runner spawns process.execPath,
+  # so the suites really run on 1.3.14.
+  test-db-oldest-bun:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      bun-version: "1.3.14"
+      install-args: "--no-save"
+      command: "bun run test:db"
+
   # Enforcement aggregator (spec.md pattern 2). Needs EVERY job, including the
   # gate: a failed gate makes downstream jobs report `skipped`, which would
   # otherwise read as OK. Skipped is accepted so docs-only PRs stay satisfiable.
   ci-pass:
-    needs: [changes, lint, typecheck, test, test-oldest-bun]
+    needs: [changes, lint, typecheck, test, test-oldest-bun, test-db, test-db-oldest-bun]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2

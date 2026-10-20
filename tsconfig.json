@@ -16,5 +16,5 @@
     "noImplicitOverride": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["src"]
+  "include": ["src", "scripts"]
 }

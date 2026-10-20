@@ -9,7 +9,7 @@ const FORBIDDEN: readonly RegExp[] = [
   new RegExp(["sendas", "org"].join(""), "i"),
   new RegExp(["com", "pass"].join(""), "i"),
   /src\/[\w-]+\.ts:\d/,
-  /(drizzle|migrations)\/\d{4}_/,
+  /(drizzle|migrations)\/\d{4,14}_/,
   /f_(embed|classify)_hash/,
   new RegExp(["gemini", "-embedding"].join("")),
   new RegExp(["Resoluci", "[oó]n"].join("")),
@@ -18,6 +18,9 @@ const FORBIDDEN: readonly RegExp[] = [
   /[\w.+-]+@[\w-]+\.[a-z]{2,}/i,
   new RegExp(["Run", "Fatal"].join("")),
   new RegExp(["storm", ".?breaker"].join(""), "i"),
+  new RegExp(["neon", "\\.tech"].join("")),
+  new RegExp(["onrender", "\\.com"].join("")),
+  new RegExp(["commons", "-migrate"].join("")),
 ];
 
 const SELF = "hygiene.test.ts";
