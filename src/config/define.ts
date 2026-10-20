@@ -35,7 +35,11 @@ export interface RootstockConfig {
 const built = new WeakSet<object>();
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
-/** True when `config` was built by composeRootstockConfig and every invariant held. */
+/**
+ * True for a config composeRootstockConfig returned, and also while its
+ * invariants are being checked; a build that fails takes it back. Nothing
+ * should start I/O on a config a check was handed.
+ */
 export function isRootstockConfig(config: unknown): config is RootstockConfig {
   return typeof config === "object" && config !== null && built.has(config);
 }
@@ -78,19 +82,22 @@ export function composeRootstockConfig(
   let held = false;
   try {
     const failures: string[] = [];
+    const thrown: unknown[] = [];
     for (const inv of invariants) {
       let message: unknown;
       try {
         message = inv.check(branded);
       } catch (err) {
         // A check that cannot run is a check that did not hold.
-        message = err instanceof Error ? err.message : err;
+        thrown.push(err);
+        message = err;
       }
       if (message !== null) failures.push(`${inv.id}: ${describe(message)}`);
     }
     if (failures.length > 0) {
       throw new Error(
         `defineRootstockConfig: ${failures.length} invariant(s) failed — ${failures.join("; ")}`,
+        thrown.length > 0 ? { cause: thrown } : undefined,
       );
     }
     held = true;
@@ -100,13 +107,19 @@ export function composeRootstockConfig(
   }
 }
 
-/** A failure message as text, whatever a check returned or threw. */
+/** A failure as text, whatever a check returned or threw; never throws. */
 function describe(message: unknown): string {
-  if (typeof message === "string") return message;
   try {
+    if (typeof message === "string") return message;
+    if (message instanceof Error) return message.message;
+    if (typeof (message as { then?: unknown } | null)?.then === "function") {
+      // Swallow a rejection so it does not surface again as an unhandled one.
+      (message as PromiseLike<unknown>).then(undefined, () => {});
+      return "check returned a Promise; checks must be synchronous";
+    }
     return String(message);
   } catch {
-    return Object.prototype.toString.call(message);
+    return "a value that cannot be printed";
   }
 }
 

@@ -360,9 +360,88 @@ describe("brand and failure paths", () => {
     };
     expect(
       messageOf(() => define({ ...exampleInput, invariants: [odd, fails("next", "x")] })),
-    ).toBe("defineRootstockConfig: 2 invariant(s) failed — odd: [object Object]; next: x");
+    ).toBe(
+      "defineRootstockConfig: 2 invariant(s) failed — odd: a value that cannot be printed; next: x",
+    );
     // biome-ignore lint/suspicious/noExplicitAny: the config a failed build leaked
     expect(messageOf(() => printRootstockConfig(kept as any))).toBe(UNBRANDED);
+  });
+
+  test("slices-keep-the-parsers-identity", () => {
+    // A slice's brand lives in its own subpath's registry, so a copy here
+    // would be refused by every function that takes that slice.
+    const made: Record<string, unknown> = {};
+    const recording = {
+      clientSlice: (i: ClientSliceInput) => (made.client = doubles.clientSlice(i as never)),
+      migrateSlice: (i: MigrateSliceInput) => (made.migrate = doubles.migrateSlice(i as never)),
+      concurrencySlice: (i: ConcurrencySliceInput) =>
+        (made.concurrency = doubles.concurrencySlice(i as never)),
+    } as unknown as SliceParsers;
+    const config = composeRootstockConfig(recording, exampleInput);
+    expect(config.client).toBe(made.client as typeof config.client);
+    expect(config.migrate).toBe(made.migrate as typeof config.migrate);
+    expect(config.concurrency).toBe(made.concurrency as typeof config.concurrency);
+  });
+
+  test("thrown-values-ride-as-cause", () => {
+    const first = new TypeError("cannot read max");
+    const thrower: Invariant = {
+      id: "thrower",
+      check: () => {
+        throw first;
+      },
+    };
+    let caught: unknown;
+    try {
+      define({ ...exampleInput, invariants: [thrower, fails("plain", "x")] });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as Error).cause).toEqual([first]);
+    expect(((caught as Error).cause as unknown[])[0]).toBe(first);
+  });
+
+  test("a-throwing-message-getter-does-not-hide-other-failures", () => {
+    const hostile = {
+      id: "hostile",
+      check: () => {
+        const err = new Error("x");
+        Object.defineProperty(err, "message", {
+          get() {
+            throw new Error("getter boom");
+          },
+        });
+        throw err;
+      },
+    };
+    expect(
+      messageOf(() => define({ ...exampleInput, invariants: [fails("first", "x bad"), hostile] })),
+    ).toBe(
+      "defineRootstockConfig: 2 invariant(s) failed — first: x bad; hostile: a value that cannot be printed",
+    );
+  });
+
+  test("async-check-is-a-failure-and-its-rejection-is-handled", async () => {
+    let unhandled = 0;
+    const onUnhandled = () => {
+      unhandled++;
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const asyncCheck = {
+        id: "async",
+        check: async () => {
+          throw new Error("late");
+        },
+      } as unknown as Invariant;
+      expect(messageOf(() => define({ ...exampleInput, invariants: [asyncCheck] }))).toBe(
+        "defineRootstockConfig: 1 invariant(s) failed — async: check returned a Promise; checks must be synchronous",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toBe(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   test("non-error-throw-and-empty-message-are-failures", () => {
