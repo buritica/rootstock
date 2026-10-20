@@ -143,10 +143,11 @@ describe("every transactor", () => {
 
 describe("postgres-js and bun-sql", () => {
   for (const [id, make] of FACTORIES.slice(0, 2)) {
+    const over = id === "postgres-js" ? postgresJsTransactor : bunSqlTransactor;
     test(`${id}: queries return the driver's own promise and pass arguments through`, async () => {
       const calls: Call[] = [];
       const client = tagDouble("db", calls);
-      const t = id === "postgres-js" ? postgresJsTransactor(client) : bunSqlTransactor(client);
+      const t = over(client);
       expect(t.sql`select ${1}, ${"x"}`).toBe(client.result);
       expect(t.sql.unsafe("select $1", [2])).toBe(client.result);
       expect(t.sql.unsafe("select 1")).toBe(client.result);
@@ -155,7 +156,6 @@ describe("postgres-js and bun-sql", () => {
         ["db.unsafe", "select $1", [2]],
         ["db.unsafe", "select 1", undefined],
       ]);
-      void make;
     });
 
     test(`${id}: savepoint-partial-rollback goes through the native savepoint`, async () => {

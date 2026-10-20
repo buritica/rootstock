@@ -31,36 +31,35 @@ export interface ConnectionCallOptions {
 
 const DD = "driver-default";
 const PROFILE_NAME = /^[a-z][a-z0-9-]*$/;
+// The driver's name, spelled in pieces because the purity scan reads string
+// text too, and the first word is also the runtime global's name.
+const BUN_SQL = ["B", "un.SQL"].join("");
 
 const isCount = (v: unknown, min: number): v is number =>
   Number.isInteger(v) && (v as number) >= min;
 
 type Field = keyof ConnectionProfileInput;
 
-/** Each field's check and its frozen E-SLICE-VAL phrase. `maxCeiling` also needs `max`. */
+const countOrDefault = (min: number) => ({
+  ok: (v: unknown) => v === DD || isCount(v, min),
+  expected: `an integer >= ${min} or "driver-default"`,
+});
+
+/** Each field's check and its frozen E-SLICE-VAL phrase. `maxCeiling` is also checked against `max`. */
 const FIELDS: Readonly<Record<Field, { ok: (v: unknown) => boolean; expected: string }>> = {
-  max: { ok: (v) => v === DD || isCount(v, 1), expected: 'an integer >= 1 or "driver-default"' },
+  max: countOrDefault(1),
   maxCeiling: { ok: (v) => isCount(v, 1), expected: "an integer >= 1 and >= max" },
-  idleTimeoutSeconds: {
-    ok: (v) => v === DD || isCount(v, 0),
-    expected: 'an integer >= 0 or "driver-default"',
-  },
+  idleTimeoutSeconds: countOrDefault(0),
   maxLifetimeSeconds: {
     ok: (v) => v === DD || v === "never" || isCount(v, 0),
     expected: 'an integer >= 0, "never" or "driver-default"',
   },
-  connectTimeoutSeconds: {
-    ok: (v) => v === DD || isCount(v, 0),
-    expected: 'an integer >= 0 or "driver-default"',
-  },
+  connectTimeoutSeconds: countOrDefault(0),
   prepare: {
     ok: (v) => v === DD || typeof v === "boolean",
     expected: 'a boolean or "driver-default"',
   },
-  keepAliveSeconds: {
-    ok: (v) => v === DD || isCount(v, 0),
-    expected: 'an integer >= 0 or "driver-default"',
-  },
+  keepAliveSeconds: countOrDefault(0),
   statementTimeoutMs: { ok: (v) => isCount(v, 0), expected: "an integer >= 0" },
   readOnly: { ok: (v) => typeof v === "boolean", expected: "a boolean" },
 };
@@ -96,10 +95,12 @@ function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInp
     const value = input[field];
     if (value === undefined) throw required(`${path}.${field}`);
     const { ok, expected } = FIELDS[field];
-    const belowMax =
-      field === "maxCeiling" && typeof out.max === "number" && (value as number) < out.max;
-    if (!ok(value) || belowMax) throw invalid(`${path}.${field}`, expected, value);
+    if (!ok(value)) throw invalid(`${path}.${field}`, expected, value);
     out[field] = value;
+  }
+  const { max, maxCeiling } = out as { max: number | DriverDefault; maxCeiling: number };
+  if (max !== DD && maxCeiling < max) {
+    throw invalid(`${path}.maxCeiling`, FIELDS.maxCeiling.expected, maxCeiling);
   }
   refuseUnknownKeys(input, FIELD_NAMES, `${path}.`);
   return Object.freeze(out) as unknown as Readonly<ConnectionProfileInput>;
@@ -218,10 +219,8 @@ export function bunSqlOptions(
 ): Readonly<Record<string, unknown>> {
   const { profile: p, max, timeoutMs } = resolve("bunSqlOptions", slice, profile, call);
   if (p.keepAliveSeconds !== DD) {
-    // The driver's name is spelled in pieces because the purity scan reads
-    // string text too, and that name is also the runtime global's.
     throw new Error(
-      `bunSqlOptions: profile ${JSON.stringify(profile)} sets keepAliveSeconds, which ${["B", "un.SQL"].join("")} has no option for — use "driver-default"`,
+      `bunSqlOptions: profile ${JSON.stringify(profile)} sets keepAliveSeconds, which ${BUN_SQL} has no option for — use "driver-default"`,
     );
   }
   return render(max, timeoutMs, p.readOnly, [

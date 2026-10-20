@@ -55,13 +55,19 @@ export interface DrizzleSqlTagLike<D = any> {
 /** A tagged-template driver object: postgres.js and Bun.SQL clients, transactions and savepoints. */
 interface TagDriver {
   (strings: TemplateStringsArray, ...values: unknown[]): PromiseLike<unknown>;
-  unsafe(query: string, params?: unknown[]): PromiseLike<unknown>;
-  savepoint?(fn: (sp: unknown) => unknown): PromiseLike<unknown>;
+  unsafe(query: string, params?: readonly unknown[]): PromiseLike<unknown>;
 }
 
-interface DrizzleExecutor {
-  execute(query: unknown): PromiseLike<unknown>;
-  transaction?(fn: (tx: unknown) => unknown): PromiseLike<unknown>;
+/** A driver's transaction or savepoint entry: `begin`, `savepoint` or drizzle's `transaction`. */
+type Nest = (fn: (native: unknown) => unknown) => PromiseLike<unknown>;
+
+/** Enters a transaction or savepoint, wrapping the driver's object once for fn. */
+function enter<N, T>(
+  nest: Nest,
+  wrap: (native: unknown) => TxSql<N>,
+  fn: (tx: TxSql<N>, native: N) => Promise<T>,
+): Promise<T> {
+  return nest((native) => fn(wrap(native), native as N)) as Promise<T>;
 }
 
 function surface<S extends object>(
@@ -75,29 +81,28 @@ function surface<S extends object>(
 function tagSurface<S extends object>(x: TagDriver, rest: S): Sql & S {
   return surface((strings, ...values) => x(strings, ...values) as Promise<unknown>, {
     unsafe: (query: string, params?: readonly unknown[]) =>
-      x.unsafe(query, params as unknown[] | undefined) as Promise<unknown>,
+      x.unsafe(query, params) as Promise<unknown>,
     ...rest,
   });
 }
 
-function tagTx<N>(x: TagDriver): TxSql<N> {
+function tagTx<N>(native: unknown): TxSql<N> {
+  const x = native as TagDriver & { savepoint: Nest };
   return tagSurface(x, {
     savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>) =>
-      (x.savepoint as NonNullable<TagDriver["savepoint"]>)((sp) =>
-        fn(tagTx<N>(sp as TagDriver), sp as N),
-      ) as Promise<T>,
+      enter((cb) => x.savepoint(cb), tagTx<N>, fn),
   });
 }
 
 function tagTransactor<N>(
-  id: "postgres-js" | "bun-sql",
-  client: { begin(fn: (tx: unknown) => unknown): PromiseLike<unknown> },
+  id: Exclude<TransactorId, "drizzle">,
+  client: TagDriver & { begin: Nest },
 ): Transactor<N> {
   return Object.freeze({
     id,
-    sql: tagSurface(client as unknown as TagDriver, {}),
+    sql: tagSurface(client, {}),
     begin: <T>(fn: (tx: TxSql<N>, native: N) => Promise<T>) =>
-      client.begin((native) => fn(tagTx<N>(native as TagDriver), native as N)) as Promise<T>,
+      enter((cb) => client.begin(cb), tagTx<N>, fn),
   });
 }
 
@@ -109,6 +114,11 @@ export function postgresJsTransactor<N = unknown>(client: PostgresJsClientLike):
 /** A transactor over a `Bun.SQL` client. `native` is Bun's transaction object. */
 export function bunSqlTransactor<N = unknown>(client: BunSqlClientLike): Transactor<N> {
   return tagTransactor<N>("bun-sql", client);
+}
+
+interface DrizzleExecutor {
+  execute(query: unknown): PromiseLike<unknown>;
+  transaction: Nest;
 }
 
 const PLACEHOLDER = /\$([1-9][0-9]*)/;
@@ -176,12 +186,15 @@ function drizzleSurface<S extends object>(
   });
 }
 
-function drizzleTx<N>(x: DrizzleExecutor, deps: { sql: DrizzleSqlTagLike }): TxSql<N> {
+function drizzleTx<N>(native: unknown, deps: { sql: DrizzleSqlTagLike }): TxSql<N> {
+  const x = native as DrizzleExecutor;
   return drizzleSurface(x, deps, {
     savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>) =>
-      (x.transaction as NonNullable<DrizzleExecutor["transaction"]>)((sp) =>
-        fn(drizzleTx<N>(sp as DrizzleExecutor, deps), sp as N),
-      ) as Promise<T>,
+      enter(
+        (cb) => x.transaction(cb),
+        (sp) => drizzleTx<N>(sp, deps),
+        fn,
+      ),
   });
 }
 
@@ -189,7 +202,9 @@ function drizzleTx<N>(x: DrizzleExecutor, deps: { sql: DrizzleSqlTagLike }): TxS
  * A transactor over a drizzle database. `deps.sql` is the consumer's own `sql`
  * tag, so rootstock never imports drizzle. `native` is drizzle's transaction;
  * a savepoint is its nested `transaction`. Every `execute` result must be a row
- * array, which holds for drizzle over postgres.js.
+ * array, which holds for drizzle over postgres.js. `unsafe` rewrites every
+ * `$n` in the text, including inside a quoted literal or comment, so its query
+ * text must use `$` only as placeholders.
  */
 export function drizzleTransactor<N = unknown>(
   db: DrizzleDbLike,
@@ -199,8 +214,10 @@ export function drizzleTransactor<N = unknown>(
     id: "drizzle" as const,
     sql: drizzleSurface(db, deps, {}),
     begin: <T>(fn: (tx: TxSql<N>, native: N) => Promise<T>) =>
-      db.transaction((native: unknown) =>
-        fn(drizzleTx<N>(native as DrizzleExecutor, deps), native as N),
-      ) as Promise<T>,
+      enter(
+        (cb) => db.transaction(cb),
+        (tx) => drizzleTx<N>(tx, deps),
+        fn,
+      ),
   });
 }

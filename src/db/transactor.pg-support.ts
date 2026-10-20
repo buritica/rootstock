@@ -18,14 +18,13 @@ export interface TestTransactor {
 }
 
 function wrap(c: TestClient): TestTransactor {
-  switch (c.kind) {
-    case "bun-sql":
-      return { transactor: bunSqlTransactor(c.client), close: c.close };
-    case "postgres-js":
-      return { transactor: postgresJsTransactor(c.client), close: c.close };
-    case "drizzle":
-      return { transactor: drizzleTransactor(c.client, { sql }), close: c.close };
-  }
+  const transactor =
+    c.kind === "bun-sql"
+      ? bunSqlTransactor(c.client)
+      : c.kind === "postgres-js"
+        ? postgresJsTransactor(c.client)
+        : drizzleTransactor(c.client, { sql });
+  return { transactor, close: c.close };
 }
 
 export function openTestTransactor(): TestTransactor {

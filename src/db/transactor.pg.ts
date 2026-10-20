@@ -8,8 +8,9 @@ import {
   clientSlice,
   pgCode,
   postgresJsOptions,
+  type Row,
+  type Sql,
   type Transactor,
-  type TxSql,
 } from "./index.ts";
 import { openSecond, openTestTransactor } from "./transactor.pg-support.ts";
 
@@ -40,9 +41,13 @@ async function withTable<T>(
   }
 }
 
-async function ids(q: TxSql | Transactor["sql"], table: string): Promise<number[]> {
+async function ids(q: Sql, table: string): Promise<number[]> {
   const rows = await q.unsafe<{ id: number }>(`select id from ${table} order by id`);
   return rows.map((r) => r.id);
+}
+
+function insertId(q: Sql, table: string, v: number): Promise<unknown> {
+  return q.unsafe(`insert into ${table} (id) values ($1)`, [v]);
 }
 
 /** A write through the driver's own transaction object, in that driver's own API. */
@@ -89,7 +94,7 @@ describe("query surface", () => {
         '{"a":[1,null,"x"]}'::jsonb::text as j
       from (values (1), (2)) v(x)`;
     await withTransactor(async (t) => {
-      const check = (rows: Record<string, unknown>[]) => {
+      const check = (rows: Row[]) => {
         expect(rows).toHaveLength(1);
         const [row] = rows;
         expect(row?.n).toBe(2);
@@ -117,7 +122,7 @@ describe("begin", () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         await t.begin(async (tx) => {
-          await tx.unsafe(`insert into ${table} (id) values ($1)`, [1]);
+          await insertId(tx, table, 1);
         });
         const other = openSecond();
         try {
@@ -135,7 +140,7 @@ describe("begin", () => {
         const boom = new Error("boom");
         const caught = await rejection(
           t.begin(async (tx) => {
-            await tx.unsafe(`insert into ${table} (id) values ($1)`, [1]);
+            await insertId(tx, table, 1);
             throw boom;
           }),
         );
@@ -148,8 +153,7 @@ describe("begin", () => {
   test("savepoint-partial-rollback: a savepoint throw rolls back only the savepoint", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
-        const insert = (q: TxSql, v: number) =>
-          q.unsafe(`insert into ${table} (id) values ($1)`, [v]);
+        const insert = (q: Sql, v: number) => insertId(q, table, v);
         const boom = new Error("savepoint boom");
         await t.begin(async (tx) => {
           await insert(tx, 1);
@@ -171,8 +175,7 @@ describe("begin", () => {
   test("nested savepoints commit together, and an inner throw rolls back only the inner one", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
-        const insert = (q: TxSql, v: number) =>
-          q.unsafe(`insert into ${table} (id) values ($1)`, [v]);
+        const insert = (q: Sql, v: number) => insertId(q, table, v);
         const value = await t.begin((tx) =>
           tx.savepoint(async (outer) => {
             await insert(outer, 1);
@@ -286,8 +289,8 @@ describe("pgCode on real driver errors", () => {
   test("23505 for a unique violation, raw and wrapped", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
-        await t.sql.unsafe(`insert into ${table} (id) values ($1)`, [1]);
-        const err = await rejection(t.sql.unsafe(`insert into ${table} (id) values ($1)`, [1]));
+        await insertId(t.sql, table, 1);
+        const err = await rejection(insertId(t.sql, table, 1));
         expect(pgCode(err)).toBe("23505");
         expect(pgCode(new Error("x", { cause: err }))).toBe("23505");
       }),
@@ -313,7 +316,7 @@ describe("pgCode on real driver errors", () => {
         const err = await rejection(
           t.begin(async (tx) => {
             await tx.unsafe("set transaction read only");
-            await tx.unsafe(`insert into ${table} (id) values ($1)`, [1]);
+            await insertId(tx, table, 1);
           }),
         );
         expect(pgCode(err)).toBe("25006");
