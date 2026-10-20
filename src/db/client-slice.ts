@@ -11,8 +11,12 @@ export interface ConnectionProfileInput {
   connectTimeoutSeconds: number | DriverDefault;
   prepare: boolean | DriverDefault;
   keepAliveSeconds: number | DriverDefault;
-  /** Default per-connection statement_timeout. 0 = none (no startup parameter sent). */
+  /**
+   * Default per-connection statement_timeout. 0 = none: no startup parameter is
+   * sent, so a role or database default still applies.
+   */
   statementTimeoutMs: number;
+  /** true sends default_transaction_read_only; false sends nothing and does not override a read-only role. */
   readOnly: boolean;
 }
 
@@ -67,6 +71,7 @@ const FIELDS: Readonly<Record<Field, { ok: (v: unknown) => boolean; expected: st
 };
 
 const FIELD_NAMES = Object.keys(FIELDS) as Field[];
+const CALL_KEYS: readonly string[] = ["max", "statementTimeoutMs"];
 
 // Every slice clientSlice() returned, so a hand-built literal is refused at use.
 const BUILT = new WeakSet<object>();
@@ -85,7 +90,8 @@ function invalid(path: string, expected: string, value: unknown): Error {
 
 function refuseUnknownKeys(record: Record<string, unknown>, known: readonly string[], at: string) {
   for (const key of Object.keys(record)) {
-    if (!known.includes(key)) throw invalid(`${at}${key}`, "a known key", record[key]);
+    // The value is never echoed: an unknown key is where a URL or a password lands.
+    if (!known.includes(key)) throw new Error(`clientSlice: ${at}${key} is not a known key`);
   }
 }
 
@@ -146,6 +152,14 @@ function resolve(
       `${fn}: expected a ClientSlice built by clientSlice() — got an object that parser did not return`,
     );
   }
+  if (call !== undefined) {
+    if (!isRecord(call)) {
+      throw new Error(`${fn}: call options must be an object — got ${typeof call}`);
+    }
+    for (const key of Object.keys(call)) {
+      if (!CALL_KEYS.includes(key)) throw new Error(`${fn}: ${q(key)} is not a known call option`);
+    }
+  }
   const profile = Object.hasOwn(slice.profiles, name) ? slice.profiles[name] : undefined;
   if (profile === undefined) {
     throw new Error(
@@ -192,8 +206,11 @@ function render(
 }
 
 /**
- * postgres.js options for one profile. Never emits `ssl`, a URL, a host or
- * credentials: the consumer spreads what it owns over the result.
+ * postgres.js options for one profile. Never emits `ssl`, a URL, a host,
+ * credentials or `onnotice` (postgres.js prints notices by default): the consumer spreads what it owns over the result. The spread
+ * is shallow, so a consumer that sets its own `connection` keys merges them
+ * with the result's `connection`, or loses the statement timeout and read-only
+ * setting.
  */
 export function postgresJsOptions(
   slice: ClientSlice,
@@ -212,7 +229,10 @@ export function postgresJsOptions(
 
 /**
  * Bun.SQL options for one profile. Never emits `ssl`, a URL, a host or
- * credentials: the consumer spreads what it owns over the result. Refuses a profile that sets
+ * credentials: the consumer spreads what it owns over the result. The spread
+ * is shallow, so a consumer that sets its own `connection` keys merges them
+ * with the result's `connection`, or loses the statement timeout and read-only
+ * setting. Refuses a profile that sets
  * `keepAliveSeconds`: Bun.SQL accepts a keep-alive option and ignores it, so
  * rendering one would promise a setting that never takes effect.
  */

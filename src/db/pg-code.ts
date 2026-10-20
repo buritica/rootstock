@@ -7,6 +7,8 @@ const SQLSTATE_SHAPE = /^[0-9A-Z]{5}$/;
  * error and leaves the SQLSTATE on its cause. `errno` is checked at each hop
  * because `Bun.SQL` puts the SQLSTATE there and sets `code` to
  * `"ERR_POSTGRES_SERVER_ERROR"`. A `code` and an `errno` on one hop: `code` wins.
+ * The shape test also matches five-letter system codes such as `EPIPE`, so a
+ * socket error can come back as one.
  */
 export function pgCode(err: unknown): string | undefined {
   // try/catch because .code/.cause can be throwing accessors on hostile or

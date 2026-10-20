@@ -218,6 +218,107 @@ describe("begin", () => {
     );
   });
 
+  test("an overlapping savepoint is refused and the open one still commits", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await t.begin(async (tx) => {
+          let release = () => {};
+          const gate = new Promise<void>((r) => {
+            release = r;
+          });
+          const first = tx.savepoint(async (sp) => {
+            await insertId(sp, table, 1);
+            await gate;
+          });
+          const refused = (await rejection(tx.savepoint((sp) => insertId(sp, table, 2)))) as Error;
+          expect(refused.message).toBe(
+            `${t.id}: a savepoint is already open on this transaction — await it before starting another`,
+          );
+          release();
+          await first;
+          await tx.savepoint((sp) => insertId(sp, table, 3));
+        });
+        expect(await ids(t.sql, table)).toEqual([1, 3]);
+      }),
+    );
+  });
+
+  test("a handle kept past its transaction is refused and writes nothing", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        let leaked: Sql | undefined;
+        await t.begin(async (tx) => {
+          leaked = tx;
+          await insertId(tx, table, 1);
+        });
+        const refused = (await rejection(insertId(leaked as Sql, table, 2))) as Error;
+        expect(refused.message).toBe(
+          `${t.id}: this transaction has already settled — its handle can no longer be used`,
+        );
+        expect(await ids(t.sql, table)).toEqual([1]);
+      }),
+    );
+  });
+
+  test("a server error fn caught still rolls back and rejects begin, on every driver", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await insertId(t.sql, table, 1);
+        let swallowed: unknown;
+        const err = await rejection(
+          t.begin(async (tx) => {
+            await insertId(tx, table, 2);
+            swallowed = await rejection(insertId(tx, table, 1));
+            return "resolved";
+          }),
+        );
+        expect(err).toBe(swallowed);
+        expect(pgCode(err)).toBe("23505");
+        expect(await ids(t.sql, table)).toEqual([1]);
+      }),
+    );
+  });
+
+  test("a savepoint that caught a server error rejects with it, and the rest commits", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await t.begin(async (tx) => {
+          await insertId(tx, table, 10);
+          const err = await rejection(
+            tx.savepoint(async (sp) => {
+              await insertId(sp, table, 11);
+              await rejection(insertId(sp, table, 10));
+            }),
+          );
+          expect(pgCode(err)).toBe("23505");
+          await insertId(tx, table, 12);
+        });
+        expect(await ids(t.sql, table)).toEqual([10, 12]);
+      }),
+    );
+  });
+
+  test("a statement timeout inside a savepoint rolls back only the savepoint and its setting", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await t.begin(async (tx) => {
+          await insertId(tx, table, 1);
+          const err = await rejection(
+            tx.savepoint(async (sp) => {
+              await sp.unsafe("set local statement_timeout = 50");
+              await sp.unsafe("select pg_sleep(1)");
+            }),
+          );
+          expect(pgCode(err)).toBe("57014");
+          const [row] = await tx.unsafe<{ statement_timeout: string }>("show statement_timeout");
+          expect(row?.statement_timeout).toBe("0");
+          await insertId(tx, table, 2);
+        });
+        expect(await ids(t.sql, table)).toEqual([1, 2]);
+      }),
+    );
+  });
+
   test("native is the driver's transaction: its write is visible to tx and rolled back with it", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {

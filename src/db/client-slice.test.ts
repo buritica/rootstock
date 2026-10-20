@@ -127,13 +127,13 @@ describe("clientSlice", () => {
     expect(one({ max: "driver-default", maxCeiling: 1 }).profiles.app?.maxCeiling).toBe(1);
   });
 
-  test("unknown keys are refused, in a profile and at the top", () => {
+  test("unknown keys are refused, in a profile and at the top, without echoing the value", () => {
     expect(messageOf(() => one({ ssl: true } as never))).toBe(
-      "clientSlice: profiles.app.ssl must be a known key — got true",
+      "clientSlice: profiles.app.ssl is not a known key",
     );
-    expect(messageOf(() => clientSlice({ profiles: { app: APP }, url: "x" } as never))).toBe(
-      'clientSlice: url must be a known key — got "x"',
-    );
+    expect(
+      messageOf(() => clientSlice({ profiles: { app: APP }, url: "pg://u:secret@h/d" } as never)),
+    ).toBe("clientSlice: url is not a known key");
   });
 
   test("an inherited field is not a declared one", () => {
@@ -148,8 +148,8 @@ describe("clientSlice", () => {
     );
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
-    expect(messageOf(() => one({ extra: cyclic } as never))).toBe(
-      "clientSlice: profiles.app.extra must be a known key — got an unserializable value",
+    expect(messageOf(() => one({ maxCeiling: cyclic } as never))).toBe(
+      "clientSlice: profiles.app.maxCeiling must be an integer >= 1 and >= max — got an unserializable value",
     );
     expect(
       messageOf(() => postgresJsOptions(slice({ app: APP }), "app", { max: 3n as never })),
@@ -320,6 +320,20 @@ describe("renderers", () => {
             `${render.name}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${JSON.stringify(statementTimeoutMs)}`,
           );
         }
+      });
+
+      test("call options must be an object with only known keys (E-CALL-OBJ, E-CALL-KEY)", () => {
+        for (const call of [5, "max", null, [1]]) {
+          expect(messageOf(() => render(C, "app", call as never))).toBe(
+            `${render.name}: call options must be an object — got ${typeof call}`,
+          );
+        }
+        for (const key of ["statement_timeout", "readOnly", "ssl"]) {
+          expect(messageOf(() => render(C, "app", { [key]: "secret" } as never))).toBe(
+            `${render.name}: ${JSON.stringify(key)} is not a known call option`,
+          );
+        }
+        expect(render(C, "app", undefined)).toEqual(render(C, "app"));
       });
 
       test("call max 1 and maxCeiling are accepted, over a number or a driver-default max", () => {

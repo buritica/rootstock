@@ -12,6 +12,12 @@ import {
 
 type Call = [string, ...unknown[]];
 
+// What a driver rejects with for a server error: an object carrying a SQLSTATE.
+const serverError = Object.assign(new Error("duplicate key"), { code: "23505" });
+const FAIL = "insert failing";
+// A client-side refusal: no SQLSTATE, nothing reached the server.
+const REFUSE = "refused before sending";
+
 function tagDouble(name: string, calls: Call[]) {
   const result = Promise.resolve([{ from: name }]);
   const tag = (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -22,7 +28,8 @@ function tagDouble(name: string, calls: Call[]) {
     result,
     unsafe: (query: string, params?: unknown[]) => {
       calls.push([`${name}.unsafe`, query, params]);
-      return result;
+      if (query === REFUSE) return Promise.reject(new Error(REFUSE));
+      return query === FAIL ? Promise.reject(serverError) : result;
     },
     savepoint: async (fn: (sp: unknown) => unknown) => {
       const sp = tagDouble(`${name}.sp`, calls);
@@ -50,6 +57,8 @@ function drizzleDouble(
   return {
     execute: async (query: unknown) => {
       calls.push([`${name}.execute`, query]);
+      if ((query as { raw?: string }).raw === FAIL) throw serverError;
+      if ((query as { raw?: string }).raw === REFUSE) throw new Error(REFUSE);
       return out.result;
     },
     transaction: async (fn: (tx: unknown) => unknown) => {
@@ -131,6 +140,112 @@ describe("every transactor", () => {
           )
           .catch((err: unknown) => err);
         expect(caught).toBe(boom);
+      });
+
+      test("a handle used after its transaction settled is refused (E-TX-CLOSED)", async () => {
+        const calls: Call[] = [];
+        const t = make(calls);
+        const closed = `${id}: this transaction has already settled — its handle can no longer be used`;
+        let leakedTx: TxSql | undefined;
+        let leakedSp: TxSql | undefined;
+        await t.begin(async (tx) => {
+          leakedTx = tx;
+          await tx.savepoint(async (sp) => {
+            leakedSp = sp;
+          });
+          // The savepoint settled, so its handle is closed while tx stays open.
+          expect(await messageOf(async () => (leakedSp as TxSql)`select 1`)).toBe(closed);
+          await tx`select ${1}`;
+        });
+        const before = calls.length;
+        for (const h of [leakedTx, leakedSp]) {
+          expect(await messageOf(async () => (h as TxSql)`select ${1}`)).toBe(closed);
+          expect(await messageOf(async () => (h as TxSql).unsafe("select 1"))).toBe(closed);
+          expect(await messageOf(async () => (h as TxSql).savepoint(async () => 1))).toBe(closed);
+        }
+        expect(calls).toHaveLength(before);
+      });
+
+      test("a handle closes after its transaction rejects too", async () => {
+        let leaked: TxSql | undefined;
+        await make([])
+          .begin(async (tx) => {
+            leaked = tx;
+            throw new Error("boom");
+          })
+          .catch(() => undefined);
+        expect(await messageOf(async () => (leaked as TxSql).unsafe("select 1"))).toBe(
+          `${id}: this transaction has already settled — its handle can no longer be used`,
+        );
+      });
+
+      test("a second savepoint while one is open is refused (E-TX-OVERLAP)", async () => {
+        const calls: Call[] = [];
+        const t = make(calls);
+        await t.begin(async (tx) => {
+          let release = () => {};
+          const gate = new Promise<void>((r) => {
+            release = r;
+          });
+          const first = tx.savepoint(() => gate);
+          expect(await messageOf(() => tx.savepoint(async () => 1))).toBe(
+            `${id}: a savepoint is already open on this transaction — await it before starting another`,
+          );
+          release();
+          await first;
+          // Settled, so the next one is allowed, and a failed one frees the slot too.
+          await tx
+            .savepoint(async () => {
+              throw new Error("boom");
+            })
+            .catch(() => undefined);
+          expect(await tx.savepoint(async () => "again")).toBe("again");
+        });
+        const entered = calls.filter(
+          ([c]) => c.endsWith(".savepoint") || c === "db.tx.transaction",
+        );
+        expect(entered).toHaveLength(3);
+      });
+
+      test("savepoints on different handles do not block each other", async () => {
+        await make([]).begin(async (tx) => {
+          await tx.savepoint(async (sp) => {
+            // The outer handle's savepoint is open; the inner handle has its own slot.
+            expect(await sp.savepoint(async () => "inner")).toBe("inner");
+          });
+        });
+      });
+
+      test("a server error fn caught still rejects begin and the savepoint", async () => {
+        const t = make([]);
+        const swallow = (q: TxSql) => q.unsafe(FAIL).catch(() => undefined);
+        expect(
+          await t
+            .begin(async (tx) => {
+              await swallow(tx);
+              return "resolved";
+            })
+            .catch((err: unknown) => err),
+        ).toBe(serverError);
+        // A savepoint that caught its own server error rejects with it, and the
+        // transaction that caught the savepoint's rejection commits.
+        let fromSavepoint: unknown;
+        const value = await t.begin(async (tx) => {
+          fromSavepoint = await tx.savepoint(swallow).catch((err: unknown) => err);
+          return "committed";
+        });
+        expect(fromSavepoint).toBe(serverError);
+        expect(value).toBe("committed");
+      });
+
+      test("an error with no SQLSTATE that fn caught does not reject begin", async () => {
+        const t = make([]);
+        const value = await t.begin(async (tx) => {
+          expect(await messageOf(() => tx.unsafe(REFUSE))).toBe(REFUSE);
+          expect(await tx.savepoint((sp) => sp.unsafe(REFUSE).catch(() => "sp"))).toBe("sp");
+          return "committed";
+        });
+        expect(value).toBe("committed");
       });
 
       test("a nested savepoint wraps the savepoint's own native object", async () => {
@@ -267,8 +382,35 @@ describe("drizzleTransactor", () => {
     expect(await messageOf(() => t.begin((tx) => tx`select ${undefined}::int`))).toBe(
       "drizzleTransactor: value 1 is undefined — bind null instead",
     );
+    // A hole in a sparse array reads as undefined too.
+    const sparse: unknown[] = [];
+    sparse[1] = 2;
+    expect(await messageOf(() => t.sql.unsafe("select $1::int, $2::int", sparse))).toBe(
+      "drizzleTransactor: value 1 is undefined — bind null instead",
+    );
     expect(executed()).toEqual([]);
     await t.sql.unsafe("select $1::int", [null]);
+    expect(executed()).toHaveLength(1);
+  });
+
+  test("a value that is not a bindable scalar is refused before sending", async () => {
+    const { t, executed } = make();
+    const sqlObject = { getSQL: () => ({}) };
+    for (const [value, kind] of [
+      [[1, 2], "array"],
+      [sqlObject, "sql"],
+      [{ a: 1 }, "object"],
+      [Symbol("s"), "symbol"],
+      [() => 1, "function"],
+    ] as const) {
+      const expected = `drizzleTransactor: value 2 is not a bindable scalar — got ${kind}`;
+      expect(await messageOf(() => t.sql`select ${1}, ${value}`)).toBe(expected);
+      expect(await messageOf(() => t.sql.unsafe("select $1, $2", [1, value]))).toBe(expected);
+      expect(await messageOf(() => t.begin((tx) => tx`select ${1}, ${value}`))).toBe(expected);
+    }
+    expect(executed()).toEqual([]);
+    const at = new Date(0);
+    await t.sql`select ${"s"}, ${1}, ${true}, ${2n}, ${null}, ${at}`;
     expect(executed()).toHaveLength(1);
   });
 
