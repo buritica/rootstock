@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { CAPABILITIES } from "./capabilities.ts";
 
-test("v0.1.1 appends the two transport ids to the frozen v0.1.0 vocabulary", () => {
+test("appends the three data-layer ids to the frozen 24-id vocabulary, in order", () => {
   expect([...CAPABILITIES]).toEqual([
     "hash.content",
     "normalize.name",
@@ -27,5 +27,8 @@ test("v0.1.1 appends the two transport ids to the frozen v0.1.0 vocabulary", () 
     "grounding.quote",
     "transport.retry",
     "transport.slack",
+    "db.migrate",
+    "concurrency.map",
+    "config",
   ]);
 });

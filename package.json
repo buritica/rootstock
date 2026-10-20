@@ -1,6 +1,6 @@
 {
   "name": "@buritica/rootstock",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Shared capabilities for Bun + Postgres knowledge systems: ingestion, chunking, embeddings, retrieval, judgments, and the goldens that prove extractions change nothing.",
   "license": "MIT",
   "type": "module",
