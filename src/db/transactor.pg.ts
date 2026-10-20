@@ -71,9 +71,14 @@ async function rejection(p: Promise<unknown>): Promise<unknown> {
 }
 
 describe("query surface", () => {
-  test("the tag binds values", async () => {
+  test("the tag binds values, and runs with none", async () => {
     await withTransactor(async (t) => {
       expect(await t.sql`select ${1}::int as a, ${"x"}::text as b`).toEqual([{ a: 1, b: "x" }]);
+      expect(await t.sql`select 1::int as a`).toEqual([{ a: 1 }]);
+      await t.begin(async (tx) => {
+        expect(await tx`select 2::int as a`).toEqual([{ a: 2 }]);
+        expect(await tx`select ${3}::int as a`).toEqual([{ a: 3 }]);
+      });
     });
   });
 
@@ -320,13 +325,20 @@ describe("pgCode on real driver errors", () => {
           }),
         );
         expect(pgCode(err)).toBe("25006");
+        expect(pgCode(new Error("x", { cause: err }))).toBe("25006");
       }),
     );
   });
 });
 
 describe("rendered options, live", () => {
-  const url = process.env.ROOTSTOCK_TEST_DATABASE_URL ?? "";
+  const url = process.env.ROOTSTOCK_TEST_DATABASE_URL;
+  if (url === undefined || url === "") {
+    // Never let a driver fall back to ambient connection settings.
+    throw new Error(
+      "ROOTSTOCK_TEST_DATABASE_URL is not set — run DB suites through `bun run test:db`",
+    );
+  }
   const profile = (statementTimeoutMs: number, readOnly: boolean): ClientSlice =>
     clientSlice({
       profiles: {

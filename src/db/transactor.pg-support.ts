@@ -8,7 +8,7 @@ import {
 import { openSecondClient, openTestClient, type TestClient } from "./test-client.pg-support.ts";
 
 /**
- * The matrix's transactors: the O1 test clients, each behind the factory for
+ * The matrix's transactors: the test clients (`test-client.pg-support.ts`), each behind the factory for
  * its kind. Every client is `max: 1`, so a transactor's queries share one
  * backend; `openSecond()` is an independent one. A test closes what it opens.
  */

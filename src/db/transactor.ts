@@ -176,7 +176,7 @@ function drizzleSurface<S extends object>(
     }
     return result;
   };
-  return surface((strings, ...values) => run(deps.sql(strings, ...values)), {
+  return surface(async (strings, ...values) => run(deps.sql(strings, ...values)), {
     unsafe: async (query: string, params?: readonly unknown[]) => {
       if (params === undefined || params.length === 0) return run(deps.sql.raw(query));
       const { strings, values } = drizzleTemplate(query, params);
@@ -202,9 +202,15 @@ function drizzleTx<N>(native: unknown, deps: { sql: DrizzleSqlTagLike }): TxSql<
  * A transactor over a drizzle database. `deps.sql` is the consumer's own `sql`
  * tag, so rootstock never imports drizzle. `native` is drizzle's transaction;
  * a savepoint is its nested `transaction`. Every `execute` result must be a row
- * array, which holds for drizzle over postgres.js. `unsafe` rewrites every
- * `$n` in the text, including inside a quoted literal or comment, so its query
- * text must use `$` only as placeholders.
+ * array, which holds for drizzle over postgres.js. The check runs after the
+ * statement did, so a refused write on the root `sql` has already committed.
+ *
+ * `unsafe(query, params)` becomes one tagged-template call: each `$n` occurrence
+ * binds `params[n - 1]` (a placeholder used twice binds twice), and every
+ * parameter must be referenced, or the call rejects before anything is sent.
+ * It rewrites `$n` anywhere in the text, inside a quoted literal or a comment
+ * too, so the text must use `$` only as placeholders. With no params, or `[]`,
+ * the text is sent as-is.
  */
 export function drizzleTransactor<N = unknown>(
   db: DrizzleDbLike,

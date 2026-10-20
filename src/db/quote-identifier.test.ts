@@ -35,6 +35,12 @@ describe("quoteIdentifier", () => {
     expect(messageOf(() => quoteIdentifier(name))).toBe(refusal(name));
   });
 
+  test("a non-string is refused, even one whose string form would pass", () => {
+    for (const value of [undefined, null, 123, ["ok"]]) {
+      expect(messageOf(() => quoteIdentifier(value as unknown as string))).toBe(refusal(value));
+    }
+  });
+
   test("names outside [a-z_][a-z0-9_]* are refused with E-ID", () => {
     for (const name of ["", "Root", "9lives", "rs-t", 'x"y', "rs t", "é", "a;drop"]) {
       expect(messageOf(() => quoteIdentifier(name))).toBe(refusal(name));

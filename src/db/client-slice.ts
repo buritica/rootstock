@@ -1,8 +1,10 @@
+import { q } from "./quote-value.ts";
+
 export type DriverDefault = "driver-default";
 
 export interface ConnectionProfileInput {
   max: number | DriverDefault;
-  /** Upper bound for a per-call max (tier 2). Integer >= 1, and >= max when max is a number. */
+  /** The highest `max` a call may ask a renderer for. Integer >= 1, and >= max when max is a number. */
   maxCeiling: number;
   idleTimeoutSeconds: number | DriverDefault;
   maxLifetimeSeconds: number | "never" | DriverDefault;
@@ -78,7 +80,7 @@ function required(path: string): Error {
 }
 
 function invalid(path: string, expected: string, value: unknown): Error {
-  return new Error(`clientSlice: ${path} must be ${expected} — got ${JSON.stringify(value)}`);
+  return new Error(`clientSlice: ${path} must be ${expected} — got ${q(value)}`);
 }
 
 function refuseUnknownKeys(record: Record<string, unknown>, known: readonly string[], at: string) {
@@ -92,7 +94,8 @@ function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInp
   const path = `profiles.${name}`;
   const out: Record<string, unknown> = {};
   for (const field of FIELD_NAMES) {
-    const value = input[field];
+    // Own keys only: an inherited value is not a field the profile declared.
+    const value = Object.hasOwn(input, field) ? input[field] : undefined;
     if (value === undefined) throw required(`${path}.${field}`);
     const { ok, expected } = FIELDS[field];
     if (!ok(value)) throw invalid(`${path}.${field}`, expected, value);
@@ -146,14 +149,14 @@ function resolve(
   const profile = Object.hasOwn(slice.profiles, name) ? slice.profiles[name] : undefined;
   if (profile === undefined) {
     throw new Error(
-      `${fn}: no connection profile ${JSON.stringify(name)} — declared: ${Object.keys(slice.profiles).join(", ")}`,
+      `${fn}: no connection profile ${q(name)} — declared: ${Object.keys(slice.profiles).join(", ")}`,
     );
   }
   let max = profile.max;
   if (call?.max !== undefined) {
     if (!isCount(call.max, 1) || call.max > profile.maxCeiling) {
       throw new Error(
-        `${fn}: max for profile ${JSON.stringify(name)} must be an integer from 1 to ${profile.maxCeiling} — got ${JSON.stringify(call.max)}`,
+        `${fn}: max for profile ${q(name)} must be an integer from 1 to ${profile.maxCeiling} — got ${q(call.max)}`,
       );
     }
     max = call.max;
@@ -162,7 +165,7 @@ function resolve(
   if (call?.statementTimeoutMs !== undefined) {
     if (!isCount(call.statementTimeoutMs, 0)) {
       throw new Error(
-        `${fn}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${JSON.stringify(call.statementTimeoutMs)}`,
+        `${fn}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${q(call.statementTimeoutMs)}`,
       );
     }
     timeoutMs = call.statementTimeoutMs;
@@ -208,7 +211,8 @@ export function postgresJsOptions(
 }
 
 /**
- * Bun.SQL options for one profile. Refuses a profile that sets
+ * Bun.SQL options for one profile. Never emits `ssl`, a URL, a host or
+ * credentials: the consumer spreads what it owns over the result. Refuses a profile that sets
  * `keepAliveSeconds`: Bun.SQL accepts a keep-alive option and ignores it, so
  * rendering one would promise a setting that never takes effect.
  */
@@ -220,7 +224,7 @@ export function bunSqlOptions(
   const { profile: p, max, timeoutMs } = resolve("bunSqlOptions", slice, profile, call);
   if (p.keepAliveSeconds !== DD) {
     throw new Error(
-      `bunSqlOptions: profile ${JSON.stringify(profile)} sets keepAliveSeconds, which ${BUN_SQL} has no option for — use "driver-default"`,
+      `bunSqlOptions: profile ${q(profile)} sets keepAliveSeconds, which ${BUN_SQL} has no option for — use "driver-default"`,
     );
   }
   return render(max, timeoutMs, p.readOnly, [

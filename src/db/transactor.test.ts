@@ -25,12 +25,14 @@ function tagDouble(name: string, calls: Call[]) {
       return result;
     },
     savepoint: async (fn: (sp: unknown) => unknown) => {
-      calls.push([`${name}.savepoint`]);
-      return fn(tagDouble(`${name}.sp`, calls));
+      const sp = tagDouble(`${name}.sp`, calls);
+      calls.push([`${name}.savepoint`, sp]);
+      return fn(sp);
     },
     begin: async (fn: (tx: unknown) => unknown) => {
-      calls.push([`${name}.begin`]);
-      return fn(tagDouble(`${name}.tx`, calls));
+      const tx = tagDouble(`${name}.tx`, calls);
+      calls.push([`${name}.begin`, tx]);
+      return fn(tx);
     },
   });
 }
@@ -51,8 +53,9 @@ function drizzleDouble(
       return out.result;
     },
     transaction: async (fn: (tx: unknown) => unknown) => {
-      calls.push([`${name}.transaction`]);
-      return fn(drizzleDouble(`${name}.tx`, calls, out));
+      const tx = drizzleDouble(`${name}.tx`, calls, out);
+      calls.push([`${name}.transaction`, tx]);
+      return fn(tx);
     },
     begin: () => {
       throw new Error("drizzle has no begin");
@@ -103,8 +106,9 @@ describe("every transactor", () => {
           return ["a", "b"];
         });
         expect(value).toEqual(["a", "b"]);
-        expect(calls.filter(([c]) => c === "db.begin" || c === "db.transaction")).toHaveLength(1);
-        expect(typeof seen).not.toBe("undefined");
+        const entered = calls.filter(([c]) => c === "db.begin" || c === "db.transaction");
+        expect(entered).toHaveLength(1);
+        expect(seen).toBe(entered[0]?.[1]);
       });
 
       test("begin-rethrows-same-object", async () => {
@@ -131,11 +135,24 @@ describe("every transactor", () => {
 
       test("a nested savepoint wraps the savepoint's own native object", async () => {
         const calls: Call[] = [];
+        const natives: unknown[] = [];
         await make(calls).begin(async (tx) => {
-          await tx.savepoint((sp) => sp.savepoint((inner) => inner`select ${1}`));
+          await tx.savepoint((sp, spNative) => {
+            natives.push(spNative);
+            return sp.savepoint(async (inner, innerNative) => {
+              natives.push(innerNative);
+              await inner`select ${1}`;
+            });
+          });
         });
-        const nested = id === "drizzle" ? "db.tx.tx.transaction" : "db.tx.sp.savepoint";
-        expect(calls.map(([c]) => c)).toContain(nested);
+        const expected =
+          id === "drizzle"
+            ? ["db.transaction", "db.tx.transaction", "db.tx.tx.transaction", "db.tx.tx.tx.execute"]
+            : ["db.begin", "db.tx.savepoint", "db.tx.sp.savepoint", "db.tx.sp.sp.tag"];
+        expect(calls.map(([c]) => c)).toEqual(expected);
+        expect(natives).toEqual([calls[1]?.[1], calls[2]?.[1]]);
+        expect(natives[0]).toBe(calls[1]?.[1]);
+        expect(natives[1]).toBe(calls[2]?.[1]);
       });
     });
   }

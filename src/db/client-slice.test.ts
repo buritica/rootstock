@@ -136,6 +136,26 @@ describe("clientSlice", () => {
     );
   });
 
+  test("an inherited field is not a declared one", () => {
+    expect(messageOf(() => slice({ app: Object.create(APP) }))).toBe(
+      "clientSlice: profiles.app.max is required",
+    );
+  });
+
+  test("a value JSON cannot serialize still gets the refusal that names its path", () => {
+    expect(messageOf(() => one({ max: 2n }))).toBe(
+      'clientSlice: profiles.app.max must be an integer >= 1 or "driver-default" — got 2n',
+    );
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(messageOf(() => one({ extra: cyclic } as never))).toBe(
+      "clientSlice: profiles.app.extra must be a known key — got an unserializable value",
+    );
+    expect(
+      messageOf(() => postgresJsOptions(slice({ app: APP }), "app", { max: 3n as never })),
+    ).toBe('postgresJsOptions: max for profile "app" must be an integer from 1 to 8 — got 3n');
+  });
+
   test("unbranded-slice-refused", () => {
     const real = slice({ app: APP });
     const lookalikes = [{ profiles: { app: APP } }, { ...real }, Object.freeze({ ...real })];
@@ -257,77 +277,83 @@ describe("renderers", () => {
     });
   });
 
-  test("statement timeout and read-only share one connection object", () => {
-    const s = slice({ app: { ...READER, statementTimeoutMs: 100, readOnly: true } });
-    const connection = { statement_timeout: 100, default_transaction_read_only: true };
-    expect(postgresJsOptions(s, "app")).toEqual({ connection });
-    expect(bunSqlOptions(s, "app")).toEqual({ connection });
-    expect(postgresJsOptions(s, "app", { statementTimeoutMs: 0 })).toEqual({
-      connection: { default_transaction_read_only: true },
-    });
-    const writer = slice({ app: { ...READER, statementTimeoutMs: 100 } });
-    expect(postgresJsOptions(writer, "app", { statementTimeoutMs: 0 })).toEqual({});
-  });
+  // Call options resolve the same way for both renderers; a profile with no
+  // keep-alive renders on both.
+  const RENDERERS = [postgresJsOptions, bunSqlOptions] as const;
+  const C = slice({ app: { ...APP, keepAliveSeconds: "driver-default" }, reader: READER });
+  const timeout = (statementTimeoutMs: number, readOnly = false) =>
+    slice({ app: { ...READER, statementTimeoutMs, readOnly } });
 
-  test("a call statement timeout overrides the profile's", () => {
-    const s = slice({ app: { ...READER, statementTimeoutMs: 100 } });
-    expect(bunSqlOptions(s, "app", { statementTimeoutMs: 40 })).toEqual({
-      connection: { statement_timeout: 40 },
-    });
-    expect(bunSqlOptions(S, "reader", { statementTimeoutMs: 40 })).toEqual({
-      connection: { statement_timeout: 40 },
-    });
-  });
+  for (const render of RENDERERS) {
+    describe(`${render.name} call options`, () => {
+      test("statement timeout and read-only share one connection object", () => {
+        expect(render(timeout(100, true), "app")).toEqual({
+          connection: { statement_timeout: 100, default_transaction_read_only: true },
+        });
+        expect(render(timeout(100, true), "app", { statementTimeoutMs: 0 })).toEqual({
+          connection: { default_transaction_read_only: true },
+        });
+        expect(render(timeout(100), "app", { statementTimeoutMs: 0 })).toEqual({});
+        expect(render(timeout(0, true), "app", { statementTimeoutMs: 30 })).toEqual({
+          connection: { statement_timeout: 30, default_transaction_read_only: true },
+        });
+      });
 
-  test("a call statementTimeoutMs of undefined renders the profile value", () => {
-    const s = slice({ app: { ...READER, statementTimeoutMs: 100 } });
-    expect(postgresJsOptions(s, "app", { statementTimeoutMs: undefined })).toEqual({
-      connection: { statement_timeout: 100 },
-    });
-  });
+      test("a call statement timeout overrides the profile's", () => {
+        expect(render(timeout(100), "app", { statementTimeoutMs: 40 })).toEqual({
+          connection: { statement_timeout: 40 },
+        });
+        expect(render(C, "reader", { statementTimeoutMs: 40 })).toEqual({
+          connection: { statement_timeout: 40 },
+        });
+      });
 
-  test("a bad call statement timeout is refused with E-CALL-STMT", () => {
-    for (const statementTimeoutMs of [-1, 1.5, Number.NaN]) {
-      for (const [fn, render] of [
-        ["postgresJsOptions", postgresJsOptions],
-        ["bunSqlOptions", bunSqlOptions],
-      ] as const) {
-        expect(messageOf(() => render(S, "reader", { statementTimeoutMs }))).toBe(
-          `${fn}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${JSON.stringify(statementTimeoutMs)}`,
-        );
+      test("a call statementTimeoutMs of undefined renders the profile value", () => {
+        expect(render(timeout(100), "app", { statementTimeoutMs: undefined })).toEqual({
+          connection: { statement_timeout: 100 },
+        });
+      });
+
+      test("a bad call statement timeout is refused with E-CALL-STMT", () => {
+        for (const statementTimeoutMs of [-1, 1.5, Number.NaN]) {
+          expect(messageOf(() => render(C, "reader", { statementTimeoutMs }))).toBe(
+            `${render.name}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${JSON.stringify(statementTimeoutMs)}`,
+          );
+        }
+      });
+
+      test("call max 1 and maxCeiling are accepted, over a number or a driver-default max", () => {
+        expect(render(C, "app", { max: 1 }).max).toBe(1);
+        expect(render(C, "app", { max: 8 }).max).toBe(8);
+        expect(render(C, "reader", { max: 10 })).toEqual({ max: 10 });
+        expect(render(C, "reader", { max: 1 })).toEqual({ max: 1 });
+      });
+
+      test("call max undefined renders the profile max", () => {
+        expect(render(C, "app", { max: undefined })).toEqual(render(C, "app"));
+        expect(render(C, "app", { max: undefined }).max).toBe(5);
+        expect(render(C, "reader", { max: undefined })).toEqual({});
+        expect(render(C, "reader", {})).toEqual({});
+      });
+
+      for (const max of [0, 1.5, Number.NaN, -1]) {
+        test(`call max ${max} is refused with E-CALL-MAX`, () => {
+          expect(messageOf(() => render(C, "app", { max }))).toBe(
+            `${render.name}: max for profile "app" must be an integer from 1 to 8 — got ${JSON.stringify(max)}`,
+          );
+        });
       }
-    }
-  });
 
-  test("call max 1 and maxCeiling are accepted, over a number or a driver-default max", () => {
-    expect(postgresJsOptions(S, "app", { max: 1 }).max).toBe(1);
-    expect(postgresJsOptions(S, "app", { max: 8 }).max).toBe(8);
-    expect(bunSqlOptions(S, "reader", { max: 10 }).max).toBe(10);
-    expect(postgresJsOptions(S, "reader", { max: 1 })).toEqual({ max: 1 });
-  });
-
-  test("call max undefined renders the profile max", () => {
-    expect(postgresJsOptions(S, "app", { max: undefined })).toEqual(postgresJsOptions(S, "app"));
-    expect(postgresJsOptions(S, "reader", { max: undefined })).toEqual({});
-    expect(bunSqlOptions(S, "reader", {})).toEqual({});
-  });
-
-  for (const max of [0, 1.5, Number.NaN, -1]) {
-    test(`call max ${max} is refused with E-CALL-MAX`, () => {
-      expect(messageOf(() => postgresJsOptions(S, "app", { max }))).toBe(
-        `postgresJsOptions: max for profile "app" must be an integer from 1 to 8 — got ${JSON.stringify(max)}`,
-      );
+      test("call-max-above-ceiling", () => {
+        expect(messageOf(() => render(C, "app", { max: 9 }))).toBe(
+          `${render.name}: max for profile "app" must be an integer from 1 to 8 — got 9`,
+        );
+        expect(messageOf(() => render(C, "reader", { max: 11 }))).toBe(
+          `${render.name}: max for profile "reader" must be an integer from 1 to 10 — got 11`,
+        );
+      });
     });
   }
-
-  test("call-max-above-ceiling", () => {
-    expect(messageOf(() => postgresJsOptions(S, "app", { max: 9 }))).toBe(
-      'postgresJsOptions: max for profile "app" must be an integer from 1 to 8 — got 9',
-    );
-    expect(messageOf(() => bunSqlOptions(S, "reader", { max: 11 }))).toBe(
-      'bunSqlOptions: max for profile "reader" must be an integer from 1 to 10 — got 11',
-    );
-  });
 
   test("each result is a fresh frozen object with no ssl", () => {
     const s = slice({ app: { ...APP, statementTimeoutMs: 5, keepAliveSeconds: "driver-default" } });
