@@ -38,6 +38,10 @@ export const CAPABILITIES = [
   // Outbound transport
   "transport.retry", // retry, backoff, rate-limit and wait schedules of an outbound client
   "transport.slack", // Slack Web API request construction, cursor pagination and error mapping
+  // Data layer, concurrency and configuration
+  "db.migrate", // migration discovery, ordering, tracking and apply decisions
+  "concurrency.map", // bounded-concurrency map and for-each: dispatch order, width and bad-limit behavior, early stop, errors
+  "config", // a consumer's composed, validated configuration
 ] as const;
 
 export type CapabilityId = (typeof CAPABILITIES)[number];
