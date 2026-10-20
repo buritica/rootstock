@@ -76,8 +76,8 @@ registerGoldenTests(suites, { dir: "goldens/data" });
   `process.env` and never open their own connections.
 - Test fixtures are synthetic. Consumer data never goes into this repo.
 - The capability vocabulary in `src/golden/capabilities.ts` is shared by
-  every consumer. Adding an id is a minor release; renaming or removing one
-  is breaking.
+  every consumer. Adding an id is additive (a patch release while on 0.x);
+  renaming or removing one is breaking.
 
 ## License
 
