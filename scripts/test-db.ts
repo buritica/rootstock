@@ -1,3 +1,5 @@
+import { hostname } from "node:os";
+import { SQL } from "bun";
 import { TEST_TRANSACTOR_KINDS } from "../src/db/test-client.pg-support.ts";
 import {
   GOLDEN_LABELS,
@@ -52,17 +54,37 @@ export function testsPassed(output: string): number {
   return last ? Number(last[1]) : 0;
 }
 
-async function dockerAvailable(): Promise<boolean> {
+async function dockerProblem(): Promise<string | null> {
   try {
     const proc = Bun.spawn(["docker", "version", "--format", "{{.Server.Version}}"], {
       stdout: "ignore",
-      stderr: "ignore",
+      stderr: "pipe",
     });
-    return (await proc.exited) === 0;
-  } catch {
-    return false;
+    const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    return code === 0 ? null : err.trim() || `docker version exited ${code}`;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
   }
 }
+
+/** Echoes a stream as it arrives, so a hung suite still shows its progress, and keeps a copy. */
+async function tee(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const decoder = new TextDecoder();
+  let all = "";
+  for await (const chunk of stream) {
+    const text = decoder.decode(chunk, { stream: true });
+    process.stdout.write(text);
+    all += text;
+  }
+  return all + decoder.decode();
+}
+
+/** What a signal handler must clean up: the live child, and whether a start is in flight. */
+const live: { child: Bun.Subprocess | null; starting: boolean; exitCode: number | null } = {
+  child: null,
+  starting: false,
+  exitCode: null,
+};
 
 async function runSuites(url: string, kind: string, suites: string[]): Promise<string | null> {
   // process.execPath, never "bun" from PATH: the oldest-Bun job must run its own Bun.
@@ -72,45 +94,89 @@ async function runSuites(url: string, kind: string, suites: string[]): Promise<s
     stdout: "pipe",
     stderr: "pipe",
   });
+  live.child = proc;
   const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+    tee(proc.stdout),
+    tee(proc.stderr),
     proc.exited,
   ]);
-  const output = stdout + stderr;
-  out(output);
-  if (code !== 0) return `exited ${code}`;
-  if (testsPassed(output) === 0) return "reported 0 passing tests";
+  live.child = null;
+  if (code !== 0) return `exited ${code}${proc.signalCode ? ` (${proc.signalCode})` : ""}`;
+  if (testsPassed(stdout + stderr) === 0) return "reported 0 passing tests";
   return null;
 }
 
-// A cancelled CI job or a Ctrl-C would otherwise kill the runner before its
-// `finally`, leaving a container up (`--rm` only removes a stopped one). The
-// signal can land mid-start, before any handle exists, so the sweep goes by
-// the owner-pid label every throwaway container carries.
+/**
+ * Removes every container this process started, found by the owner labels
+ * every throwaway container carries (pid, host and process start together, so
+ * another run on the same daemon is never touched).
+ */
 function removeOwnContainers(): void {
-  const label = `${GOLDEN_LABELS.pid}=${process.pid}`;
-  const ids = Bun.spawnSync(["docker", "ps", "-aq", "--filter", `label=${label}`])
-    .stdout.toString()
+  const filters = [
+    `${GOLDEN_LABELS.pid}=${process.pid}`,
+    `${GOLDEN_LABELS.host}=${hostname()}`,
+    `${GOLDEN_LABELS.ownerStart}=${Math.round(performance.timeOrigin)}`,
+  ].flatMap((label) => ["--filter", `label=${label}`]);
+  const listed = Bun.spawnSync(["docker", "ps", "-aq", ...filters], { timeout: 15_000 });
+  const ids = listed.stdout
+    .toString()
     .split("\n")
     .filter((id) => id !== "");
-  if (ids.length > 0) Bun.spawnSync(["docker", "rm", "-f", ...ids]);
+  if (ids.length > 0) Bun.spawnSync(["docker", "rm", "-f", ...ids], { timeout: 30_000 });
 }
 
-for (const [signal, code] of [
-  ["SIGINT", 130],
-  ["SIGTERM", 143],
-] as const) {
-  process.on(signal, () => {
-    out(`test:db: ${signal} — removing this run's throwaway Postgres`);
-    removeOwnContainers();
-    process.exit(code);
-  });
+// A cancelled CI job or a Ctrl-C would otherwise kill the runner before its
+// `finally`, leaving the container up (`--rm` only removes a stopped one) and
+// the child suite running against it. A signal that lands while a container
+// is starting waits for the start to settle, then sweeps, because the
+// container does not exist yet when the signal arrives.
+function onSignal(signal: "SIGINT" | "SIGTERM", code: number): void {
+  out(`test:db: ${signal} — stopping the suite and removing this run's throwaway Postgres`);
+  live.child?.kill();
+  live.exitCode = code;
+  if (live.starting) return;
+  removeOwnContainers();
+  process.exit(code);
+}
+
+async function startOrExit(image: string): Promise<ThrowawayPostgres> {
+  live.starting = true;
+  try {
+    return await startThrowawayPostgres({ image });
+  } finally {
+    live.starting = false;
+    if (live.exitCode !== null) {
+      removeOwnContainers();
+      process.exit(live.exitCode);
+    }
+  }
+}
+
+/**
+ * A fresh database per transactor kind, so one kind never sees what another
+ * left behind in the shared container.
+ */
+async function databaseFor(url: string, kind: string): Promise<string> {
+  const name = `rs_${kind.replaceAll("-", "_")}`;
+  const admin = new SQL({ url, max: 1 });
+  try {
+    await admin.unsafe(`create database "${name}"`);
+  } finally {
+    await admin.close();
+  }
+  const fresh = new URL(url);
+  fresh.pathname = `/${name}`;
+  return fresh.toString();
 }
 
 async function main(): Promise<number> {
-  if (!(await dockerAvailable())) {
-    out("test:db: docker is not available — the DB matrix needs a running docker daemon");
+  process.on("SIGINT", () => onSignal("SIGINT", 130));
+  process.on("SIGTERM", () => onSignal("SIGTERM", 143));
+  const problem = await dockerProblem();
+  if (problem !== null) {
+    out(
+      `test:db: docker is not available — the DB matrix needs a running docker daemon (${problem})`,
+    );
     return 1;
   }
   const suites = await suitesUnder(ROOT);
@@ -122,19 +188,24 @@ async function main(): Promise<number> {
   const failures: string[] = [];
   for (const image of IMAGES) {
     const name = image.split("@")[0];
+    out(`\ntest:db: starting ${image}`);
     let pg: ThrowawayPostgres;
     try {
-      pg = await startThrowawayPostgres({ image });
+      pg = await startOrExit(image);
     } catch (err) {
-      failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+      const failure = `${name}: ${err instanceof Error ? err.message : String(err)}`;
+      out(`test:db: ${failure}`);
+      failures.push(failure);
       continue;
     }
     try {
       for (const kind of TRANSACTORS) {
         out(`\n=== ${name} · ${kind} ===`);
-        const failure = await runSuites(pg.url, kind, suites);
+        const failure = await runSuites(await databaseFor(pg.url, kind), kind, suites);
         if (failure !== null) failures.push(`${name} · ${kind}: ${failure}`);
       }
+    } catch (err) {
+      failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       await pg.stop();
     }

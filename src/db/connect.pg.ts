@@ -29,12 +29,15 @@ test("close() resolves and ends the backend", async () => {
   const c = openTestClient();
   const watcher = openSecondClient();
   try {
+    await rows(watcher, "select 1");
     const [row] = (await rows(c, "select pg_backend_pid() as pid")) as { pid: number }[];
     expect(await c.close()).toBeUndefined();
     const alive = async () =>
       (await rows(watcher, `select 1 from pg_stat_activity where pid = ${Number(row?.pid)}`))
         .length;
-    for (let i = 0; i < 50 && (await alive()) > 0; i++) await Bun.sleep(20);
+    // The backend exits asynchronously after the client disconnects.
+    const deadline = performance.now() + 5_000;
+    while ((await alive()) > 0 && performance.now() < deadline) await Bun.sleep(20);
     expect(await alive()).toBe(0);
   } finally {
     await watcher.close();
