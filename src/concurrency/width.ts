@@ -28,6 +28,12 @@ function required(path: string): Error {
   return new Error(`${PARSER}: ${path} is required`);
 }
 
+// An unknown key's value is never echoed: a mistyped key could hold anything,
+// and this text is printed at boot.
+function unknownKey(path: string): Error {
+  return new Error(`${PARSER}: ${path} is not a known key`);
+}
+
 function invalid(path: string, expected: string, value: unknown): Error {
   return new Error(`${PARSER}: ${path} must be ${expected} — got ${q(value)}`);
 }
@@ -50,7 +56,7 @@ function parseWidth(name: string, entry: unknown): Readonly<WidthInput> {
   const path = `widths.${name}`;
   const fields = isRecord(entry) ? entry : {};
   for (const key of Object.keys(fields)) {
-    if (!WIDTH_KEYS.has(key)) throw invalid(`${path}.${key}`, "a known key", fields[key]);
+    if (!WIDTH_KEYS.has(key)) throw unknownKey(`${path}.${key}`);
   }
   const def = own(fields, "default");
   const max = own(fields, "max");
@@ -74,7 +80,7 @@ function parseWidth(name: string, entry: unknown): Readonly<WidthInput> {
 export function concurrencySlice(input: ConcurrencySliceInput): ConcurrencySlice {
   const fields: Record<string, unknown> = isRecord(input) ? input : {};
   for (const key of Object.keys(fields)) {
-    if (key !== "widths") throw invalid(key, "a known key", fields[key]);
+    if (key !== "widths") throw unknownKey(key);
   }
   const widths = own(fields, "widths");
   if (widths === undefined) throw required("widths");

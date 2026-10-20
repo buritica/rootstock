@@ -48,11 +48,7 @@ describe("concurrencySlice", () => {
     ["missing widths", {}, "concurrencySlice: widths is required"],
     ["null input", null, "concurrencySlice: widths is required"],
     ["array input", [], "concurrencySlice: widths is required"],
-    [
-      "unknown key with widths absent",
-      { width: {} },
-      "concurrencySlice: width must be a known key — got {}",
-    ],
+    ["unknown key with widths absent", { width: {} }, "concurrencySlice: width is not a known key"],
     [
       "empty widths",
       { widths: {} },
@@ -71,7 +67,7 @@ describe("concurrencySlice", () => {
     [
       "unknown top-level key",
       { widths: { fetch: { default: 1, max: 1 } }, profiles: 1 },
-      "concurrencySlice: profiles must be a known key — got 1",
+      "concurrencySlice: profiles is not a known key",
     ],
     [
       "uppercase name",
@@ -104,9 +100,14 @@ describe("concurrencySlice", () => {
       "concurrencySlice: widths.fetch.default is required",
     ],
     [
+      "unknown key holding a secret-looking value",
+      { widths: { fetch: { default: 1, max: 1 } }, url: "postgres://user:secret@db/x" },
+      "concurrencySlice: url is not a known key",
+    ],
+    [
       "unknown width key",
       { widths: { fetch: { default: 1, max: 1, min: 1 } } },
-      "concurrencySlice: widths.fetch.min must be a known key — got 1",
+      "concurrencySlice: widths.fetch.min is not a known key",
     ],
     [
       "max 0",
