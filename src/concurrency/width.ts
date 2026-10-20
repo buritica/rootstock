@@ -40,15 +40,22 @@ function isIntegerIn(value: unknown, min: number, max: number): value is number 
   return Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
 }
 
+// Reads own properties only, so an inherited key can neither satisfy a required
+// field nor slip past the unknown-key check.
+function own(record: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
 function parseWidth(name: string, entry: unknown): Readonly<WidthInput> {
   const path = `widths.${name}`;
   const fields = isRecord(entry) ? entry : {};
   for (const key of Object.keys(fields)) {
     if (!WIDTH_KEYS.has(key)) throw invalid(`${path}.${key}`, "a known key", fields[key]);
   }
-  if (fields.default === undefined) throw required(`${path}.default`);
-  if (fields.max === undefined) throw required(`${path}.max`);
-  const { default: def, max } = fields;
+  const def = own(fields, "default");
+  const max = own(fields, "max");
+  if (def === undefined) throw required(`${path}.default`);
+  if (max === undefined) throw required(`${path}.max`);
   if (!isIntegerIn(max, 1, MAX_WIDTH)) {
     throw invalid(`${path}.max`, `an integer from 1 to ${MAX_WIDTH}`, max);
   }
@@ -69,7 +76,7 @@ export function concurrencySlice(input: ConcurrencySliceInput): ConcurrencySlice
   for (const key of Object.keys(fields)) {
     if (key !== "widths") throw invalid(key, "a known key", fields[key]);
   }
-  const { widths } = fields;
+  const widths = own(fields, "widths");
   if (widths === undefined) throw required("widths");
   if (!isRecord(widths) || Object.keys(widths).length === 0) {
     throw invalid("widths", "an object with at least one width", widths);
@@ -98,8 +105,8 @@ export function width(slice: ConcurrencySlice, name: string, requested?: number)
       `width: expected a ConcurrencySlice built by ${PARSER}() — got an object that parser did not return`,
     );
   }
-  const declared = Object.hasOwn(slice.widths, name) ? slice.widths[name] : undefined;
-  if (declared === undefined) {
+  const declared = slice.widths[name];
+  if (!Object.hasOwn(slice.widths, name) || declared === undefined) {
     throw new Error(
       `width: no width ${q(name)} — declared: ${Object.keys(slice.widths).join(", ")}`,
     );

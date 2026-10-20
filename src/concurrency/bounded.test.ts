@@ -1,22 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { forEachBounded } from "./bounded.ts";
 
-interface Deferred<T = void> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (err: unknown) => void;
-}
-
-function deferred<T = void>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (err: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 // Drains the microtask queue far enough for every chained continuation here.
 async function flush(): Promise<void> {
   for (let i = 0; i < 20; i++) await Promise.resolve();
@@ -34,7 +18,7 @@ async function state(p: Promise<unknown>): Promise<unknown> {
 
 // Records every gate and dispatch in order; each run waits on its own deferred.
 function harness(n: number) {
-  const runs = Array.from({ length: n }, () => deferred());
+  const runs = Array.from({ length: n }, () => Promise.withResolvers<void>());
   const events: string[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -43,7 +27,7 @@ function harness(n: number) {
     inFlight++;
     maxInFlight = Math.max(maxInFlight, inFlight);
     try {
-      await (runs[i] as Deferred).promise;
+      await (runs[i] as PromiseWithResolvers<void>).promise;
     } finally {
       inFlight--;
       events.push(`done:${i}`);
@@ -118,7 +102,7 @@ describe("forEachBounded", () => {
 
   test("rejection-during-gate", async () => {
     const h = harness(3);
-    const gate1 = deferred();
+    const gate1 = Promise.withResolvers<void>();
     const before = async (i: number) => {
       if (i === 1) await gate1.promise;
     };

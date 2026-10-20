@@ -1,22 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mapWithConcurrency } from "./map-with-concurrency.ts";
 
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (err: unknown) => void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (err: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 // Drains the microtask queue far enough for every chained continuation here.
 async function flush(): Promise<void> {
   for (let i = 0; i < 20; i++) await Promise.resolve();
@@ -24,7 +8,7 @@ async function flush(): Promise<void> {
 
 // One deferred per item; `fn` records what started and how many are in flight.
 function harness(n: number) {
-  const gates = Array.from({ length: n }, () => deferred<string>());
+  const gates = Array.from({ length: n }, () => Promise.withResolvers<string>());
   const started: Array<[string, number]> = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -33,7 +17,7 @@ function harness(n: number) {
     inFlight++;
     maxInFlight = Math.max(maxInFlight, inFlight);
     try {
-      return await (gates[index] as Deferred<string>).promise;
+      return await (gates[index] as PromiseWithResolvers<string>).promise;
     } finally {
       inFlight--;
     }

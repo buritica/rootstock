@@ -85,6 +85,11 @@ describe("concurrencySlice", () => {
       "concurrencySlice: widths.fetch.max is required",
     ],
     [
+      "default only inherited",
+      { widths: { fetch: Object.assign(Object.create({ default: 1 }), { max: 4 }) } },
+      "concurrencySlice: widths.fetch.default is required",
+    ],
+    [
       "entry that is not an object",
       { widths: { fetch: 4 } },
       "concurrencySlice: widths.fetch.default is required",
