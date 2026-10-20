@@ -1,4 +1,4 @@
-import { checkIdentifier } from "./db-surface.ts";
+import { checkIdentifier, q } from "./db-surface.ts";
 
 export interface MigrateSliceInput {
   /** Identifier rule of `db`'s `quoteIdentifier`. Default "rootstock". */
@@ -21,7 +21,7 @@ const BUILT = new WeakSet<object>();
 export function migrateSlice(input: MigrateSliceInput): MigrateSlice {
   for (const [key, value] of Object.entries(input)) {
     if (!KNOWN_KEYS.has(key)) {
-      throw new Error(`migrateSlice: ${key} must be a known key — got ${JSON.stringify(value)}`);
+      throw new Error(`migrateSlice: ${key} must be a known key — got ${q(value)}`);
     }
   }
   const schema =
@@ -30,9 +30,7 @@ export function migrateSlice(input: MigrateSliceInput): MigrateSlice {
       : checkIdentifier("migrateSlice: schema", input.schema);
   if (input.ahead === undefined) throw new Error("migrateSlice: ahead is required");
   if (input.ahead !== "refuse" && input.ahead !== "allow") {
-    throw new Error(
-      `migrateSlice: ahead must be "refuse" or "allow" — got ${JSON.stringify(input.ahead)}`,
-    );
+    throw new Error(`migrateSlice: ahead must be "refuse" or "allow" — got ${q(input.ahead)}`);
   }
   const slice = Object.freeze({ schema, ahead: input.ahead }) as MigrateSlice;
   BUILT.add(slice);
