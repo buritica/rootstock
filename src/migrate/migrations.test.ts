@@ -77,6 +77,13 @@ describe("parseMigration", () => {
     });
   });
 
+  test("a trailing breakpoint sends no empty statement", () => {
+    const text = "-- rootstock-migration: additive\nSELECT 1;\n--> statement-breakpoint\n";
+    expect(parseMigration("20200101000000_one.sql", encode(text)).statements).toEqual([
+      "-- rootstock-migration: additive\nSELECT 1;",
+    ]);
+  });
+
   test("a breakpoint must be the whole line", () => {
     const text =
       "-- rootstock-migration: additive\nSELECT 1; --> statement-breakpoint\nSELECT 2;\n";

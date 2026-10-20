@@ -30,7 +30,12 @@ export function parseMigration(filename: string, bytes: Uint8Array): RootstockMi
     filename,
     sha256: sha256Hex(bytes),
     kind,
-    statements: Object.freeze(text.split(BREAKPOINT).map((s) => s.trim())),
+    statements: Object.freeze(
+      text
+        .split(BREAKPOINT)
+        .map((s) => s.trim())
+        .filter((s) => s !== ""),
+    ),
   });
 }
 

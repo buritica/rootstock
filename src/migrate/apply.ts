@@ -63,7 +63,8 @@ export async function applyMigrationList(
     // Selected FROM the call so no driver has to decode a void column. The
     // lock serializes appliers only under READ COMMITTED: at a stricter
     // isolation the snapshot predates the wait, so a second concurrent apply
-    // fails on CREATE TABLE (42P07) and a re-run then finds it applied.
+    // fails on CREATE SCHEMA or CREATE TABLE (42P06, 42P07), and a re-run
+    // then finds it applied.
     await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${schema}`}::text)::bigint)`;
     const { exists } = await preflight(tx, schema);
     if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoted(schema)}`);
