@@ -207,6 +207,29 @@ describe("every transactor", () => {
         expect(entered).toHaveLength(3);
       });
 
+      test("a query on the outer handle while its savepoint is open is refused (E-TX-BUSY)", async () => {
+        const calls: Call[] = [];
+        const t = make(calls);
+        const busy = `${id}: a savepoint is open on this transaction — use the savepoint's handle until it settles`;
+        await t.begin(async (tx) => {
+          let release = () => {};
+          const gate = new Promise<void>((r) => {
+            release = r;
+          });
+          const open = tx.savepoint(async (sp) => {
+            await gate;
+            return sp.unsafe("select 2");
+          });
+          const before = calls.length;
+          expect(await messageOf(() => tx`select ${1}`)).toBe(busy);
+          expect(await messageOf(() => tx.unsafe("select 1"))).toBe(busy);
+          expect(calls).toHaveLength(before);
+          release();
+          await open;
+          await tx.unsafe("select 3");
+        });
+      });
+
       test("savepoints on different handles do not block each other", async () => {
         await make([]).begin(async (tx) => {
           await tx.savepoint(async (sp) => {

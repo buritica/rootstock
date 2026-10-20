@@ -19,7 +19,8 @@ export interface TxSql<N = unknown> extends Sql {
    * back even when fn caught it, as `begin` does. Savepoints on one transaction must not overlap:
    * they are a stack on one connection, and rolling back one that started
    * first also undoes one started after it. While one is open, a query
-   * through the outer handle runs inside it and rolls back with it.
+   * through the outer handle is refused: it would run inside the savepoint
+   * and roll back with it.
    */
   savepoint<T>(fn: (sp: TxSql<N>, native: N) => Promise<T>): Promise<T>;
 }
@@ -148,9 +149,20 @@ function txHandle<N>(driver: Driver, native: unknown, state: HandleState): TxSql
           ),
         )
       : run();
-  return surface((strings, ...values) => guard(() => track(base(strings, ...values))), {
-    unsafe: (query: string, params?: readonly unknown[]) =>
-      guard(() => track(base.unsafe(query, params))),
+  // A query through this handle while its savepoint is open would run inside
+  // the savepoint and roll back with it.
+  const send = <R>(run: () => Promise<R>): Promise<R> =>
+    guard(() =>
+      savepointOpen
+        ? Promise.reject(
+            new Error(
+              `${id}: a savepoint is open on this transaction — use the savepoint's handle until it settles`,
+            ),
+          )
+        : track(run()),
+    );
+  return surface((strings, ...values) => send(() => base(strings, ...values)), {
+    unsafe: (query: string, params?: readonly unknown[]) => send(() => base.unsafe(query, params)),
     savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>) =>
       guard<T>((): Promise<T> => {
         if (savepointOpen) {
@@ -203,6 +215,10 @@ function tagTransactor<N>(
 
 /**
  * A transactor over a postgres.js client. `native` is its `TransactionSql`.
+ * On Bun, a connection that dies mid-transaction can leave a postgres.js
+ * client unusable: its rollback writes to the closed socket and throws
+ * outside any promise, and later queries time out connecting. Treat a
+ * connection error inside `begin` as fatal for that client and replace it.
  * Binding `undefined` is refused by the driver; pass `null`. The id is the
  * factory's, not checked against the client: the client types are structural.
  */
@@ -344,8 +360,8 @@ function drizzleSurface(x: DrizzleExecutor, deps: { sql: DrizzleSqlTagLike }): S
  * the text is sent as-is. Every value, in the tag or in `params`, must be a
  * string, number, boolean, bigint, null or date, or the call rejects before
  * sending; pass `null` for `undefined`. Errors are drizzle's own, whose message
- * carries the query and its bound values: log `pgCode(err)`, not the message,
- * where values are sensitive. The id is the factory's, not checked against `db`.
+ * carries the query and its bound values: never send a raw error message to a
+ * shared channel; log `pgCode(err)` instead. The id is the factory's, not checked against `db`.
  */
 export function drizzleTransactor<N = unknown>(
   db: DrizzleDbLike,

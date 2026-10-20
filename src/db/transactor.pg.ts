@@ -243,6 +243,31 @@ describe("begin", () => {
     );
   });
 
+  test("a write on the outer handle while a savepoint is open is refused, and nothing is lost", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await t.begin(async (tx) => {
+          let release = () => {};
+          const gate = new Promise<void>((r) => {
+            release = r;
+          });
+          const open = tx.savepoint(async (sp) => {
+            await insertId(sp, table, 1);
+            await gate;
+          });
+          const refused = (await rejection(insertId(tx, table, 2))) as Error;
+          expect(refused.message).toBe(
+            `${t.id}: a savepoint is open on this transaction — use the savepoint's handle until it settles`,
+          );
+          release();
+          await open;
+          await insertId(tx, table, 3);
+        });
+        expect(await ids(t.sql, table)).toEqual([1, 3]);
+      }),
+    );
+  });
+
   test("a handle kept past its transaction is refused and writes nothing", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
