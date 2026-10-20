@@ -2,21 +2,33 @@ import { describe, expect, test } from "bun:test";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
 import { printRootstockConfig } from "./print.ts";
-import type { SliceParsers } from "./slices.ts";
+import type {
+  ClientSliceInput,
+  ClientSliceView,
+  ConcurrencySliceInput,
+  ConcurrencySliceView,
+  MigrateSliceInput,
+  MigrateSliceView,
+  SliceParsers,
+} from "./slices.ts";
 
 // Test doubles of the three slice parsers, built from their frozen
 // signatures: each copies its input and returns it unfrozen, so every freeze
 // these tests observe is config's own. The composition test replaces them
-// with the real parsers once those exist.
-const doubles: SliceParsers = {
-  clientSlice: (input) => ({
+// with the real parsers once those exist. The cast is what lets them stand
+// in for a real parser whose result also carries its slice's brand type.
+const doubles = {
+  clientSlice: (input: ClientSliceInput): ClientSliceView => ({
     profiles: Object.fromEntries(Object.entries(input.profiles).map(([k, p]) => [k, { ...p }])),
   }),
-  migrateSlice: (input) => ({ schema: input.schema ?? "rootstock", ahead: input.ahead }),
-  concurrencySlice: (input) => ({
+  migrateSlice: (input: MigrateSliceInput): MigrateSliceView => ({
+    schema: input.schema ?? "rootstock",
+    ahead: input.ahead,
+  }),
+  concurrencySlice: (input: ConcurrencySliceInput): ConcurrencySliceView => ({
     widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
   }),
-};
+} as unknown as SliceParsers;
 
 const define = (input: RootstockConfigInput) => composeRootstockConfig(doubles, input);
 
@@ -120,6 +132,9 @@ function messageOf(fn: () => unknown): string {
   throw new Error("expected a throw");
 }
 
+const UNBRANDED =
+  "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return";
+
 const holds = (id: string): Invariant => ({ id, check: () => null });
 const fails = (id: string, message: string): Invariant => ({ id, check: () => message });
 
@@ -166,17 +181,13 @@ describe("print", () => {
   test("unbranded-config-refused", () => {
     const real = define(exampleInput);
     const copy = { ...real };
-    expect(messageOf(() => printRootstockConfig(copy))).toBe(
-      "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return",
-    );
+    expect(messageOf(() => printRootstockConfig(copy))).toBe(UNBRANDED);
   });
 
   test("unbranded-slice-refused", () => {
     const slice = doubles.migrateSlice({ ahead: "refuse" });
     // biome-ignore lint/suspicious/noExplicitAny: an unbranded object on purpose
-    expect(messageOf(() => printRootstockConfig(slice as any))).toBe(
-      "printRootstockConfig: expected a RootstockConfig built by defineRootstockConfig() — got an object that parser did not return",
-    );
+    expect(messageOf(() => printRootstockConfig(slice as any))).toBe(UNBRANDED);
   });
 });
 

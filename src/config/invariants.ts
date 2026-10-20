@@ -2,6 +2,11 @@ import type { Invariant, RootstockConfig } from "./define.ts";
 
 const q = (x: unknown): string => JSON.stringify(x);
 
+/** An own entry only, so a name like "toString" is not found on the prototype. */
+function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
 /**
  * Holds when width `widthName`'s max is strictly below profile
  * `profileName`'s pool max, so a fully busy width still leaves a connection
@@ -11,18 +16,15 @@ export function widthBelowPool(widthName: string, profileName: string): Invarian
   return Object.freeze({
     id: `width-below-pool.${widthName.toLowerCase()}.${profileName.toLowerCase()}`,
     check(config: RootstockConfig): string | null {
-      const { widths } = config.concurrency;
-      const { profiles } = config.client;
-      const w = Object.hasOwn(widths, widthName) ? widths[widthName] : undefined;
+      const w = own(config.concurrency.widths, widthName);
       if (w === undefined) return `no width ${q(widthName)} is declared`;
-      const p = Object.hasOwn(profiles, profileName) ? profiles[profileName] : undefined;
+      const p = own(config.client.profiles, profileName);
       if (p === undefined) return `no profile ${q(profileName)} is declared`;
-      const pm = p.max;
-      if (pm === "driver-default") {
+      if (p.max === "driver-default") {
         return `width ${q(widthName)} cannot be checked against profile ${q(profileName)}: its max is "driver-default"`;
       }
-      if (w.max < pm) return null;
-      return `width ${q(widthName)} max ${w.max} must be below profile ${q(profileName)} max ${pm}`;
+      if (w.max < p.max) return null;
+      return `width ${q(widthName)} max ${w.max} must be below profile ${q(profileName)} max ${p.max}`;
     },
   });
 }

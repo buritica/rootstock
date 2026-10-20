@@ -8,21 +8,23 @@ import {
 } from "./define.ts";
 import type { SliceParsers } from "./slices.ts";
 
-const NAMES = ["clientSlice", "migrateSlice", "concurrencySlice"] as const;
-
 /**
  * The real slice parsers, read off their subpaths' namespaces at call time
  * rather than imported by name, so config loads while a subpath still
  * exports nothing. Calling it before then refuses by name.
  */
 function siblingParsers(): SliceParsers {
-  const found: Partial<SliceParsers> = { ...db, ...migrate, ...concurrency };
-  for (const name of NAMES) {
-    if (typeof found[name] !== "function") {
+  const parsers: Partial<SliceParsers> = {
+    clientSlice: (db as Partial<SliceParsers>).clientSlice,
+    migrateSlice: (migrate as Partial<SliceParsers>).migrateSlice,
+    concurrencySlice: (concurrency as Partial<SliceParsers>).concurrencySlice,
+  };
+  for (const [name, parser] of Object.entries(parsers)) {
+    if (typeof parser !== "function") {
       throw new Error(`defineRootstockConfig: ${name} is not exported by its subpath`);
     }
   }
-  return found as SliceParsers;
+  return parsers as SliceParsers;
 }
 
 /** Composes the client, migrate and concurrency slices and checks the invariants. */

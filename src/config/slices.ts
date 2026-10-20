@@ -1,7 +1,11 @@
+import type * as concurrency from "../concurrency/index.ts";
+import type * as db from "../db/index.ts";
+import type * as migrate from "../migrate/index.ts";
+
 // The parts of the db, migrate and concurrency surfaces that config reads,
-// declared from their frozen signatures. Each view leaves out its slice's
-// brand: the real branded slice is assignable to the view, so this compiles
-// the same before and after those subpaths export their own types.
+// declared from their frozen signatures. While a subpath exports nothing,
+// config uses these views; once it exports its parser, `Parser` below picks
+// up the real signature, branded slice type included, with no edit here.
 
 export type DriverDefault = "driver-default";
 
@@ -21,7 +25,7 @@ export interface ClientSliceInput {
   profiles: Readonly<Record<string, ConnectionProfileInput>>;
 }
 
-export interface ClientSlice {
+export interface ClientSliceView {
   readonly profiles: Readonly<Record<string, Readonly<ConnectionProfileInput>>>;
 }
 
@@ -30,7 +34,7 @@ export interface MigrateSliceInput {
   ahead: "refuse" | "allow";
 }
 
-export interface MigrateSlice {
+export interface MigrateSliceView {
   readonly schema: string;
   readonly ahead: "refuse" | "allow";
 }
@@ -44,13 +48,31 @@ export interface ConcurrencySliceInput {
   widths: Readonly<Record<string, WidthInput>>;
 }
 
-export interface ConcurrencySlice {
+export interface ConcurrencySliceView {
   readonly widths: Readonly<Record<string, Readonly<WidthInput>>>;
 }
 
+type Parser<NS, K extends string, Fallback> = K extends keyof NS ? NS[K] : Fallback;
+
 /** The three slice parsers config composes, in the order it calls them. */
 export interface SliceParsers {
-  clientSlice(input: ClientSliceInput): ClientSlice;
-  migrateSlice(input: MigrateSliceInput): MigrateSlice;
-  concurrencySlice(input: ConcurrencySliceInput): ConcurrencySlice;
+  clientSlice: Parser<typeof db, "clientSlice", (input: ClientSliceInput) => ClientSliceView>;
+  migrateSlice: Parser<
+    typeof migrate,
+    "migrateSlice",
+    (input: MigrateSliceInput) => MigrateSliceView
+  >;
+  concurrencySlice: Parser<
+    typeof concurrency,
+    "concurrencySlice",
+    (input: ConcurrencySliceInput) => ConcurrencySliceView
+  >;
 }
+
+type Slice<K extends keyof SliceParsers> = SliceParsers[K] extends (input: never) => infer S
+  ? S
+  : never;
+
+export type ClientSlice = Slice<"clientSlice">;
+export type MigrateSlice = Slice<"migrateSlice">;
+export type ConcurrencySlice = Slice<"concurrencySlice">;

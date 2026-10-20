@@ -54,22 +54,23 @@ export function composeRootstockConfig(
   const concurrency = parsers.concurrencySlice(input.concurrency);
 
   const invariants = input.invariants ?? [];
-  const seen = new Set<string>();
+  const ids: string[] = [];
   for (const { id } of invariants) {
-    if (typeof id !== "string" || !INVARIANT_ID.test(id) || seen.has(id)) {
+    if (typeof id !== "string" || !INVARIANT_ID.test(id) || ids.includes(id)) {
       throw new Error(
         `defineRootstockConfig: invariant id ${JSON.stringify(id)} must match [a-z0-9][a-z0-9.-]* and be unique`,
       );
     }
-    seen.add(id);
+    ids.push(id);
   }
 
-  const ids = invariants.map((inv) => inv.id);
+  // Branded before the checks run, so a check may print the config it is
+  // judging; a failed build takes the brand back.
   const config = deepFreeze({ client, migrate, concurrency, invariants: ids });
   built.add(config);
   const branded = config as unknown as RootstockConfig;
 
-  const failures: { id: string; message: string }[] = [];
+  const failures: string[] = [];
   for (const inv of invariants) {
     let message: string | null;
     try {
@@ -78,12 +79,12 @@ export function composeRootstockConfig(
       // A check that cannot run is a check that did not hold.
       message = err instanceof Error ? err.message : String(err);
     }
-    if (message !== null) failures.push({ id: inv.id, message });
+    if (message !== null) failures.push(`${inv.id}: ${message}`);
   }
   if (failures.length > 0) {
     built.delete(config);
     throw new Error(
-      `defineRootstockConfig: ${failures.length} invariant(s) failed — ${failures.map((f) => `${f.id}: ${f.message}`).join("; ")}`,
+      `defineRootstockConfig: ${failures.length} invariant(s) failed — ${failures.join("; ")}`,
     );
   }
   return branded;
