@@ -33,7 +33,7 @@ function required(name: string): string {
   return value;
 }
 
-export function testTransactorKind(): TestTransactorKind {
+function testTransactorKind(): TestTransactorKind {
   const kind = required("ROOTSTOCK_TEST_TRANSACTOR");
   const known = TEST_TRANSACTOR_KINDS.find((k) => k === kind);
   if (known === undefined) {

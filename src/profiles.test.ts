@@ -7,6 +7,13 @@ const OFFICE_PEERS = new Set(["jszip", "mammoth", "unpdf"]);
 // import drivers and read the environment by design; every scan skips them.
 const TEST_FILE = /\.(test|pg|pg-support)\.ts$/;
 
+test("the published files exclude every test-file suffix", () => {
+  for (const suffix of ["test", "pg", "pg-support"]) {
+    expect(TEST_FILE.test(`x.${suffix}.ts`)).toBe(true);
+    expect(pkg.files).toContain(`!src/**/*.${suffix}.ts`);
+  }
+});
+
 function walk(value: unknown, seen: Set<object>, visit: (v: object) => void): void {
   if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
   if (seen.has(value)) return;

@@ -1,3 +1,4 @@
+import { TEST_TRANSACTOR_KINDS } from "../src/db/test-client.pg-support.ts";
 import { startThrowawayPostgres } from "../src/golden/postgres.ts";
 
 /**
@@ -13,7 +14,7 @@ export const IMAGES = [
   "pgvector/pgvector:pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11",
 ] as const;
 
-export const TRANSACTORS = ["bun-sql", "postgres-js", "drizzle"] as const;
+export const TRANSACTORS = TEST_TRANSACTOR_KINDS;
 
 const ROOT = `${import.meta.dir}/..`;
 
@@ -65,9 +66,10 @@ async function runSuites(url: string, kind: string, suites: string[]): Promise<s
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  out(stdout + stderr);
+  const output = stdout + stderr;
+  out(output);
   if (code !== 0) return `exited ${code}`;
-  if (testsRan(stdout + stderr) === 0) return "reported 0 tests";
+  if (testsRan(output) === 0) return "reported 0 tests";
   return null;
 }
 
@@ -84,12 +86,13 @@ async function main(): Promise<number> {
   out(`test:db: Bun ${Bun.version}, suites: ${suites.join(" ")}`);
   const failures: string[] = [];
   for (const image of IMAGES) {
+    const name = image.split("@")[0];
     const pg = await startThrowawayPostgres({ image });
     try {
       for (const kind of TRANSACTORS) {
-        out(`\n=== ${image.split("@")[0]} · ${kind} ===`);
+        out(`\n=== ${name} · ${kind} ===`);
         const failure = await runSuites(pg.url, kind, suites);
-        if (failure !== null) failures.push(`${image.split("@")[0]} · ${kind}: ${failure}`);
+        if (failure !== null) failures.push(`${name} · ${kind}: ${failure}`);
       }
     } finally {
       await pg.stop();
