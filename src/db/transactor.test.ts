@@ -256,6 +256,22 @@ describe("drizzleTransactor", () => {
     expect(executed()).toEqual([]);
   });
 
+  test("an undefined value is refused before sending, in the tag and in unsafe", async () => {
+    const { t, executed } = make();
+    expect(await messageOf(() => t.sql`select ${1}::int, ${undefined}::int`)).toBe(
+      "drizzleTransactor: value 2 is undefined — bind null instead",
+    );
+    expect(await messageOf(() => t.sql.unsafe("select $1::int", [undefined]))).toBe(
+      "drizzleTransactor: value 1 is undefined — bind null instead",
+    );
+    expect(await messageOf(() => t.begin((tx) => tx`select ${undefined}::int`))).toBe(
+      "drizzleTransactor: value 1 is undefined — bind null instead",
+    );
+    expect(executed()).toEqual([]);
+    await t.sql.unsafe("select $1::int", [null]);
+    expect(executed()).toHaveLength(1);
+  });
+
   test("unsafe-unused-param", async () => {
     const { t, executed } = make();
     expect(

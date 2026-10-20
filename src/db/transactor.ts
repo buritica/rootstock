@@ -106,12 +106,21 @@ function tagTransactor<N>(
   });
 }
 
-/** A transactor over a postgres.js client. `native` is its `TransactionSql`. */
+/**
+ * A transactor over a postgres.js client. `native` is its `TransactionSql`.
+ * Binding `undefined` is refused by the driver; pass `null`. The id is the
+ * factory's, not checked against the client: the client types are structural.
+ */
 export function postgresJsTransactor<N = unknown>(client: PostgresJsClientLike): Transactor<N> {
   return tagTransactor<N>("postgres-js", client);
 }
 
-/** A transactor over a `Bun.SQL` client. `native` is Bun's transaction object. */
+/**
+ * A transactor over a `Bun.SQL` client. `native` is Bun's transaction object.
+ * The driver binds `undefined` as NULL without complaint; pass `null`. The id
+ * is the factory's, not checked against the client: the client types are
+ * structural.
+ */
 export function bunSqlTransactor<N = unknown>(client: BunSqlClientLike): Transactor<N> {
   return tagTransactor<N>("bun-sql", client);
 }
@@ -160,6 +169,16 @@ function drizzleTemplate(
   return { strings, values };
 }
 
+// drizzle drops an undefined value from the query text, so the placeholders
+// after it shift and the server reports a syntax error instead.
+function refuseUndefined(values: readonly unknown[]): readonly unknown[] {
+  const at = values.indexOf(undefined);
+  if (at !== -1) {
+    throw new Error(`drizzleTransactor: value ${at + 1} is undefined — bind null instead`);
+  }
+  return values;
+}
+
 function drizzleSurface<S extends object>(
   x: DrizzleExecutor,
   deps: { sql: DrizzleSqlTagLike },
@@ -176,10 +195,10 @@ function drizzleSurface<S extends object>(
     }
     return result;
   };
-  return surface(async (strings, ...values) => run(deps.sql(strings, ...values)), {
+  return surface(async (strings, ...values) => run(deps.sql(strings, ...refuseUndefined(values))), {
     unsafe: async (query: string, params?: readonly unknown[]) => {
       if (params === undefined || params.length === 0) return run(deps.sql.raw(query));
-      const { strings, values } = drizzleTemplate(query, params);
+      const { strings, values } = drizzleTemplate(query, refuseUndefined(params));
       return run(deps.sql(strings, ...values));
     },
     ...rest,
@@ -210,7 +229,9 @@ function drizzleTx<N>(native: unknown, deps: { sql: DrizzleSqlTagLike }): TxSql<
  * parameter must be referenced, or the call rejects before anything is sent.
  * It rewrites `$n` anywhere in the text, inside a quoted literal or a comment
  * too, so the text must use `$` only as placeholders. With no params, or `[]`,
- * the text is sent as-is.
+ * the text is sent as-is. An `undefined` value, in the tag or in `params`, is
+ * refused before sending; pass `null`. The id is the factory's, not checked
+ * against `db`.
  */
 export function drizzleTransactor<N = unknown>(
   db: DrizzleDbLike,

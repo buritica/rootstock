@@ -92,6 +92,24 @@ describe("query surface", () => {
     });
   });
 
+  // Rule 8: never bind undefined. Each driver's own behavior is pinned here,
+  // because only one of them stays silent.
+  test("an undefined value: Bun.SQL binds NULL, the other two refuse", async () => {
+    await withTransactor(async (t) => {
+      const sent = t.sql.unsafe("select $1::int as a", [undefined]);
+      if (t.id === "bun-sql") {
+        expect(await sent).toEqual([{ a: null }]);
+        return;
+      }
+      const err = (await rejection(sent)) as Error;
+      if (t.id === "drizzle") {
+        expect(err.message).toBe("drizzleTransactor: value 1 is undefined — bind null instead");
+      } else {
+        expect((err as Error & { code?: string }).code).toBe("UNDEFINED_VALUE");
+      }
+    });
+  });
+
   test("the portable read types read as specified, on the root and in a transaction", async () => {
     const query = `select count(*)::int as n,
         (2::bigint ^ 40)::bigint::text as big,
