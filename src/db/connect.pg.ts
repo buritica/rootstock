@@ -25,10 +25,20 @@ test("select 1 through the raw client returns one row", async () => {
   }
 });
 
-test("close() resolves", async () => {
+test("close() resolves and ends the backend", async () => {
   const c = openTestClient();
-  await rows(c, "select 1");
-  expect(await c.close()).toBeUndefined();
+  const watcher = openSecondClient();
+  try {
+    const [row] = (await rows(c, "select pg_backend_pid() as pid")) as { pid: number }[];
+    expect(await c.close()).toBeUndefined();
+    const alive = async () =>
+      (await rows(watcher, `select 1 from pg_stat_activity where pid = ${Number(row?.pid)}`))
+        .length;
+    for (let i = 0; i < 50 && (await alive()) > 0; i++) await Bun.sleep(20);
+    expect(await alive()).toBe(0);
+  } finally {
+    await watcher.close();
+  }
 });
 
 test("the second client is an independent backend", async () => {

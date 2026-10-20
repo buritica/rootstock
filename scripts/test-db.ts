@@ -1,12 +1,18 @@
 import { TEST_TRANSACTOR_KINDS } from "../src/db/test-client.pg-support.ts";
-import { startThrowawayPostgres } from "../src/golden/postgres.ts";
+import {
+  GOLDEN_LABELS,
+  startThrowawayPostgres,
+  type ThrowawayPostgres,
+} from "../src/golden/postgres.ts";
 
 /**
  * The DB test matrix: every `src/**\/*.pg.ts` suite, once per transactor kind,
  * against each digest-pinned Postgres image, on the Bun running this script.
  *
  * Red, never empty: it fails when docker is missing, when no suite is found,
- * when any run exits non-zero, and when any run reports zero tests.
+ * when a container will not start, when any run exits non-zero, and when any
+ * run reports zero passing tests. Each run covers every suite at once, so the
+ * zero-test check is per run, not per suite file.
  */
 
 export const IMAGES = [
@@ -35,10 +41,15 @@ export async function suitesUnder(root: string): Promise<string[]> {
   return found.sort();
 }
 
-/** How many tests a `bun test` run reports having run, or 0 when it reports none. */
-export function testsRan(output: string): number {
-  const match = /^Ran (\d+) tests? across/m.exec(output);
-  return match ? Number(match[1]) : 0;
+/**
+ * How many tests a `bun test` run reports as passed, or 0 when it reports none.
+ * Skipped and todo tests are not passes. The last summary wins, so a test that
+ * prints a look-alike line cannot stand in for the real one.
+ */
+export function testsPassed(output: string): number {
+  const counts = [...output.matchAll(/^\s*(\d+) pass$/gm)];
+  const last = counts.at(-1);
+  return last ? Number(last[1]) : 0;
 }
 
 async function dockerAvailable(): Promise<boolean> {
@@ -69,8 +80,32 @@ async function runSuites(url: string, kind: string, suites: string[]): Promise<s
   const output = stdout + stderr;
   out(output);
   if (code !== 0) return `exited ${code}`;
-  if (testsRan(output) === 0) return "reported 0 tests";
+  if (testsPassed(output) === 0) return "reported 0 passing tests";
   return null;
+}
+
+// A cancelled CI job or a Ctrl-C would otherwise kill the runner before its
+// `finally`, leaving a container up (`--rm` only removes a stopped one). The
+// signal can land mid-start, before any handle exists, so the sweep goes by
+// the owner-pid label every throwaway container carries.
+function removeOwnContainers(): void {
+  const label = `${GOLDEN_LABELS.pid}=${process.pid}`;
+  const ids = Bun.spawnSync(["docker", "ps", "-aq", "--filter", `label=${label}`])
+    .stdout.toString()
+    .split("\n")
+    .filter((id) => id !== "");
+  if (ids.length > 0) Bun.spawnSync(["docker", "rm", "-f", ...ids]);
+}
+
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+] as const) {
+  process.on(signal, () => {
+    out(`test:db: ${signal} — removing this run's throwaway Postgres`);
+    removeOwnContainers();
+    process.exit(code);
+  });
 }
 
 async function main(): Promise<number> {
@@ -87,7 +122,13 @@ async function main(): Promise<number> {
   const failures: string[] = [];
   for (const image of IMAGES) {
     const name = image.split("@")[0];
-    const pg = await startThrowawayPostgres({ image });
+    let pg: ThrowawayPostgres;
+    try {
+      pg = await startThrowawayPostgres({ image });
+    } catch (err) {
+      failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
     try {
       for (const kind of TRANSACTORS) {
         out(`\n=== ${name} · ${kind} ===`);

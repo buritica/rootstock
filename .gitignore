@@ -6,3 +6,5 @@ node_modules/
 .claude/sdlc/
 .claude/grumpy/
 .claude/worktrees/
+.claude/buritica/
+.claude/sdlc-gates.json

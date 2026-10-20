@@ -25,11 +25,14 @@ const FORBIDDEN: readonly RegExp[] = [
 
 const SELF = "hygiene.test.ts";
 
+// The repo is public, so the scripts are scanned as well as the package source.
+const ROOT = `${import.meta.dir}/..`;
+
 test("no source file names a consumer's internals", async () => {
   const hits: string[] = [];
-  for await (const path of new Bun.Glob("**/*").scan({ cwd: import.meta.dir })) {
-    if (path === SELF) continue;
-    const lines = (await Bun.file(`${import.meta.dir}/${path}`).text()).split("\n");
+  for await (const path of new Bun.Glob("{src,scripts}/**/*").scan({ cwd: ROOT })) {
+    if (path === `src/${SELF}`) continue;
+    const lines = (await Bun.file(`${ROOT}/${path}`).text()).split("\n");
     lines.forEach((line, i) => {
       for (const pattern of FORBIDDEN) {
         if (pattern.test(line)) hits.push(`${path}:${i + 1} matches ${pattern}`);

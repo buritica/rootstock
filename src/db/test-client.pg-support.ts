@@ -25,6 +25,9 @@ export type TestClient =
       close: () => Promise<void>;
     };
 
+/** The `TestClient` arm for one kind, so a handler table keyed by kind needs no cast. */
+export type TestClientOf<K extends TestTransactorKind> = Extract<TestClient, { kind: K }>;
+
 function required(name: string): string {
   const value = process.env[name];
   if (value === undefined || value === "") {
@@ -68,7 +71,10 @@ export function openTestClient(): TestClient {
   return open();
 }
 
-/** A second, independent `max: 1` client, for cases that need two backends. */
+/**
+ * Another `max: 1` client, independent of every other. It is the same call as
+ * `openTestClient()`, named for the cases that need a second backend.
+ */
 export function openSecondClient(): TestClient {
   return open();
 }

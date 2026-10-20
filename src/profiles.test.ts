@@ -162,15 +162,41 @@ test("migrate and config import only their allowlist", async () => {
 // the one non-test file that may import it.
 const BUN_TEST_ADAPTER = "src/golden/bun-test.ts";
 
+const DRIVER = /^(postgres|pg|bun|drizzle-orm)(\/|$)|^bun:(?!test$)/;
+
 test("no non-test file imports a database driver, and bun:test stays in tests", async () => {
   const offenders: string[] = [];
   for (const path of await sourceFiles()) {
     if (TEST_FILE.test(path)) continue;
     for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
-      const driver = spec === "postgres" || spec === "bun" || spec.startsWith("drizzle-orm");
       const bunTest = spec === "bun:test" && path !== BUN_TEST_ADAPTER;
-      if (driver || bunTest) offenders.push(`${path} imports ${spec}`);
+      if (DRIVER.test(spec) || bunTest) offenders.push(`${path} imports ${spec}`);
     }
+  }
+  expect(offenders).toEqual([]);
+});
+
+// Test files are left out of the published package, so a shipped file that
+// imports one would fail to load for every consumer.
+test("no non-test file imports a test file", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
+      if (TEST_FILE.test(spec)) offenders.push(`${path} imports ${spec}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
+test("no non-test file reads the environment", async () => {
+  const offenders: string[] = [];
+  for (const path of await sourceFiles()) {
+    if (TEST_FILE.test(path)) continue;
+    const code = stripComments(await Bun.file(`${ROOT}/${path}`).text());
+    code.split("\n").forEach((line, i) => {
+      if (/\b(process|Bun)\.env\b/.test(line)) offenders.push(`${path}:${i + 1}`);
+    });
   }
   expect(offenders).toEqual([]);
 });
