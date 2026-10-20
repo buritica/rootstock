@@ -25,6 +25,18 @@ test("select 1 through the raw client returns one row", async () => {
   }
 });
 
+// The runner gives each kind its own database, so no kind sees another's leftovers.
+test("each kind runs in its own database", async () => {
+  const c = openTestClient();
+  try {
+    expect(await rows(c, "select current_database() as db")).toEqual([
+      { db: `rs_${c.kind.replaceAll("-", "_")}` },
+    ]);
+  } finally {
+    await c.close();
+  }
+});
+
 test("close() resolves and ends the backend", async () => {
   const c = openTestClient();
   const watcher = openSecondClient();
