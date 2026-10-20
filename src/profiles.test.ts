@@ -183,7 +183,8 @@ test("no non-test file imports a test file", async () => {
   for (const path of await sourceFiles()) {
     if (TEST_FILE.test(path)) continue;
     for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
-      if (TEST_FILE.test(spec)) offenders.push(`${path} imports ${spec}`);
+      // Bundler resolution lets a specifier drop its `.ts`, so match the stem too.
+      if (/\.(test|pg|pg-support)(\.ts)?$/.test(spec)) offenders.push(`${path} imports ${spec}`);
     }
   }
   expect(offenders).toEqual([]);
@@ -195,7 +196,9 @@ test("no non-test file reads the environment", async () => {
     if (TEST_FILE.test(path)) continue;
     const code = stripComments(await Bun.file(`${ROOT}/${path}`).text());
     code.split("\n").forEach((line, i) => {
-      if (/\b(process|Bun)\.env\b/.test(line)) offenders.push(`${path}:${i + 1}`);
+      if (/\b(process|Bun)\.env\b|\bprocess\[|import\.meta\.env/.test(line)) {
+        offenders.push(`${path}:${i + 1}`);
+      }
     });
   }
   expect(offenders).toEqual([]);

@@ -128,15 +128,22 @@ function removeOwnContainers(): void {
 // A cancelled CI job or a Ctrl-C would otherwise kill the runner before its
 // `finally`, leaving the container up (`--rm` only removes a stopped one) and
 // the child suite running against it. A signal that lands while a container
-// is starting waits for the start to settle, then sweeps, because the
-// container does not exist yet when the signal arrives.
+// is starting waits briefly for the start to settle, because the container
+// does not exist yet when the signal arrives; a second signal, or the grace
+// running out, sweeps and exits at once. The first signal's code wins.
+const START_GRACE_MS = 5_000;
+
+function sweepAndExit(code: number): never {
+  removeOwnContainers();
+  process.exit(code);
+}
+
 function onSignal(signal: "SIGINT" | "SIGTERM", code: number): void {
   out(`test:db: ${signal} — stopping the suite and removing this run's throwaway Postgres`);
   live.child?.kill();
+  if (live.exitCode !== null || !live.starting) sweepAndExit(live.exitCode ?? code);
   live.exitCode = code;
-  if (live.starting) return;
-  removeOwnContainers();
-  process.exit(code);
+  setTimeout(() => sweepAndExit(code), START_GRACE_MS).unref();
 }
 
 async function startOrExit(image: string): Promise<ThrowawayPostgres> {
@@ -145,10 +152,7 @@ async function startOrExit(image: string): Promise<ThrowawayPostgres> {
     return await startThrowawayPostgres({ image });
   } finally {
     live.starting = false;
-    if (live.exitCode !== null) {
-      removeOwnContainers();
-      process.exit(live.exitCode);
-    }
+    if (live.exitCode !== null) sweepAndExit(live.exitCode);
   }
 }
 

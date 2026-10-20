@@ -25,9 +25,6 @@ export type TestClient =
       close: () => Promise<void>;
     };
 
-/** The `TestClient` arm for one kind, so a handler table keyed by kind needs no cast. */
-export type TestClientOf<K extends TestTransactorKind> = Extract<TestClient, { kind: K }>;
-
 function required(name: string): string {
   const value = process.env[name];
   if (value === undefined || value === "") {
