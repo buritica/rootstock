@@ -19,10 +19,8 @@ const BUILT = new WeakSet<object>();
 
 /** Parses the migrate slice into a frozen, branded object. */
 export function migrateSlice(input: MigrateSliceInput): MigrateSlice {
-  for (const [key, value] of Object.entries(input)) {
-    if (!KNOWN_KEYS.has(key)) {
-      throw new Error(`migrateSlice: ${key} must be a known key — got ${q(value)}`);
-    }
+  for (const key of Object.keys(input)) {
+    if (!KNOWN_KEYS.has(key)) throw new Error(`migrateSlice: ${key} is not a known key`);
   }
   const schema =
     input.schema === undefined

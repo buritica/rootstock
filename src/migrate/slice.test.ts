@@ -75,9 +75,7 @@ describe("migrateSlice", () => {
 
   test("an unknown key is refused", () => {
     const input = { ahead: "refuse", allowHeavy: true } as unknown as MigrateSliceInput;
-    expect(thrown(() => migrateSlice(input))).toBe(
-      "migrateSlice: allowHeavy must be a known key — got true",
-    );
+    expect(thrown(() => migrateSlice(input))).toBe("migrateSlice: allowHeavy is not a known key");
   });
 });
 
