@@ -81,7 +81,9 @@ export function concurrencySlice(input: ConcurrencySliceInput): ConcurrencySlice
   if (!isRecord(widths) || Object.keys(widths).length === 0) {
     throw invalid("widths", "an object with at least one width", widths);
   }
-  const parsed: Record<string, Readonly<WidthInput>> = {};
+  // No prototype, so a name like "constructor" is never found on a slice that
+  // did not declare it, by `width()` or by any other reader.
+  const parsed: Record<string, Readonly<WidthInput>> = Object.create(null);
   for (const name of Object.keys(widths)) {
     if (!NAME.test(name)) {
       throw invalid(`widths.${name}`, "a name matching [a-z][a-zA-Z0-9]*", name);

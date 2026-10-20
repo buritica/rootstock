@@ -10,9 +10,10 @@
  * refusal check the limit themselves before calling.
  *
  * `fn` rejecting rejects the whole call, plain `Promise.all` semantics, and
- * the other workers keep running detached rather than being cancelled. A
- * caller that must survive one bad item catches inside `fn` and returns a
- * failure value.
+ * the other workers keep running detached rather than being cancelled: they
+ * go on starting the remaining items after the call has rejected, and any
+ * later rejection is dropped. A caller that must survive one bad item catches
+ * inside `fn` and returns a failure value.
  */
 // biome-ignore format: the body is carried verbatim, so its line breaks are part of it
 export async function mapWithConcurrency<T, R>(

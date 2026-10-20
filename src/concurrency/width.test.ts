@@ -33,6 +33,9 @@ describe("concurrencySlice", () => {
     expect(Object.isFrozen(slice.widths.fetch)).toBe(true);
     expect(slice.widths).not.toBe(input.widths);
     expect(slice.widths.fetch).not.toBe(input.widths.fetch);
+    // No prototype, so an undeclared "constructor" reads as absent everywhere.
+    expect(Object.getPrototypeOf(slice.widths)).toBe(null);
+    expect(slice.widths.constructor).toBeUndefined();
   });
 
   test("accepts the bounds: default 1, and max 256", () => {

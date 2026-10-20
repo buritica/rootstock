@@ -25,8 +25,13 @@ export interface BoundedOptions<T> {
  *   first error is rethrown. Callers absorb per-item failures inside `run`;
  *   what reaches here is fatal to the pass.
  * - The iterable is pulled lazily, one item per dispatch, and not at all once
- *   the pass has aborted. Its `return()` runs on the way out, so a generator's
- *   `finally` still gets its cleanup.
+ *   the pass has aborted. Its `return()` runs on the way out, before the
+ *   in-flight items drain, so a generator's `finally` still gets its cleanup.
+ * - A throw from the iterable itself (its `next()`) is not caught: the call
+ *   rejects with it at once, without calling `return()` and without waiting
+ *   for in-flight items, which keep running unobserved.
+ * - Each slot wait races every in-flight item, so while one item hangs, every
+ *   later wait leaves a reaction on it until it settles.
  * - Items are gated and dispatched in iteration order. They complete in
  *   whatever order they complete.
  */
@@ -117,7 +122,8 @@ export async function forEachBounded<T>(
   if (!exhausted) {
     // What `for...of`'s `break` did for free: tell the generator its consumer
     // is gone, so its `finally` runs. A cleanup that itself throws is
-    // recorded, never allowed to mask the error that aborted the pass.
+    // recorded, never allowed to mask the error that aborted the pass (unless
+    // that error was itself nullish, which `??=` lets it replace).
     try {
       iterator.return?.();
     } catch (returnErr) {

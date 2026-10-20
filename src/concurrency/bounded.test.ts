@@ -188,6 +188,33 @@ describe("forEachBounded", () => {
     expect(pulled).toBe(2);
   });
 
+  test("a throw from the iterable itself rejects at once, without draining", async () => {
+    const h = harness(1);
+    const broken = new Error("next failed");
+    let pulls = 0;
+    let returned = 0;
+    const iterable: Iterable<number> = {
+      [Symbol.iterator]: () => ({
+        next: () => {
+          if (pulls++ === 1) throw broken;
+          return { done: false, value: 0 };
+        },
+        return: () => {
+          returned++;
+          return { done: true, value: undefined };
+        },
+      }),
+    };
+    const pass = forEachBounded(iterable, { width: 2 }, h.run);
+    // Characterizes the verbatim body: the in-flight item is still running.
+    expect(await rejection(pass)).toBe(broken);
+    expect(h.events).toEqual(["run:0"]);
+    expect(returned).toBe(0);
+    h.runs[0]?.resolve();
+    await flush();
+    expect(h.events).toEqual(["run:0", "done:0"]);
+  });
+
   test("a throwing return() does not mask the error that aborted the pass", async () => {
     const refused = new Error("gate refused");
     const cleanup = new Error("cleanup");
