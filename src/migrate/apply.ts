@@ -23,9 +23,11 @@ async function preflight(tx: TxSql, schema: string): Promise<{ exists: boolean }
     select current_user::text as "user",
            to_regnamespace(${schema}::text) is not null as "exists",
            has_database_privilege(current_database(), 'CREATE') as "dbCreate"`;
-  const user = who?.user ?? "";
-  if (who?.exists !== true) {
-    if (who?.dbCreate === true) return { exists: false };
+  if (who === undefined)
+    throw new Error("applyRootstockMigrations: the preflight query returned no row");
+  const { user } = who;
+  if (!who.exists) {
+    if (who.dbCreate) return { exists: false };
     throw new Error(
       `applyRootstockMigrations: schema "${schema}" does not exist and role ${JSON.stringify(user)} cannot create it (no CREATE on this database) — have a superuser or a member of that role run CREATE SCHEMA "${schema}" AUTHORIZATION "${user}", then re-run`,
     );
@@ -33,10 +35,9 @@ async function preflight(tx: TxSql, schema: string): Promise<{ exists: boolean }
   const [can] = await tx<{ usage: boolean; create: boolean }>`
     select has_schema_privilege(${schema}::text, 'USAGE') as "usage",
            has_schema_privilege(${schema}::text, 'CREATE') as "create"`;
-  const missing = [
-    ...(can?.usage === true ? [] : ["USAGE"]),
-    ...(can?.create === true ? [] : ["CREATE"]),
-  ];
+  if (can === undefined)
+    throw new Error("applyRootstockMigrations: the privilege query returned no row");
+  const missing = [...(can.usage ? [] : ["USAGE"]), ...(can.create ? [] : ["CREATE"])];
   if (missing.length > 0) {
     throw new Error(
       `applyRootstockMigrations: role ${JSON.stringify(user)} lacks ${missing.join(" and ")} on schema "${schema}" — run GRANT ${missing.join(", ")} ON SCHEMA "${schema}" TO "${user}" as its owner, then re-run`,
@@ -59,7 +60,10 @@ export async function applyMigrationList(
   assertMigrateSlice("applyRootstockMigrations", slice);
   const { schema } = slice;
   return transactor.begin(async (tx) => {
-    // Selected FROM the call so no driver has to decode a void column.
+    // Selected FROM the call so no driver has to decode a void column. The
+    // lock serializes appliers only under READ COMMITTED: at a stricter
+    // isolation the snapshot predates the wait, so a second concurrent apply
+    // fails on CREATE TABLE (42P07) and a re-run then finds it applied.
     await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${schema}`}::text)::bigint)`;
     const { exists } = await preflight(tx, schema);
     if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoted(schema)}`);

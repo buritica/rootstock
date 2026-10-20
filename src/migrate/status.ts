@@ -33,8 +33,9 @@ export async function statusOf(
   const [found] = await sql<{ schemaExists: boolean; tracked: boolean }>`
     select to_regnamespace(${schema}::text) is not null as "schemaExists",
            to_regclass(${table}::text) is not null as "tracked"`;
-  const schemaExists = found?.schemaExists === true;
-  const tracked = found?.tracked === true;
+  if (found === undefined)
+    throw new Error("rootstockMigrationStatus: the catalog query returned no row");
+  const { schemaExists, tracked } = found;
   const rows = tracked
     ? await sql.unsafe<{ filename: string; sha256: string }>(
         `select filename, sha256 from ${table} order by filename collate "C"`,

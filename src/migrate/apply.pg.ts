@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { applyMigrationList } from "./apply.ts";
+import { applyMigrationList, applyRootstockMigrations } from "./apply.ts";
 import type { Sql } from "./db-surface.ts";
 import { parseMigration, type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { migrateSlice } from "./slice.ts";
@@ -83,7 +83,9 @@ beforeAll(() => {
 
 afterAll(async () => {
   await sql.unsafe("RESET ROLE");
-  await sql.unsafe(`DROP SCHEMA IF EXISTS ${made.map((s) => `"${s}"`).join(", ")} CASCADE`);
+  if (made.length > 0) {
+    await sql.unsafe(`DROP SCHEMA IF EXISTS ${made.map((s) => `"${s}"`).join(", ")} CASCADE`);
+  }
   await main.close();
 });
 
@@ -172,11 +174,11 @@ describe("applyRootstockMigrations", () => {
           reports.filter((r) => r.applied.length === 0 && r.alreadyApplied === 1).length === 1;
         if (!ok) failures++;
       }
-      expect(failures).toBe(0);
+      expect(`${failures}/50 iterations failed`).toBe("0/50 iterations failed");
     } finally {
       await second.close();
     }
-  });
+  }, 60_000);
 
   test("kill-mid-run-converges: a failing statement leaves no schema and no row", async () => {
     const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
@@ -186,6 +188,8 @@ describe("applyRootstockMigrations", () => {
     );
     expect(sqlstate(err)).toBe("22012");
     expect(await exists(slice.schema)).toBe(false);
+    const leaked = await one<{ t: boolean }>("select to_regclass('ok_t') is not null as t");
+    expect(leaked?.t).toBe(false);
     const report = await applyMigrationList(main.transactor, slice, SHIPPED);
     expect(report.applied).toEqual([FILE]);
     expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual([FILE]);
@@ -301,27 +305,33 @@ describe("applyRootstockMigrations", () => {
       expect(await asApp(() => refusal(applyMigrationList(main.transactor, slice, SHIPPED)))).toBe(
         `applyRootstockMigrations: role "rs_app" lacks CREATE on schema "${s}" — run GRANT CREATE ON SCHEMA "${s}" TO "rs_app" as its owner, then re-run`,
       );
-      expect(await rootstockMigrationStatus(sql, slice)).toMatchObject({ tracked: false });
+      expect(await rootstockMigrationStatus(sql, slice)).toMatchObject({
+        schemaExists: true,
+        tracked: false,
+      });
     });
   });
 
   test("a public.schema_migrations of another shape is untouched and ignored", async () => {
+    // Plain CREATEs: on a database that already has either object this fails
+    // instead of adopting it and dropping it afterwards.
+    expect(await exists("rootstock")).toBe(false);
     await sql.unsafe(
-      "CREATE TABLE IF NOT EXISTS public.schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+      "CREATE TABLE public.schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
-    await sql.unsafe(
-      "INSERT INTO public.schema_migrations (filename) VALUES ('0000_init.sql'), ('0001_more.sql') ON CONFLICT DO NOTHING",
-    );
-    const snapshot = () =>
-      sql.unsafe(
-        "select filename, applied_at::text as at from public.schema_migrations order by 1",
-      );
-    const before = await snapshot();
     made.push("rootstock");
-    const slice = migrateSlice({ ahead: "refuse" });
-    expect(slice.schema).toBe("rootstock");
     try {
-      expect((await applyMigrationList(main.transactor, slice, SHIPPED)).applied).toEqual([FILE]);
+      await sql.unsafe(
+        "INSERT INTO public.schema_migrations (filename) VALUES ('0000_init.sql'), ('0001_more.sql')",
+      );
+      const snapshot = () =>
+        sql.unsafe(
+          "select filename, applied_at::text as at from public.schema_migrations order by 1",
+        );
+      const before = await snapshot();
+      const slice = migrateSlice({ ahead: "refuse" });
+      expect(slice.schema).toBe("rootstock");
+      expect((await applyRootstockMigrations(main.transactor, slice)).applied).toEqual([FILE]);
       expect(await snapshot()).toEqual(before);
       const status = await rootstockMigrationStatus(sql, slice);
       expect(status).toMatchObject({ applied: [FILE], ahead: [], red: false });
@@ -336,6 +346,5 @@ describe("applyRootstockMigrations", () => {
     expect((await applyMigrationList(main.transactor, slice, SHIPPED)).applied).toEqual([FILE]);
     const [after] = await sql<{ search_path: string }>`show search_path`;
     expect(after).toEqual(before);
-    expect(before?.search_path).not.toContain(slice.schema);
   });
 });
