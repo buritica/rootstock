@@ -33,12 +33,16 @@ export interface RootstockConfig {
 }
 
 const built = new WeakSet<object>();
+
+const INPUT_KEYS: readonly string[] = ["client", "migrate", "concurrency", "invariants"];
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
 /**
  * True for a config composeRootstockConfig returned, and also while its
- * invariants are being checked; a build that fails takes it back. Nothing
- * should start I/O on a config a check was handed.
+ * invariants are being checked, to any code that runs meanwhile (a nested
+ * build's checks included); a build that fails takes it back. Taking it back
+ * does not reach the slices, whose own brands stay valid, so nothing should
+ * keep or start I/O on a config, or a slice of one, that a check was handed.
  */
 export function isRootstockConfig(config: unknown): config is RootstockConfig {
   return typeof config === "object" && config !== null && built.has(config);
@@ -57,10 +61,23 @@ export function composeRootstockConfig(
   const migrate = parsers.migrateSlice(input.migrate);
   const concurrency = parsers.concurrencySlice(input.concurrency);
 
-  // Copied once: the id pass and the check pass must see the same entries.
+  // A misspelled key would otherwise drop its slice or its invariants and
+  // still build green. The value is never echoed, as in every slice parser.
+  for (const key of Object.keys(input)) {
+    if (!INPUT_KEYS.includes(key)) {
+      throw new Error(`defineRootstockConfig: ${key} is not a known key`);
+    }
+  }
+  if (input.invariants !== undefined && !Array.isArray(input.invariants)) {
+    throw new Error(
+      `defineRootstockConfig: invariants must be an array — got ${describe(input.invariants)}`,
+    );
+  }
+  // Copied once, so a getter-backed entry is read the same in both passes.
   const invariants = [...(input.invariants ?? [])];
   const ids: string[] = [];
-  for (const { id } of invariants) {
+  for (const inv of invariants) {
+    const id = (inv as { id?: unknown } | null)?.id;
     if (typeof id !== "string" || !INVARIANT_ID.test(id) || ids.includes(id)) {
       throw new Error(
         `defineRootstockConfig: invariant id ${JSON.stringify(id)} must match [a-z0-9][a-z0-9.-]* and be unique`,

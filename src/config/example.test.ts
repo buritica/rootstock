@@ -515,13 +515,40 @@ describe("brand and failure paths", () => {
     ).toBe("defineRootstockConfig: 2 invariant(s) failed — odd: Symbol(odd); other: no");
   });
 
-  test("a one-shot invariants iterable still runs every check", () => {
+  test("a one-shot invariants iterable is refused, not half-consumed", () => {
     function* once(): Generator<Invariant> {
       yield fails("gen", "ran");
     }
     const invariants = once() as unknown as Invariant[];
     expect(messageOf(() => define({ ...exampleInput, invariants }))).toBe(
-      "defineRootstockConfig: 1 invariant(s) failed — gen: ran",
+      "defineRootstockConfig: invariants must be an array — got [object Generator]",
+    );
+  });
+
+  test("an unknown top-level key is refused without echoing its value", () => {
+    const typo = { ...exampleInput, invariant: [fails("never", "ran")] } as RootstockConfigInput;
+    expect(messageOf(() => define(typo))).toBe(
+      "defineRootstockConfig: invariant is not a known key",
+    );
+  });
+
+  test("invariants that are not an array are refused", () => {
+    for (const [value, got] of [
+      [null, "null"],
+      ["ab", "ab"],
+      [{}, "[object Object]"],
+    ] as const) {
+      const input = { ...exampleInput, invariants: value } as unknown as RootstockConfigInput;
+      expect(messageOf(() => define(input))).toBe(
+        `defineRootstockConfig: invariants must be an array — got ${got}`,
+      );
+    }
+  });
+
+  test("a null invariant is refused by its id", () => {
+    const input = { ...exampleInput, invariants: [null] } as unknown as RootstockConfigInput;
+    expect(messageOf(() => define(input))).toBe(
+      "defineRootstockConfig: invariant id undefined must match [a-z0-9][a-z0-9.-]* and be unique",
     );
   });
 

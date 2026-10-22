@@ -10,7 +10,9 @@ function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined
 /**
  * Holds when width `widthName`'s max is strictly below profile
  * `profileName`'s pool max, so a fully busy width still leaves a connection
- * free. A "driver-default" pool max cannot be compared, so it fails.
+ * free. A "driver-default" pool max cannot be compared, so it fails. It
+ * checks the profile's own max: a renderer call that asks for a smaller
+ * `max` (anywhere from 1 to `maxCeiling`) is not covered.
  */
 export function widthBelowPool(widthName: string, profileName: string): Invariant {
   // Lowercased, so widths "fooBar" and "foobar" against one profile share an
