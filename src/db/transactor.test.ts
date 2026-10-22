@@ -201,9 +201,9 @@ describe("every transactor", () => {
         let pending: Promise<unknown> | undefined;
         let deep: Promise<unknown> | undefined;
         let leaked: TxSql | undefined;
-        await t.begin(async (tx) => {
+        const done = t.begin(async (tx) => {
           leaked = tx;
-          // Not awaited: the transaction settles while the savepoints wait.
+          // Not awaited: fn settles while the savepoints wait.
           pending = tx.savepoint(async (sp) => {
             // Two levels down: the middle savepoint is still open when the
             // transaction settles, so only a walk to the top closes this one.
@@ -215,6 +215,13 @@ describe("every transactor", () => {
             return sp.unsafe("select 1");
           });
         });
+        let committed = false;
+        void done.then(() => {
+          committed = true;
+        });
+        await new Promise((r) => setTimeout(r, 0));
+        // The transaction waits for its savepoints rather than exiting under them.
+        expect(committed).toBe(false);
         // Closed and busy at once: closed wins, since no handle here is usable.
         expect(await messageOf(async () => (leaked as TxSql).unsafe("select 0"))).toBe(closed);
         expect(await messageOf(async () => (leaked as TxSql).savepoint(async () => 0))).toBe(
@@ -223,6 +230,7 @@ describe("every transactor", () => {
         release();
         expect(await messageOf(async () => pending)).toBe(closed);
         expect(await messageOf(async () => deep)).toBe(closed);
+        await done;
         // Only the begin and savepoint entries reached the driver; no query did.
         expect(calls.filter(([c]) => /unsafe|execute|tag$/.test(c))).toEqual([]);
       });
@@ -424,6 +432,28 @@ describe("a driver entry that throws instead of rejecting", () => {
       return "committed";
     });
     expect(value).toBe("committed");
+  });
+
+  test("a savepoint whose own exit statement failed rejects begin", async () => {
+    const exitError = Object.assign(new Error("release failed"), { code: "25P02" });
+    const client = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) =>
+        fn(
+          Object.assign(tagDouble("db.tx", []), {
+            savepoint: async (cb: (sp: unknown) => unknown) => {
+              await cb(tagDouble("db.tx.sp", []));
+              throw exitError;
+            },
+          }),
+        ),
+    });
+    const err = await postgresJsTransactor(client)
+      .begin(async (tx) => {
+        await tx.savepoint(async () => 1).catch(() => undefined);
+        return "resolved";
+      })
+      .catch((e: unknown) => e);
+    expect(err).toBe(exitError);
   });
 
   test("begin rejects instead of throwing", async () => {

@@ -307,12 +307,12 @@ describe("begin", () => {
     );
   });
 
-  test("a savepoint outliving its transaction is refused, and the connection stays clean", async () => {
+  test("a savepoint outliving fn is refused, and its transaction waits for it", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         const { promise: gate, resolve: release } = Promise.withResolvers<void>();
         let pending: Promise<unknown> | undefined;
-        await t.begin(async (tx) => {
+        const done = t.begin(async (tx) => {
           await insertId(tx, table, 1);
           pending = tx.savepoint(async (sp) => {
             await gate;
@@ -322,18 +322,62 @@ describe("begin", () => {
           pending.catch(() => undefined);
         });
         release();
-        // It rejects, with the refusal or, where the driver then tries ROLLBACK
-        // TO SAVEPOINT on the settled connection, with that statement's error.
-        const refused = await pending?.then(
-          () => undefined,
-          (e: unknown) => e,
+        // The transaction waited for the savepoint. fn had settled first, so
+        // the savepoint's query was refused, and its ROLLBACK TO ran inside
+        // the transaction, before COMMIT.
+        await done;
+        expect(((await rejection(pending as Promise<unknown>)) as Error).message).toBe(
+          `${t.id}: this transaction has already settled — its handle can no longer be used`,
         );
-        expect(refused).toBeInstanceOf(Error);
-        // The one connection is usable, and in no transaction left over.
         await t.begin((tx) => insertId(tx, table, 3));
         expect(await ids(t.sql, table)).toEqual([1, 3]);
       }),
     );
+  });
+
+  test("a server error that lands after fn settled still rolls back and rejects begin", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await insertId(t.sql, table, 1);
+        const err = await rejection(
+          t.begin(async (tx) => {
+            await insertId(tx, table, 2);
+            // The slow failing insert loses the race and is still running.
+            const slow = tx
+              .unsafe(`insert into ${table} (id) select 1 from pg_sleep(0.05)`)
+              .catch(() => "caught");
+            await Promise.race([slow, Promise.resolve("first")]);
+            return "resolved";
+          }),
+        ).catch((e: unknown) => e);
+        expect(pgCode(err)).toBe("23505");
+        expect(await ids(t.sql, table)).toEqual([1]);
+      }),
+    );
+  });
+
+  test("a query nobody awaited runs only on drizzle, whose queries run at once", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        await t.begin(async (tx) => {
+          void insertId(tx, table, 1);
+          return "done";
+        });
+        expect(await ids(t.sql, table)).toEqual(t.id === "drizzle" ? [1] : []);
+      }),
+    );
+  });
+
+  test("a handle's query is the driver's own, so a tag driver's fragment nests", async () => {
+    await withTransactor(async (t) => {
+      if (t.id === "drizzle") return;
+      await t.begin(async (tx) => {
+        expect(await tx`select 1::int as a ${tx`where true`}`).toEqual([{ a: 1 }]);
+        await tx.savepoint(async (sp) => {
+          expect(await sp`select 2::int as a ${sp`where true`}`).toEqual([{ a: 2 }]);
+        });
+      });
+    });
   });
 
   test("a server error fn caught still rolls back and rejects begin, on every driver", async () => {

@@ -13,7 +13,9 @@ export interface ConnectionProfileInput {
   keepAliveSeconds: number | DriverDefault;
   /**
    * Default per-connection statement_timeout. 0 = none: no startup parameter is
-   * sent, so a role or database default still applies.
+   * sent, so a role or database default still applies. This and `readOnly` go
+   * out as startup parameters, which a pooler in front of Postgres may refuse
+   * or drop unless it is configured to pass them on.
    */
   statementTimeoutMs: number;
   /** true sends default_transaction_read_only; false sends nothing and does not override a read-only role. */
