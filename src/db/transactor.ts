@@ -106,8 +106,6 @@ interface Driver {
   surfaceOf: (native: unknown) => Sql;
   /** How a driver object nests a savepoint. */
   savepointOf: (native: unknown) => Nest;
-  /** Queries run when made, not when awaited. */
-  eager: boolean;
 }
 
 /** One transaction or savepoint scope, as its handle sees it. */
@@ -159,53 +157,38 @@ function enter<N, T>(
   let settled: PromiseLike<unknown>;
   try {
     settled = nest(async (native) => {
-      let outcome: PromiseSettledResult<T>;
+      let value: T;
       try {
-        outcome = {
-          status: "fulfilled",
-          value: await fn(txHandle<N>(driver, native, scope), native as N),
-        };
+        value = await fn(txHandle<N>(driver, native, scope), native as N);
       } catch (reason) {
-        outcome = { status: "rejected", reason };
-      }
-      close();
-      while (scope.pending.size > 0) {
-        const batch = [...scope.pending];
-        scope.pending.clear();
-        await Promise.allSettled(batch);
-      }
-      if (outcome.status === "rejected") {
-        scope.seen.add(outcome.reason);
-        throw outcome.reason;
+        scope.seen.add(reason);
+        throw reason;
+      } finally {
+        close();
+        // Closed, so nothing joins `pending` while this waits.
+        await Promise.allSettled(scope.pending);
       }
       // Postgres aborts a transaction on any server error, and one driver then
       // answers COMMIT with a silent rollback. Throwing here makes every driver
       // roll back the scope and reject instead.
-      if (scope.failed !== undefined) {
-        throw scope.failed;
-      }
-      return outcome.value;
+      if (scope.failed !== undefined) throw scope.failed;
+      return value;
     });
   } catch (err) {
     // A driver entry that throws instead of rejecting.
     close();
     return Promise.reject(err);
   }
-  return Promise.resolve(settled as PromiseLike<T>).then(
-    (value) => {
-      close();
-      return value;
-    },
-    (err: unknown) => {
-      close();
+  return Promise.resolve(settled as PromiseLike<T>)
+    .finally(close)
+    .catch((err: unknown) => {
       // The savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
-      // server, which leaves the parent transaction aborted.
-      // postgres.js may reject with a query's error in place of fn's, so any
-      // error this scope already saw is fn's outcome, not the exit statement's.
+      // server, which leaves the parent transaction aborted. postgres.js may
+      // reject with a query's error in place of fn's, so an error this scope
+      // already saw is fn's outcome, not the exit statement's.
       if (parent !== undefined && !scope.seen.has(err)) track(parent, err);
       throw err;
-    },
-  );
+    });
 }
 
 /** Records the first server error on a scope; a refusal raised before sending carries no code. */
@@ -239,11 +222,8 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
     } catch (err) {
       return Promise.reject(err);
     }
+    // Not a query (a postgres.js helper such as `tx(ids)`): nothing to watch.
     if (typeof query?.then !== "function") return query;
-    // The driver's own query object goes back, so a lazy query stays lazy and
-    // a fragment stays a fragment. Its `then` is shadowed: the first await
-    // starts it through the driver's own `then`, records a server error, and
-    // registers it so the scope waits for it before its exit statement.
     const driverThen = query.then;
     let watched: Promise<R> | undefined;
     const watch = (): Promise<R> => {
@@ -252,35 +232,42 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
         // now would run it after the driver's COMMIT or ROLLBACK.
         const refused = refusal(BUSY);
         if (refused) return Promise.reject(refused);
-        const settled = driverThen.call(query, undefined, (err: unknown) => {
-          scope.seen.add(err);
-          track(scope, err);
-          throw err;
-        }) as Promise<R>;
+        const settled: Promise<R> = driverThen.call(
+          query,
+          (value: R) => {
+            scope.pending.delete(settled);
+            return value;
+          },
+          (err: unknown) => {
+            scope.pending.delete(settled);
+            scope.seen.add(err);
+            track(scope, err);
+            throw err;
+          },
+        ) as Promise<R>;
         watched = settled;
         scope.pending.add(settled);
-        settled.then(
-          () => scope.pending.delete(settled),
-          () => scope.pending.delete(settled),
-        );
       }
       return watched;
     };
+    // A plain promise (drizzle's) is already running, and `await` never looks
+    // up its `then`: watch it now and hand the watched promise back.
+    if (Object.getPrototypeOf(query) === Promise.prototype) return watch();
+    // A driver query object (postgres.js, Bun.SQL) goes back as itself, so a
+    // lazy query stays lazy and a fragment stays a fragment. Its `then` is
+    // shadowed: the first await starts it through the driver's own `then`.
     // biome-ignore lint/suspicious/noThenProperty: shadowing the query's own then is the point
     Object.defineProperty(query, "then", {
       configurable: true,
       value: (ok?: (v: R) => unknown, bad?: (e: unknown) => unknown) => {
         const next = watch().then(ok, bad);
-        // Bun.SQL's own `then` marks what it returns as handled, and Bun calls
-        // `finally` on its own query while running it; without the same mark
-        // that internal chain reports an unhandled rejection.
-        if (id === "bun-sql") next.catch(() => undefined);
+        // A driver may call `then` or `finally` on its own query and drop the
+        // result (Bun.SQL does, and marks its own results handled); the caller
+        // still gets the rejection through `bad`.
+        next.catch(() => undefined);
         return next;
       },
     });
-    // A native promise (drizzle's) is awaited without looking up `then`, so
-    // its watch must start here; it is already running anyway.
-    if (driver.eager) watch();
     return query;
   };
   return surface((strings, ...values) => send(() => base(strings, ...values)), {
@@ -292,14 +279,11 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
       if (refused) return Promise.reject(refused);
       const nest = driver.savepointOf(native);
       scope.childOpen = true;
-      const open = enter(driver, nest, fn, scope).finally(() => {
+      const open: Promise<T> = enter(driver, nest, fn, scope).finally(() => {
         scope.childOpen = false;
+        scope.pending.delete(open);
       });
       scope.pending.add(open);
-      open.then(
-        () => scope.pending.delete(open),
-        () => scope.pending.delete(open),
-      );
       return open;
     },
   });
@@ -329,7 +313,6 @@ function tagTransactor<N>(
     id,
     surfaceOf: tagSurface,
     savepointOf: (native) => (cb) => (native as { savepoint: Nest }).savepoint(cb),
-    eager: false,
   };
   return Object.freeze({
     id,
@@ -494,7 +477,6 @@ export function drizzleTransactor<N = unknown>(
     id: "drizzle",
     surfaceOf: (native) => drizzleSurface(native as DrizzleExecutor, deps.sql),
     savepointOf: (native) => (cb) => (native as DrizzleExecutor).transaction(cb),
-    eager: true,
   };
   return Object.freeze({
     id: "drizzle" as const,

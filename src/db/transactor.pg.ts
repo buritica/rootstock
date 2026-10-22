@@ -349,7 +349,7 @@ describe("begin", () => {
             await Promise.race([slow, Promise.resolve("first")]);
             return "resolved";
           }),
-        ).catch((e: unknown) => e);
+        );
         expect(pgCode(err)).toBe("23505");
         expect(await ids(t.sql, table)).toEqual([1]);
       }),
@@ -393,8 +393,9 @@ describe("begin", () => {
             throw new Error("abort");
           }),
         );
-        const refused = await rejection(leaked as Promise<unknown>).catch((e: unknown) => e);
+        // drizzle's query ran at once, inside the transaction that rolled back.
         if (t.id !== "drizzle") {
+          const refused = await rejection(leaked as Promise<unknown>);
           expect((refused as Error).message).toBe(
             `${t.id}: this transaction has already settled — its handle can no longer be used`,
           );
