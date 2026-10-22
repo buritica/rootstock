@@ -187,6 +187,38 @@ describe("print", () => {
     expect(messageOf(() => printRootstockConfig(copy))).toBe(UNBRANDED);
   });
 
+  test("print keeps only the frozen fields a parser hands back", () => {
+    const leaky = {
+      ...doubles,
+      clientSlice: (input: ClientSliceInput) => {
+        const view = (doubles.clientSlice as unknown as (i: ClientSliceInput) => ClientSliceView)(
+          input,
+        );
+        for (const p of Object.values(view.profiles)) {
+          Object.assign(p, { url: ["postgres://u:p", "db.example.com/x"].join("@") });
+        }
+        return view;
+      },
+      concurrencySlice: (input: ConcurrencySliceInput) => {
+        const view = (
+          doubles.concurrencySlice as unknown as (i: ConcurrencySliceInput) => ConcurrencySliceView
+        )(input);
+        for (const w of Object.values(view.widths)) Object.assign(w, { secret: "token" });
+        return view;
+      },
+    } as unknown as SliceParsers;
+    expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
+  });
+
+  test("print carries ahead as configured", () => {
+    const view = JSON.parse(
+      printRootstockConfig(
+        define({ ...exampleInput, migrate: { ...exampleInput.migrate, ahead: "allow" } }),
+      ),
+    );
+    expect(view.migrate.ahead).toBe("allow");
+  });
+
   test("unbranded-slice-refused", () => {
     const slice = doubles.migrateSlice({ ahead: "refuse" });
     // biome-ignore lint/suspicious/noExplicitAny: an unbranded object on purpose
@@ -454,6 +486,53 @@ describe("brand and failure paths", () => {
     expect(
       messageOf(() => define({ ...exampleInput, invariants: [throwsText, fails("empty", "")] })),
     ).toBe("defineRootstockConfig: 2 invariant(s) failed — text: plain text; empty: ");
+  });
+
+  test("a check that throws null or returns undefined did not hold", () => {
+    const throwsNull: Invariant = {
+      id: "null",
+      check: () => {
+        throw null;
+      },
+    };
+    const noReturn = { id: "none", check: () => undefined } as unknown as Invariant;
+    expect(messageOf(() => define({ ...exampleInput, invariants: [throwsNull, noReturn] }))).toBe(
+      "defineRootstockConfig: 2 invariant(s) failed — null: null; none: undefined",
+    );
+  });
+
+  test("an error whose message is not text is still reported", () => {
+    const err = new Error("x");
+    Object.defineProperty(err, "message", { value: Symbol("odd") });
+    const odd: Invariant = {
+      id: "odd",
+      check: () => {
+        throw err;
+      },
+    };
+    expect(
+      messageOf(() => define({ ...exampleInput, invariants: [odd, fails("other", "no")] })),
+    ).toBe("defineRootstockConfig: 2 invariant(s) failed — odd: Symbol(odd); other: no");
+  });
+
+  test("a one-shot invariants iterable still runs every check", () => {
+    function* once(): Generator<Invariant> {
+      yield fails("gen", "ran");
+    }
+    const invariants = once() as unknown as Invariant[];
+    expect(messageOf(() => define({ ...exampleInput, invariants }))).toBe(
+      "defineRootstockConfig: 1 invariant(s) failed — gen: ran",
+    );
+  });
+
+  test("no cause when no check threw", () => {
+    let caught: unknown;
+    try {
+      define({ ...exampleInput, invariants: [fails("plain", "no")] });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as Error).cause).toBeUndefined();
   });
 
   test("invariant-without-a-string-id-refused", () => {

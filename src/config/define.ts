@@ -57,7 +57,8 @@ export function composeRootstockConfig(
   const migrate = parsers.migrateSlice(input.migrate);
   const concurrency = parsers.concurrencySlice(input.concurrency);
 
-  const invariants = input.invariants ?? [];
+  // Copied once: the id pass and the check pass must see the same entries.
+  const invariants = [...(input.invariants ?? [])];
   const ids: string[] = [];
   for (const { id } of invariants) {
     if (typeof id !== "string" || !INVARIANT_ID.test(id) || ids.includes(id)) {
@@ -83,16 +84,18 @@ export function composeRootstockConfig(
   try {
     const failures: string[] = [];
     const thrown: unknown[] = [];
-    for (const inv of invariants) {
+    for (const [i, inv] of invariants.entries()) {
       let message: unknown;
+      let threw = false;
       try {
         message = inv.check(branded);
       } catch (err) {
-        // A check that cannot run is a check that did not hold.
+        // A check that cannot run is a check that did not hold, whatever it threw.
         thrown.push(err);
         message = err;
+        threw = true;
       }
-      if (message !== null) failures.push(`${inv.id}: ${describe(message)}`);
+      if (threw || message !== null) failures.push(`${ids[i]}: ${describe(message)}`);
     }
     if (failures.length > 0) {
       throw new Error(
@@ -111,7 +114,7 @@ export function composeRootstockConfig(
 function describe(message: unknown): string {
   try {
     if (typeof message === "string") return message;
-    if (message instanceof Error) return message.message;
+    if (message instanceof Error) return String(message.message);
     if (typeof (message as { then?: unknown } | null)?.then === "function") {
       // Swallow a rejection so it does not surface again as an unhandled one.
       (message as PromiseLike<unknown>).then(undefined, () => {});

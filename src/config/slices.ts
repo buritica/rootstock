@@ -6,7 +6,8 @@ import type * as migrate from "../migrate/index.ts";
 // declared from their frozen signatures. While a subpath exports nothing,
 // config uses these views; once it exports its parser, `Parser` below picks
 // up the real signature, so both the input and the branded slice types come
-// from that subpath and the views here go unused.
+// from that subpath. db already does; its views here live on only for the
+// test doubles, until the real parsers replace them.
 
 export type DriverDefault = "driver-default";
 

@@ -11,7 +11,8 @@ import type { SliceParsers } from "./slices.ts";
 /**
  * The real slice parsers, read off their subpaths' namespaces at call time
  * rather than imported by name, so config loads while a subpath still
- * exports nothing. Calling it before then refuses by name.
+ * exports nothing (db exports its parser; migrate and concurrency may not
+ * yet). Calling it before then refuses by name.
  */
 function siblingParsers(): SliceParsers {
   const parsers: Partial<SliceParsers> = {
