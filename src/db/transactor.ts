@@ -86,97 +86,91 @@ interface TagDriver {
 /** A driver's transaction or savepoint entry: `begin`, `savepoint` or drizzle's `transaction`. */
 type Nest = (fn: (native: unknown) => unknown) => PromiseLike<unknown>;
 
-/** Builds the query surface over one driver object. */
-type SurfaceOf = (native: unknown) => Sql;
-/** How a driver object nests a savepoint. */
-type SavepointOf = (native: unknown) => Nest;
-
 interface Driver {
   id: TransactorId;
-  surfaceOf: SurfaceOf;
-  savepointOf: SavepointOf;
+  /** Builds the query surface over one driver object. */
+  surfaceOf: (native: unknown) => Sql;
+  /** How a driver object nests a savepoint. */
+  savepointOf: (native: unknown) => Nest;
 }
+
+/** One transaction or savepoint scope, as its handle sees it. */
+interface Scope {
+  /** Set when the driver's call settles. */
+  closed: boolean;
+  /** A savepoint started through this scope's handle has not settled yet. */
+  childOpen: boolean;
+  /** The first server error a query through this handle rejected with. */
+  failed?: unknown;
+  /** The scope this savepoint nests in; closing it closes this one too. */
+  parent?: Scope;
+}
+
+const isClosed = (scope: Scope): boolean =>
+  scope.closed || (scope.parent !== undefined && isClosed(scope.parent));
 
 /**
  * Enters a transaction or savepoint and hands fn a handle over the driver's
- * object. The handle closes when the driver's call settles: a query through it
- * afterwards would run as autocommit on a connection the driver lent to
- * someone else, so it is refused instead.
+ * object. The handle closes when the driver's call settles, or when any scope
+ * it nests in does: a query through it afterwards would run as autocommit on
+ * a connection the driver lent to someone else, so it is refused instead.
  */
 function enter<N, T>(
   driver: Driver,
   nest: Nest,
   fn: (tx: TxSql<N>, native: N) => Promise<T>,
+  parent?: Scope,
 ): Promise<T> {
-  const state: HandleState = { closed: false, failed: [] };
+  const scope: Scope = { closed: false, childOpen: false, parent };
   const settled = nest(async (native) => {
-    const value = await fn(txHandle<N>(driver, native, state), native as N);
+    const value = await fn(txHandle<N>(driver, native, scope), native as N);
     // Postgres aborts a transaction on any server error, and one driver then
     // answers COMMIT with a silent rollback. Throwing here makes every driver
     // roll back the scope and reject instead.
-    if (state.failed.length > 0) throw state.failed[0];
+    if (scope.failed !== undefined) throw scope.failed;
     return value;
   });
   return (settled as Promise<T>).finally(() => {
-    state.closed = true;
+    scope.closed = true;
   });
 }
 
-interface HandleState {
-  closed: boolean;
-  /** The first server error a query through this handle rejected with. */
-  failed: unknown[];
-}
-
-function txHandle<N>(driver: Driver, native: unknown, state: HandleState): TxSql<N> {
+function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
   const { id } = driver;
   const base = driver.surfaceOf(native);
-  // Only an error with a SQLSTATE came from the server; a refusal raised
-  // before sending leaves the transaction usable.
-  const track = <R>(query: Promise<R>): Promise<R> =>
-    query.catch((err: unknown) => {
-      if (state.failed.length === 0 && pgCode(err) !== undefined) state.failed.push(err);
+  // Savepoints are a stack on one connection. While one is open, a query
+  // through this handle would run inside it and roll back with it, and a
+  // second savepoint's rollback would also undo the first; both are refused.
+  const refusal = (whileChildOpen: string): Error | undefined =>
+    isClosed(scope)
+      ? new Error(`${id}: this transaction has already settled — its handle can no longer be used`)
+      : scope.childOpen
+        ? new Error(`${id}: ${whileChildOpen}`)
+        : undefined;
+  const send = <R>(run: () => Promise<R>): Promise<R> => {
+    const refused = refusal(
+      "a savepoint is open on this transaction — use the savepoint's handle until it settles",
+    );
+    if (refused) return Promise.reject(refused);
+    // Only an error with a SQLSTATE came from the server; a refusal raised
+    // before sending leaves the transaction usable.
+    return run().catch((err: unknown) => {
+      if (scope.failed === undefined && pgCode(err) !== undefined) scope.failed = err;
       throw err;
     });
-  // Savepoints are a stack on one connection: rolling back one that started
-  // first would also undo one started after it, so a second open one is refused.
-  let savepointOpen = false;
-  const guard = <R>(run: () => Promise<R>): Promise<R> =>
-    state.closed
-      ? Promise.reject(
-          new Error(
-            `${id}: this transaction has already settled — its handle can no longer be used`,
-          ),
-        )
-      : run();
-  // A query through this handle while its savepoint is open would run inside
-  // the savepoint and roll back with it.
-  const send = <R>(run: () => Promise<R>): Promise<R> =>
-    guard(() =>
-      savepointOpen
-        ? Promise.reject(
-            new Error(
-              `${id}: a savepoint is open on this transaction — use the savepoint's handle until it settles`,
-            ),
-          )
-        : track(run()),
-    );
+  };
   return surface((strings, ...values) => send(() => base(strings, ...values)), {
     unsafe: (query: string, params?: readonly unknown[]) => send(() => base.unsafe(query, params)),
-    savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>) =>
-      guard<T>((): Promise<T> => {
-        if (savepointOpen) {
-          return Promise.reject(
-            new Error(
-              `${id}: a savepoint is already open on this transaction — await it before starting another`,
-            ),
-          );
-        }
-        savepointOpen = true;
-        return enter(driver, driver.savepointOf(native), fn).finally(() => {
-          savepointOpen = false;
-        });
-      }),
+    savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>): Promise<T> => {
+      const refused = refusal(
+        "a savepoint is already open on this transaction — await it before starting another",
+      );
+      if (refused) return Promise.reject(refused);
+      scope.childOpen = true;
+      return enter(driver, driver.savepointOf(native), fn, scope).finally(() => {
+        scope.childOpen = false;
+      });
+    },
   });
 }
 
@@ -321,7 +315,7 @@ function refuseUnbindable(values: readonly unknown[]): readonly unknown[] {
   return values;
 }
 
-function drizzleSurface(x: DrizzleExecutor, deps: { sql: DrizzleSqlTagLike }): Sql {
+function drizzleSurface(x: DrizzleExecutor, sql: DrizzleSqlTagLike): Sql {
   const run = async (query: unknown): Promise<unknown> => {
     const result = await x.execute(query);
     if (!Array.isArray(result)) {
@@ -333,16 +327,13 @@ function drizzleSurface(x: DrizzleExecutor, deps: { sql: DrizzleSqlTagLike }): S
     }
     return result;
   };
-  return surface(
-    async (strings, ...values) => run(deps.sql(strings, ...refuseUnbindable(values))),
-    {
-      unsafe: async (query: string, params?: readonly unknown[]) => {
-        if (params === undefined || params.length === 0) return run(deps.sql.raw(query));
-        const { strings, values } = drizzleTemplate(query, refuseUnbindable(params));
-        return run(deps.sql(strings, ...values));
-      },
+  return surface(async (strings, ...values) => run(sql(strings, ...refuseUnbindable(values))), {
+    unsafe: async (query: string, params?: readonly unknown[]) => {
+      if (params === undefined || params.length === 0) return run(sql.raw(query));
+      const { strings, values } = drizzleTemplate(query, refuseUnbindable(params));
+      return run(sql(strings, ...values));
     },
-  );
+  });
 }
 
 /**
@@ -369,12 +360,12 @@ export function drizzleTransactor<N = unknown>(
 ): Transactor<N> {
   const driver: Driver = {
     id: "drizzle",
-    surfaceOf: (native) => drizzleSurface(native as DrizzleExecutor, deps),
+    surfaceOf: (native) => drizzleSurface(native as DrizzleExecutor, deps.sql),
     savepointOf: (native) => (cb) => (native as DrizzleExecutor).transaction(cb),
   };
   return Object.freeze({
     id: "drizzle" as const,
-    sql: drizzleSurface(db, deps),
+    sql: drizzleSurface(db, deps.sql),
     begin: <T>(fn: (tx: TxSql<N>, native: N) => Promise<T>) =>
       enter(driver, (cb) => db.transaction(cb), fn),
   });

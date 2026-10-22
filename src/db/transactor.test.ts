@@ -166,6 +166,26 @@ describe("every transactor", () => {
         expect(calls).toHaveLength(before);
       });
 
+      test("a savepoint left running when its transaction settles is closed with it", async () => {
+        const calls: Call[] = [];
+        const t = make(calls);
+        const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+        let pending: Promise<unknown> | undefined;
+        await t.begin(async (tx) => {
+          // Not awaited: the transaction settles while the savepoint waits.
+          pending = tx.savepoint(async (sp) => {
+            await gate;
+            return sp.unsafe("select 1");
+          });
+        });
+        release();
+        expect(await messageOf(async () => pending)).toBe(
+          `${id}: this transaction has already settled — its handle can no longer be used`,
+        );
+        // Only the begin and savepoint entries reached the driver; no query did.
+        expect(calls.filter(([c]) => /unsafe|execute|tag$/.test(c))).toEqual([]);
+      });
+
       test("a handle closes after its transaction rejects too", async () => {
         let leaked: TxSql | undefined;
         await make([])
@@ -183,10 +203,7 @@ describe("every transactor", () => {
         const calls: Call[] = [];
         const t = make(calls);
         await t.begin(async (tx) => {
-          let release = () => {};
-          const gate = new Promise<void>((r) => {
-            release = r;
-          });
+          const { promise: gate, resolve: release } = Promise.withResolvers<void>();
           const first = tx.savepoint(() => gate);
           expect(await messageOf(() => tx.savepoint(async () => 1))).toBe(
             `${id}: a savepoint is already open on this transaction — await it before starting another`,
@@ -212,10 +229,7 @@ describe("every transactor", () => {
         const t = make(calls);
         const busy = `${id}: a savepoint is open on this transaction — use the savepoint's handle until it settles`;
         await t.begin(async (tx) => {
-          let release = () => {};
-          const gate = new Promise<void>((r) => {
-            release = r;
-          });
+          const { promise: gate, resolve: release } = Promise.withResolvers<void>();
           const open = tx.savepoint(async (sp) => {
             await gate;
             return sp.unsafe("select 2");

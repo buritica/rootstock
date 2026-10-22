@@ -222,10 +222,7 @@ describe("begin", () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         await t.begin(async (tx) => {
-          let release = () => {};
-          const gate = new Promise<void>((r) => {
-            release = r;
-          });
+          const { promise: gate, resolve: release } = Promise.withResolvers<void>();
           const first = tx.savepoint(async (sp) => {
             await insertId(sp, table, 1);
             await gate;
@@ -247,10 +244,7 @@ describe("begin", () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         await t.begin(async (tx) => {
-          let release = () => {};
-          const gate = new Promise<void>((r) => {
-            release = r;
-          });
+          const { promise: gate, resolve: release } = Promise.withResolvers<void>();
           const open = tx.savepoint(async (sp) => {
             await insertId(sp, table, 1);
             await gate;
