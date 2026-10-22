@@ -22,7 +22,8 @@ export interface BoundedOptions<T> {
  * - The first throw, from `before` or `run`, aborts the pass: nothing new is
  *   pulled, gated or dispatched after it. In-flight items are allowed to
  *   finish, because killing them mid-write leaves half-done work, and then the
- *   first error is rethrown. Callers absorb per-item failures inside `run`;
+ *   first error is rethrown (a nullish first throw is the exception: a later
+ *   error replaces it, and a pass with none rejects with a fallback error). Callers absorb per-item failures inside `run`;
  *   what reaches here is fatal to the pass.
  * - The iterable is pulled lazily, one item per dispatch, and not at all once
  *   the pass has aborted. Its `return()` runs on the way out, before the
@@ -43,9 +44,10 @@ export async function forEachBounded<T>(
 ): Promise<void> {
   const { width, before } = options;
   if (!Number.isInteger(width) || width < 1) {
-    // A zero or fractional width would dispatch everything at once (the
-    // in-flight check never trips): silently unbounded, which is the failure
-    // this function exists to prevent.
+    // Without this, a non-integer width would silently mean a different bound
+    // (1.5 behaves as 2, zero and below as 1), and NaN no bound at all, since
+    // the in-flight check never trips: the failure this function exists to
+    // prevent.
     throw new Error(
       `forEachBounded: width must be a positive integer, got ${JSON.stringify(width)}`,
     );
@@ -134,10 +136,10 @@ export async function forEachBounded<T>(
   // In-flight items finish even on an aborted pass, see the doc comment.
   await Promise.all(inFlight);
   // Checked on `aborted`, not `firstError !== undefined`: a `throw undefined`
-  // (or any falsy throw) from a gate or a `run` sets `firstError` to that same
-  // falsy value via `??=`, and a bare `if (firstError !== undefined)` would
-  // then find `undefined !== undefined` false and return normally, a pass
-  // that aborted reporting itself green. `aborted` is the fact that matters;
+  // from a gate or a `run` leaves `firstError` undefined, and a bare
+  // `if (firstError !== undefined)` would then return normally, a pass that
+  // aborted reporting itself green. Other falsy throws (0, false, "") are
+  // rethrown as they are. `aborted` is the fact that matters;
   // the fallback error names what went missing.
   if (aborted) {
     throw firstError ?? new Error("forEachBounded: aborted with a falsy error");

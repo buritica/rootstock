@@ -188,6 +188,30 @@ describe("forEachBounded", () => {
     expect(pulled).toBe(2);
   });
 
+  test("the iterable's return() runs before the in-flight items drain", async () => {
+    const h = harness(2);
+    let cleaned = false;
+    function* items(): Generator<number> {
+      try {
+        yield 0;
+        yield 1;
+        yield 2;
+      } finally {
+        cleaned = true;
+      }
+    }
+    const boom = new Error("boom");
+    const pass = forEachBounded(items(), { width: 2 }, h.run);
+    await flush();
+    h.runs[1]?.reject(boom);
+    await flush();
+    // Item 0 is still in flight, and the generator has already been closed.
+    expect(cleaned).toBe(true);
+    expect(await state(pass)).toBe("pending");
+    h.runs[0]?.resolve();
+    expect(await rejection(pass)).toBe(boom);
+  });
+
   test("a throw from the iterable itself rejects at once, without draining", async () => {
     const h = harness(1);
     const broken = new Error("next failed");

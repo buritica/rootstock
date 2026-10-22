@@ -122,7 +122,17 @@ describe("mapWithConcurrency", () => {
     h.gates[1]?.resolve("B");
     await flush();
     expect(h.started.at(-1)).toEqual(["c", 2]);
-    h.gates[2]?.resolve("C");
-    await flush();
+    // A later rejection is dropped: nothing reports it as unhandled.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      h.gates[2]?.reject(new Error("later"));
+      await flush();
+      await new Promise((r) => setTimeout(r, 0));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
   });
 });

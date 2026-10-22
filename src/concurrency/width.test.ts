@@ -38,6 +38,16 @@ describe("concurrencySlice", () => {
     expect(slice.widths.constructor).toBeUndefined();
   });
 
+  test("accepts camelCase width names", () => {
+    const slice = concurrencySlice({ widths: { embedRequest: { default: 2, max: 4 } } });
+    expect(width(slice, "embedRequest")).toBe(2);
+  });
+
+  test("an inherited widths key is not read", () => {
+    const inherited = Object.create({ widths: { fetch: { default: 1, max: 2 } } });
+    expect(parse(inherited)).toBe("concurrencySlice: widths is required");
+  });
+
   test("accepts the bounds: default 1, and max 256", () => {
     const slice = concurrencySlice({ widths: { fetch: { default: 1, max: 256 } } });
     expect(width(slice, "fetch")).toBe(1);
@@ -178,6 +188,12 @@ describe("width", () => {
     ["NaN", Number.NaN, 'width: "fetch" requested null — must be an integer from 1 to 8'],
   ])("refuses a request %s with the exact text", (_label, requested, text) => {
     expect(message(() => width(slice(), "fetch", requested))).toBe(text);
+  });
+
+  test("a null request is refused, not read as absent", () => {
+    expect(message(() => width(slice(), "fetch", null as unknown as number))).toBe(
+      'width: "fetch" requested null — must be an integer from 1 to 8',
+    );
   });
 
   test("refuses a request that is not a number", () => {
