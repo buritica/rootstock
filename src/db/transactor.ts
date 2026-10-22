@@ -4,10 +4,12 @@ export type Row = Record<string, unknown>;
 
 /**
  * The query surface every rootstock component takes: a tagged template and
- * `unsafe`. Always await a query: postgres.js and Bun.SQL queries are lazy
- * and never run unless awaited, while drizzle's run at once. Every query comes
- * back as the driver's own query object, on the root `sql` and on `begin` and
- * savepoint handles alike; a handle only watches what it sends.
+ * `unsafe`. Always await a query. On a transactor's root `sql`, postgres.js
+ * and Bun.SQL queries are lazy and never run unless awaited, while drizzle's
+ * run at once, and each comes back as the driver's own query object. On a
+ * `begin` or savepoint handle every query is sent at once and comes back as a
+ * plain promise: the handle watches each one (see `begin`), and its driver
+ * methods and fragments are not available there; use `native` for those.
  */
 export interface Sql {
   <T = Row>(strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T[]>;
@@ -17,9 +19,12 @@ export interface Sql {
 export interface TxSql<N = unknown> extends Sql {
   /**
    * A nested savepoint. A throw inside rolls back only the savepoint, then
-   * rethrows the same error (if the rollback itself fails, the driver's error
-   * comes back instead). A server error on an awaited query through `sp` rolls
-   * it back even when fn caught it, as `begin` does. Savepoints are a stack on
+   * rethrows the same error. A server error on a query through `sp` rolls it
+   * back even when fn caught it, as `begin` does, and like `begin` it waits for
+   * every query and savepoint sent through `sp` before it exits. If the
+   * savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO fails, the driver's error
+   * comes back instead and the enclosing transaction is aborted, so it fails
+   * too. Savepoints are a stack on
    * one connection, so a second savepoint on the same handle while one is open
    * is refused: rolling back the first would also undo the second. To nest,
    * call `sp.savepoint`. While one is open, a query through the outer handle is
@@ -46,16 +51,17 @@ export interface Transactor<N = unknown> {
    * the server left the transaction aborted, so if fn caught it and resolved
    * anyway, the transaction rolls back and rejects with the first such error,
    * on every driver. That covers a query still running when fn settles (one
-   * that lost a `Promise.race`, say): before committing, `begin` waits for
+   * that lost a `Promise.race`, say): before its COMMIT or ROLLBACK, `begin` waits for
    * every query sent through `tx` and every savepoint started through it, and
    * a savepoint whose own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
-   * server rejects `begin` the same way. A lazy query nobody awaited never ran
-   * and is not waited for; resolve fn with values, never with queries. Queries
-   * sent through `native`, and drizzle's refusals (a value before sending, a
-   * result that is not rows after it), are not tracked. `tx` is valid only
-   * until fn settles; a query through it afterwards, even one racing the
-   * driver's COMMIT or ROLLBACK, is refused. On postgres.js the driver itself
-   * also rejects `begin` with any error a query through it rejected with.
+   * server rejects `begin` the same way. A query nobody awaited still runs,
+   * and `begin` waits for it and fails with it like any other. Queries sent
+   * through `native`, and drizzle's refusals (a value before sending, a result
+   * that is not rows after it), are not tracked. `tx` is valid only until fn
+   * settles; a query through it afterwards, even one racing the driver's
+   * COMMIT or ROLLBACK, is refused. On postgres.js the driver itself also
+   * rejects `begin` with any error a query through `tx` or `native` rejected
+   * with, caught or not; a savepoint's recovered errors stay in the savepoint.
    */
   begin<T>(fn: (tx: TxSql<N>, native: N) => Promise<T>): Promise<T>;
 }
@@ -118,7 +124,7 @@ interface Scope {
   failed?: unknown;
   /** Queries and savepoints sent through this handle that have not settled. */
   pending: Set<PromiseLike<unknown>>;
-  /** Every error fn's scope rejected with or a query through the handle did. */
+  /** Every error fn threw or a query through the handle rejected with. */
   seen: Set<unknown>;
   /** The scope this savepoint nests in; closing it closes this one too. */
   parent?: Scope;
@@ -183,12 +189,19 @@ function enter<N, T>(
     .finally(close)
     .catch((err: unknown) => {
       // The savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
-      // server, which leaves the parent transaction aborted. postgres.js may
-      // reject with a query's error in place of fn's, so an error this scope
-      // already saw is fn's outcome, not the exit statement's.
-      if (parent !== undefined && !scope.seen.has(err)) track(parent, err);
+      // server, which leaves the parent transaction aborted. Only the codes
+      // those statements fail with count, and only when fn's scope did not
+      // already see the error: postgres.js rejects a savepoint that rolled
+      // back cleanly with the first error any query in it hit, `native` too.
+      if (parent !== undefined && isExitFailure(err) && !scope.seen.has(err)) track(parent, err);
       throw err;
     });
+}
+
+/** 25P02 in a failed transaction, 3B001 no such savepoint, class 08 connection exceptions. */
+function isExitFailure(err: unknown): boolean {
+  const code = pgCode(err);
+  return code === "25P02" || code === "3B001" || code?.startsWith("08") === true;
 }
 
 /** Records the first server error on a scope; a refusal raised before sending carries no code. */
@@ -216,59 +229,31 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
   const send = <R>(run: () => Promise<R>): Promise<R> => {
     const refused = refusal(BUSY);
     if (refused) return Promise.reject(refused);
-    let query: Promise<R>;
+    // Started now, through the driver's own `then`, so it runs inside this
+    // scope whoever awaits it, and the scope waits for it before its exit. A
+    // driver helper call (`tx(ids)`) throws here, and comes back a rejection.
+    let settled: Promise<R>;
     try {
-      query = run();
+      settled = run().then(
+        (value) => {
+          scope.pending.delete(settled);
+          return value;
+        },
+        (err: unknown) => {
+          scope.pending.delete(settled);
+          scope.seen.add(err);
+          track(scope, err);
+          throw err;
+        },
+      );
     } catch (err) {
       return Promise.reject(err);
     }
-    // Not a query (a postgres.js helper such as `tx(ids)`): nothing to watch.
-    if (typeof query?.then !== "function") return query;
-    const driverThen = query.then;
-    let watched: Promise<R> | undefined;
-    const watch = (): Promise<R> => {
-      if (watched === undefined) {
-        // Made inside the scope but first awaited after it settled: starting it
-        // now would run it after the driver's COMMIT or ROLLBACK.
-        const refused = refusal(BUSY);
-        if (refused) return Promise.reject(refused);
-        const settled: Promise<R> = driverThen.call(
-          query,
-          (value: R) => {
-            scope.pending.delete(settled);
-            return value;
-          },
-          (err: unknown) => {
-            scope.pending.delete(settled);
-            scope.seen.add(err);
-            track(scope, err);
-            throw err;
-          },
-        ) as Promise<R>;
-        watched = settled;
-        scope.pending.add(settled);
-      }
-      return watched;
-    };
-    // A plain promise (drizzle's) is already running, and `await` never looks
-    // up its `then`: watch it now and hand the watched promise back.
-    if (Object.getPrototypeOf(query) === Promise.prototype) return watch();
-    // A driver query object (postgres.js, Bun.SQL) goes back as itself, so a
-    // lazy query stays lazy and a fragment stays a fragment. Its `then` is
-    // shadowed: the first await starts it through the driver's own `then`.
-    // biome-ignore lint/suspicious/noThenProperty: shadowing the query's own then is the point
-    Object.defineProperty(query, "then", {
-      configurable: true,
-      value: (ok?: (v: R) => unknown, bad?: (e: unknown) => unknown) => {
-        const next = watch().then(ok, bad);
-        // A driver may call `then` or `finally` on its own query and drop the
-        // result (Bun.SQL does, and marks its own results handled); the caller
-        // still gets the rejection through `bad`.
-        next.catch(() => undefined);
-        return next;
-      },
-    });
-    return query;
+    scope.pending.add(settled);
+    // A failure nobody awaits is not lost: it fails the scope. Marking it
+    // handled keeps it from also being reported as unhandled.
+    settled.catch(() => undefined);
+    return settled;
   };
   return surface((strings, ...values) => send(() => base(strings, ...values)), {
     unsafe: (query: string, params?: readonly unknown[]) => send(() => base.unsafe(query, params)),

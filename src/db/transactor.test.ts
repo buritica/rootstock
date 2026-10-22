@@ -354,6 +354,18 @@ describe("every transactor", () => {
         expect(value).toBe("committed");
       });
 
+      test("a failing query nobody awaits fails begin and is not reported unhandled", async () => {
+        const err = await make([])
+          .begin(async (tx) => {
+            void tx.unsafe(FAIL);
+            // fn keeps running after the failure lands.
+            await new Promise((r) => setTimeout(r, 10));
+            return "resolved";
+          })
+          .catch((e: unknown) => e);
+        expect(err).toBe(serverError);
+      });
+
       test("begin rejects with the first server error fn caught, not the last", async () => {
         const t = make([]);
         expect(
@@ -454,6 +466,26 @@ describe("a driver entry that throws instead of rejecting", () => {
       })
       .catch((e: unknown) => e);
     expect(err).toBe(exitError);
+  });
+
+  test("a savepoint rejection no exit statement produces does not fail the parent", async () => {
+    const replayed = Object.assign(new Error("replayed"), { code: "23505" });
+    const client = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) =>
+        fn(
+          Object.assign(tagDouble("db.tx", []), {
+            savepoint: async (cb: (sp: unknown) => unknown) => {
+              await cb(tagDouble("db.tx.sp", []));
+              throw replayed;
+            },
+          }),
+        ),
+    });
+    const value = await postgresJsTransactor(client).begin(async (tx) => {
+      await tx.savepoint(async () => 1).catch(() => undefined);
+      return "committed";
+    });
+    expect(value).toBe("committed");
   });
 
   test("begin rejects instead of throwing", async () => {

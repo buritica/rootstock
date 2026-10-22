@@ -307,33 +307,42 @@ describe("begin", () => {
     );
   });
 
-  test("a savepoint outliving fn is refused, and its transaction waits for it", async () => {
-    await withTransactor((t) =>
-      withTable(t, "id int primary key", async (table) => {
-        const { promise: gate, resolve: release } = Promise.withResolvers<void>();
-        let pending: Promise<unknown> | undefined;
-        const done = t.begin(async (tx) => {
-          await insertId(tx, table, 1);
-          pending = tx.savepoint(async (sp) => {
-            await gate;
-            return insertId(sp, table, 2);
+  for (const ending of ["returns", "throws"] as const) {
+    test(`a savepoint outliving fn is refused, and its transaction waits for it (fn ${ending})`, async () => {
+      await withTransactor((t) =>
+        withTable(t, "id int primary key", async (table) => {
+          const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+          const { promise: started, resolve: start } = Promise.withResolvers<void>();
+          let pending: Promise<unknown> | undefined;
+          const done = t.begin(async (tx) => {
+            await insertId(tx, table, 1);
+            pending = tx.savepoint(async (sp) => {
+              start();
+              await gate;
+              return insertId(sp, table, 2);
+            });
+            // Keep the unawaited savepoint's rejection from going unhandled.
+            pending.catch(() => undefined);
+            await started;
+            if (ending === "throws") throw new Error("abort");
           });
-          // Keep the unawaited savepoint's rejection from going unhandled.
-          pending.catch(() => undefined);
-        });
-        release();
-        // The transaction waited for the savepoint. fn had settled first, so
-        // the savepoint's query was refused, and its ROLLBACK TO ran inside
-        // the transaction, before COMMIT.
-        await done;
-        expect(((await rejection(pending as Promise<unknown>)) as Error).message).toBe(
-          `${t.id}: this transaction has already settled — its handle can no longer be used`,
-        );
-        await t.begin((tx) => insertId(tx, table, 3));
-        expect(await ids(t.sql, table)).toEqual([1, 3]);
-      }),
-    );
-  });
+          done.catch(() => undefined);
+          // fn has settled with the savepoint open; let a turn pass first.
+          await started;
+          await new Promise((r) => setTimeout(r, 10));
+          release();
+          // The transaction waited for the savepoint, so its query was refused
+          // and its ROLLBACK TO ran inside the transaction, before the exit.
+          await done.catch(() => undefined);
+          expect(((await rejection(pending as Promise<unknown>)) as Error).message).toBe(
+            `${t.id}: this transaction has already settled — its handle can no longer be used`,
+          );
+          await t.begin((tx) => insertId(tx, table, 3));
+          expect(await ids(t.sql, table)).toEqual(ending === "returns" ? [1, 3] : [3]);
+        }),
+      );
+    });
+  }
 
   test("a server error that lands after fn settled still rolls back and rejects begin", async () => {
     await withTransactor((t) =>
@@ -356,56 +365,47 @@ describe("begin", () => {
     );
   });
 
-  test("a query nobody awaited runs only on drizzle, whose queries run at once", async () => {
+  test("a query nobody awaited runs, and begin waits for it and fails with it", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         await t.begin(async (tx) => {
           void insertId(tx, table, 1);
           return "done";
         });
-        expect(await ids(t.sql, table)).toEqual(t.id === "drizzle" ? [1] : []);
+        expect(await ids(t.sql, table)).toEqual([1]);
+        const err = await rejection(
+          t.begin(async (tx) => {
+            void insertId(tx, table, 1);
+            return "resolved";
+          }),
+        );
+        expect(pgCode(err)).toBe("23505");
+        expect(await ids(t.sql, table)).toEqual([1]);
       }),
     );
   });
 
-  test("a handle's query is the driver's own, so a tag driver's fragment nests", async () => {
-    await withTransactor(async (t) => {
-      if (t.id === "drizzle") return;
-      await t.begin(async (tx) => {
-        expect(await tx`select 1::int as a ${tx`where true`}`).toEqual([{ a: 1 }]);
-        await tx.savepoint(async (sp) => {
-          expect(await sp`select 2::int as a ${sp`where true`}`).toEqual([{ a: 2 }]);
-        });
-      });
-    });
-  });
-
-  test("a query made in a transaction but first awaited after it settled is refused", async () => {
+  test("a query made in a transaction runs in it, whenever and however it is awaited", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         let leaked: Promise<unknown> | undefined;
         await rejection(
           t.begin(async (tx) => {
             leaked = insertId(tx, table, 7);
-            // drizzle's query already ran; keep its rejection handled. On the
-            // tag drivers even a .catch here would start the query.
-            if (t.id === "drizzle") leaked.catch(() => undefined);
             throw new Error("abort");
           }),
         );
-        // drizzle's query ran at once, inside the transaction that rolled back.
-        if (t.id !== "drizzle") {
-          const refused = await rejection(leaked as Promise<unknown>);
-          expect((refused as Error).message).toBe(
-            `${t.id}: this transaction has already settled — its handle can no longer be used`,
-          );
-        }
+        // It ran inside the transaction, which rolled back; touching it
+        // afterwards starts nothing.
+        await leaked?.catch(() => undefined);
+        await leaked?.finally(() => undefined);
+        await leaked;
         expect(await ids(t.sql, table)).toEqual([]);
       }),
     );
   });
 
-  test("a savepoint that recovered from a caught server error does not fail its parent", async () => {
+  test("a transaction that caught a savepoint server error commits", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {
         const value = await t.begin(async (tx) => {
@@ -421,6 +421,56 @@ describe("begin", () => {
         });
         expect(value).toBe("committed");
         expect(await ids(t.sql, table)).toEqual([1, 2]);
+      }),
+    );
+  });
+
+  test("an error a nested savepoint passed up does not fail the transaction that caught it", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const value = await t.begin(async (tx) => {
+          await insertId(tx, table, 1);
+          // The inner savepoint fails with an error the middle one's handle
+          // never saw; the middle one rethrows it and rolls back cleanly.
+          await tx
+            .savepoint((sp) =>
+              sp.savepoint(async (inner) => {
+                await inner.unsafe("select 1/0").catch(() => undefined);
+                await inner.unsafe("select 1");
+              }),
+            )
+            .catch(() => undefined);
+          await insertId(tx, table, 2);
+          return "committed";
+        });
+        expect(value).toBe("committed");
+        expect(await ids(t.sql, table)).toEqual([1, 2]);
+      }),
+    );
+  });
+
+  test("a native error caught in a savepoint: postgres.js and drizzle commit, Bun.SQL's RELEASE fails", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const outcome = await t
+          .begin(async (tx) => {
+            await insertId(tx, table, 1);
+            await tx
+              .savepoint(async (_sp, native) => {
+                await nativeInsert(t.id, native, table, 1).catch(() => undefined);
+              })
+              .catch(() => undefined);
+            await insertId(tx, table, 2).catch(() => undefined);
+            return "committed";
+          })
+          .catch((e: unknown) => pgCode(e));
+        if (t.id === "bun-sql") {
+          expect(outcome).toBe("25P02");
+          expect(await ids(t.sql, table)).toEqual([]);
+        } else {
+          expect(outcome).toBe("committed");
+          expect(await ids(t.sql, table)).toEqual([1, 2]);
+        }
       }),
     );
   });
