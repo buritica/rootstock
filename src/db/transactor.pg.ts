@@ -380,6 +380,50 @@ describe("begin", () => {
     });
   });
 
+  test("a query made in a transaction but first awaited after it settled is refused", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        let leaked: Promise<unknown> | undefined;
+        await rejection(
+          t.begin(async (tx) => {
+            leaked = insertId(tx, table, 7);
+            // drizzle's query already ran; keep its rejection handled. On the
+            // tag drivers even a .catch here would start the query.
+            if (t.id === "drizzle") leaked.catch(() => undefined);
+            throw new Error("abort");
+          }),
+        );
+        const refused = await rejection(leaked as Promise<unknown>).catch((e: unknown) => e);
+        if (t.id !== "drizzle") {
+          expect((refused as Error).message).toBe(
+            `${t.id}: this transaction has already settled — its handle can no longer be used`,
+          );
+        }
+        expect(await ids(t.sql, table)).toEqual([]);
+      }),
+    );
+  });
+
+  test("a savepoint that recovered from a caught server error does not fail its parent", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const value = await t.begin(async (tx) => {
+          await insertId(tx, table, 1);
+          await tx
+            .savepoint(async (sp) => {
+              await sp.unsafe("select 1/0").catch(() => undefined);
+              await sp.unsafe("select 1");
+            })
+            .catch(() => undefined);
+          await insertId(tx, table, 2);
+          return "committed";
+        });
+        expect(value).toBe("committed");
+        expect(await ids(t.sql, table)).toEqual([1, 2]);
+      }),
+    );
+  });
+
   test("a server error fn caught still rolls back and rejects begin, on every driver", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {

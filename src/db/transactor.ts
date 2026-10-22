@@ -120,6 +120,8 @@ interface Scope {
   failed?: unknown;
   /** Queries and savepoints sent through this handle that have not settled. */
   pending: Set<PromiseLike<unknown>>;
+  /** Every error fn's scope rejected with or a query through the handle did. */
+  seen: Set<unknown>;
   /** The scope this savepoint nests in; closing it closes this one too. */
   parent?: Scope;
 }
@@ -135,7 +137,8 @@ const isClosed = (scope: Scope): boolean =>
  * else, or, for a savepoint, in the parent after the savepoint rolled back. It
  * is refused instead. Before handing back to the driver it waits for what the
  * handle sent, so no query or savepoint exit runs after the scope's own exit;
- * a savepoint left running keeps its transaction open until it settles.
+ * a savepoint left running keeps its transaction open until it settles, and
+ * one waiting on something released only after `begin` settles waits forever.
  */
 function enter<N, T>(
   driver: Driver,
@@ -143,13 +146,16 @@ function enter<N, T>(
   fn: (tx: TxSql<N>, native: N) => Promise<T>,
   parent?: Scope,
 ): Promise<T> {
-  const scope: Scope = { closed: false, childOpen: false, parent, pending: new Set() };
+  const scope: Scope = {
+    closed: false,
+    childOpen: false,
+    parent,
+    pending: new Set(),
+    seen: new Set(),
+  };
   const close = () => {
     scope.closed = true;
   };
-  // What fn's scope rejected with, so a different error from the driver's exit
-  // statement can be told apart from it.
-  let thrown: unknown;
   let settled: PromiseLike<unknown>;
   try {
     settled = nest(async (native) => {
@@ -169,15 +175,14 @@ function enter<N, T>(
         await Promise.allSettled(batch);
       }
       if (outcome.status === "rejected") {
-        thrown = outcome.reason;
-        throw thrown;
+        scope.seen.add(outcome.reason);
+        throw outcome.reason;
       }
       // Postgres aborts a transaction on any server error, and one driver then
       // answers COMMIT with a silent rollback. Throwing here makes every driver
       // roll back the scope and reject instead.
       if (scope.failed !== undefined) {
-        thrown = scope.failed;
-        throw thrown;
+        throw scope.failed;
       }
       return outcome.value;
     });
@@ -195,7 +200,9 @@ function enter<N, T>(
       close();
       // The savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
       // server, which leaves the parent transaction aborted.
-      if (parent !== undefined && err !== thrown) track(parent, err);
+      // postgres.js may reject with a query's error in place of fn's, so any
+      // error this scope already saw is fn's outcome, not the exit statement's.
+      if (parent !== undefined && !scope.seen.has(err)) track(parent, err);
       throw err;
     },
   );
@@ -207,6 +214,9 @@ function track(scope: Scope, err: unknown): void {
   // transaction dead anyway, so tracking them is harmless.
   if (scope.failed === undefined && pgCode(err) !== undefined) scope.failed = err;
 }
+
+const BUSY =
+  "a savepoint is open on this transaction — use the savepoint's handle until it settles";
 
 function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
   const { id } = driver;
@@ -221,9 +231,7 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
         ? new Error(`${id}: ${whileChildOpen}`)
         : undefined;
   const send = <R>(run: () => Promise<R>): Promise<R> => {
-    const refused = refusal(
-      "a savepoint is open on this transaction — use the savepoint's handle until it settles",
-    );
+    const refused = refusal(BUSY);
     if (refused) return Promise.reject(refused);
     let query: Promise<R>;
     try {
@@ -240,7 +248,12 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
     let watched: Promise<R> | undefined;
     const watch = (): Promise<R> => {
       if (watched === undefined) {
+        // Made inside the scope but first awaited after it settled: starting it
+        // now would run it after the driver's COMMIT or ROLLBACK.
+        const refused = refusal(BUSY);
+        if (refused) return Promise.reject(refused);
         const settled = driverThen.call(query, undefined, (err: unknown) => {
+          scope.seen.add(err);
           track(scope, err);
           throw err;
         }) as Promise<R>;
@@ -265,6 +278,8 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
         return next;
       },
     });
+    // A native promise (drizzle's) is awaited without looking up `then`, so
+    // its watch must start here; it is already running anyway.
     if (driver.eager) watch();
     return query;
   };
