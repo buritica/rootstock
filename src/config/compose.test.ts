@@ -46,14 +46,14 @@ describe("defineRootstockConfig", () => {
   });
 });
 
-describe("composed with the real clientSlice", () => {
+describe("composed with the real clientSlice and concurrencySlice", () => {
   const parsers = {
     clientSlice: db.clientSlice,
     migrateSlice: (i: { schema?: string; ahead: string }) => ({
       schema: i.schema ?? "rootstock",
       ahead: i.ahead,
     }),
-    concurrencySlice: (i: { widths: Record<string, unknown> }) => ({ widths: { ...i.widths } }),
+    concurrencySlice: concurrency.concurrencySlice,
   } as unknown as SliceParsers;
 
   test("the composed client slice is still the parser's own, branded slice", () => {
@@ -64,6 +64,11 @@ describe("composed with the real clientSlice", () => {
       max_lifetime: 600,
       connect_timeout: 30,
     });
+  });
+
+  test("the composed concurrency slice is still the parser's own, branded slice", () => {
+    const config = composeRootstockConfig(parsers, input);
+    expect(concurrency.width(config.concurrency, "fetch")).toBe(2);
   });
 
   test("print spells out every field the real profile has", () => {
