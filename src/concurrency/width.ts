@@ -22,7 +22,16 @@ const WIDTH_KEYS: ReadonlySet<string> = new Set(["default", "max"]);
 // object of the right shape is still refused.
 const registry = new WeakSet<object>();
 
-const q = (value: unknown): string => JSON.stringify(value);
+// `JSON.stringify`, except that a value it cannot serialize (a BigInt, a
+// cycle) still yields text, so the refusal that names the path still reaches
+// the caller. The same rule as db's slice parser.
+function q(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return typeof value === "bigint" ? `${value}n` : "an unserializable value";
+  }
+}
 
 function required(path: string): Error {
   return new Error(`${PARSER}: ${path} is required`);

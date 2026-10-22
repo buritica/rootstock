@@ -18,7 +18,10 @@ export interface BoundedOptions<T> {
  * - `before` is awaited in item order, before its item is dispatched. Gating
  *   inside the worker would let up to `width` items start against a gate
  *   nobody had re-checked yet, and gating once for the whole pass would miss
- *   a gate that stops holding partway through.
+ *   a gate that stops holding partway through. A gate does not see the
+ *   previous item's `run` start: each `run` begins a microtask after its
+ *   dispatch, so `before` of the next item can run first. A gate is not a
+ *   lock between consecutive items.
  * - The first throw, from `before` or `run`, aborts the pass: nothing new is
  *   pulled, gated or dispatched after it. In-flight items are allowed to
  *   finish, because killing them mid-write leaves half-done work, and then the
@@ -123,9 +126,9 @@ export async function forEachBounded<T>(
   }
   if (!exhausted) {
     // What `for...of`'s `break` did for free: tell the generator its consumer
-    // is gone, so its `finally` runs. A cleanup that itself throws is
-    // recorded, never allowed to mask the error that aborted the pass (unless
-    // that error was itself nullish, which `??=` lets it replace).
+    // is gone, so its `finally` runs. A cleanup that itself throws never masks
+    // the error that aborted the pass: it is dropped, unless that error was
+    // itself nullish, which `??=` lets it replace.
     try {
       iterator.return?.();
     } catch (returnErr) {

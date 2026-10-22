@@ -190,6 +190,15 @@ describe("width", () => {
     expect(message(() => width(slice(), "fetch", requested))).toBe(text);
   });
 
+  test("a value JSON cannot print still gets the refusal that names its path", () => {
+    expect(parse({ widths: { fetch: { default: 1, max: 4n } } })).toBe(
+      "concurrencySlice: widths.fetch.max must be an integer from 1 to 256 — got 4n",
+    );
+    expect(message(() => width(slice(), "fetch", 2n as unknown as number))).toBe(
+      'width: "fetch" requested 2n — must be an integer from 1 to 8',
+    );
+  });
+
   test("a null request is refused, not read as absent", () => {
     expect(message(() => width(slice(), "fetch", null as unknown as number))).toBe(
       'width: "fetch" requested null — must be an integer from 1 to 8',
