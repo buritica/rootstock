@@ -65,7 +65,10 @@ export async function statusOf(
   });
 }
 
-/** Read-only, lock-free status of the shipped migrations in the slice's schema. */
+/**
+ * Read-only, lock-free status of the shipped migrations in the slice's schema.
+ * The role needs USAGE on that schema, or this rejects with the driver's 42501.
+ */
 export async function rootstockMigrationStatus(
   sql: Sql,
   slice: MigrateSlice,

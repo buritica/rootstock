@@ -46,15 +46,12 @@ describe("defineRootstockConfig", () => {
   });
 });
 
-describe("composed with the real clientSlice and concurrencySlice", () => {
+describe("composed with the real slice parsers", () => {
   const parsers = {
     clientSlice: db.clientSlice,
-    migrateSlice: (i: { schema?: string; ahead: string }) => ({
-      schema: i.schema ?? "rootstock",
-      ahead: i.ahead,
-    }),
+    migrateSlice: migrate.migrateSlice,
     concurrencySlice: concurrency.concurrencySlice,
-  } as unknown as SliceParsers;
+  } as SliceParsers;
 
   test("the composed client slice is still the parser's own, branded slice", () => {
     const config = composeRootstockConfig(parsers, input);
@@ -69,6 +66,13 @@ describe("composed with the real clientSlice and concurrencySlice", () => {
   test("the composed concurrency slice is still the parser's own, branded slice", () => {
     const config = composeRootstockConfig(parsers, input);
     expect(concurrency.width(config.concurrency, "fetch")).toBe(2);
+  });
+
+  test("the composed migrate slice is still the parser's own, branded slice", async () => {
+    const config = composeRootstockConfig(parsers, input);
+    const sql = Object.assign(async () => [{ tracked: false }], { unsafe: async () => [] });
+    const status = await migrate.rootstockMigrationStatus(sql as never, config.migrate);
+    expect(status.schema).toBe("rootstock");
   });
 
   test("print spells out every field the real profile has", () => {
