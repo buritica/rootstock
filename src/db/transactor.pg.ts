@@ -308,7 +308,7 @@ describe("begin", () => {
   });
 
   for (const ending of ["returns", "throws"] as const) {
-    test(`a savepoint outliving fn is refused, and its transaction waits for it (fn ${ending})`, async () => {
+    test(`a savepoint outliving fn is refused, and its transaction waits for it and rolls back (fn ${ending})`, async () => {
       await withTransactor((t) =>
         withTable(t, "id int primary key", async (table) => {
           const { promise: gate, resolve: release } = Promise.withResolvers<void>();
@@ -321,7 +321,7 @@ describe("begin", () => {
               await gate;
               return insertId(sp, table, 2);
             });
-            // Keep the unawaited savepoint's rejection from going unhandled.
+            // fn may throw before the savepoint settles; nothing awaits it then.
             pending.catch(() => undefined);
             await started;
             if (ending === "throws") throw new Error("abort");
@@ -333,12 +333,13 @@ describe("begin", () => {
           release();
           // The transaction waited for the savepoint, so its query was refused
           // and its ROLLBACK TO ran inside the transaction, before the exit.
-          await done.catch(() => undefined);
-          expect(((await rejection(pending as Promise<unknown>)) as Error).message).toBe(
-            `${t.id}: this transaction has already settled — its handle can no longer be used`,
-          );
+          // The savepoint failed after fn settled, so the transaction rolls back.
+          const closed = `${t.id}: this transaction has already settled — its handle can no longer be used`;
+          const err = (await rejection(done)) as Error;
+          expect(err.message).toBe(ending === "returns" ? closed : "abort");
+          expect(((await rejection(pending as Promise<unknown>)) as Error).message).toBe(closed);
           await t.begin((tx) => insertId(tx, table, 3));
-          expect(await ids(t.sql, table)).toEqual(ending === "returns" ? [1, 3] : [3]);
+          expect(await ids(t.sql, table)).toEqual([3]);
         }),
       );
     });
@@ -471,6 +472,33 @@ describe("begin", () => {
           expect(outcome).toBe("committed");
           expect(await ids(t.sql, table)).toEqual([1, 2]);
         }
+      }),
+    );
+  });
+
+  test("a nested savepoint's failed exit, caught in its parent savepoint, stays there", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const outcome = await t
+          .begin(async (tx) => {
+            await insertId(tx, table, 1);
+            await tx
+              .savepoint((mid) =>
+                mid
+                  .savepoint(async (_sp, native) => {
+                    // Caught natively: Bun.SQL's RELEASE then fails with 25P02.
+                    await nativeInsert(t.id, native, table, 1).catch(() => undefined);
+                  })
+                  .catch(() => undefined),
+              )
+              .catch(() => undefined);
+            await insertId(tx, table, 2);
+            return "committed";
+          })
+          .catch((e: unknown) => pgCode(e));
+        // The middle savepoint's ROLLBACK TO recovered the transaction.
+        expect(outcome).toBe("committed");
+        expect(await ids(t.sql, table)).toEqual([1, 2]);
       }),
     );
   });

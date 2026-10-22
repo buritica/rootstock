@@ -24,8 +24,9 @@ export interface TxSql<N = unknown> extends Sql {
    * every query and savepoint sent through `sp` before it exits. If the
    * savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO fails, the driver's error
    * comes back instead and the enclosing transaction is aborted, so it fails
-   * too. Savepoints are a stack on
-   * one connection, so a second savepoint on the same handle while one is open
+   * too. Await it: the enclosing scope waits for a savepoint left running,
+   * and fails if it fails after that scope's fn settled. Savepoints are a
+   * stack on one connection, so a second savepoint on the same handle while one is open
    * is refused: rolling back the first would also undo the second. To nest,
    * call `sp.savepoint`. While one is open, a query through the outer handle is
    * refused too: it would run inside the savepoint and roll back with it.
@@ -52,10 +53,13 @@ export interface Transactor<N = unknown> {
    * anyway, the transaction rolls back and rejects with the first such error,
    * on every driver. That covers a query still running when fn settles (one
    * that lost a `Promise.race`, say): before its COMMIT or ROLLBACK, `begin` waits for
-   * every query sent through `tx` and every savepoint started through it, and
+   * every query sent through `tx` and every savepoint started through it (so
+   * a savepoint left running that waits on something released only after
+   * `begin` settles, such as `sql` on a pool of one, never settles), and
    * a savepoint whose own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
    * server rejects `begin` the same way. A query nobody awaited still runs,
-   * and `begin` waits for it and fails with it like any other. Queries sent
+   * and `begin` waits for it and fails with it like any other, as it does
+   * with a savepoint that fails after fn settled. Queries sent
    * through `native`, and drizzle's refusals (a value before sending, a result
    * that is not rows after it), are not tracked. `tx` is valid only until fn
    * settles; a query through it afterwards, even one racing the driver's
@@ -176,8 +180,12 @@ function enter<N, T>(
       }
       // Postgres aborts a transaction on any server error, and one driver then
       // answers COMMIT with a silent rollback. Throwing here makes every driver
-      // roll back the scope and reject instead.
-      if (scope.failed !== undefined) throw scope.failed;
+      // roll back the scope and reject instead. The rollback recovers the
+      // error, so a savepoint's parent does not count it as an exit failure.
+      if (scope.failed !== undefined) {
+        scope.seen.add(scope.failed);
+        throw scope.failed;
+      }
       return value;
     });
   } catch (err) {
@@ -194,6 +202,9 @@ function enter<N, T>(
       // already see the error: postgres.js rejects a savepoint that rolled
       // back cleanly with the first error any query in it hit, `native` too.
       if (parent !== undefined && isExitFailure(err) && !scope.seen.has(err)) track(parent, err);
+      // A savepoint that failed after its parent's fn settled: nobody in that
+      // fn could handle it, so its work is not committed without it.
+      if (parent?.closed && parent.failed === undefined) parent.failed = err;
       throw err;
     });
 }
@@ -231,24 +242,26 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
     if (refused) return Promise.reject(refused);
     // Started now, through the driver's own `then`, so it runs inside this
     // scope whoever awaits it, and the scope waits for it before its exit. A
-    // driver helper call (`tx(ids)`) throws here, and comes back a rejection.
-    let settled: Promise<R>;
-    try {
-      settled = run().then(
-        (value) => {
-          scope.pending.delete(settled);
-          return value;
-        },
-        (err: unknown) => {
-          scope.pending.delete(settled);
-          scope.seen.add(err);
-          track(scope, err);
-          throw err;
-        },
+    // driver helper call (`tx(ids)`) sits where nobody awaits it, so it throws
+    // here rather than coming back a rejection nobody handles.
+    const query = run();
+    if (typeof query?.then !== "function") {
+      throw new Error(
+        `${id}: a transaction handle sends a tagged template or unsafe() at once — driver helpers, fragments and query methods go through native`,
       );
-    } catch (err) {
-      return Promise.reject(err);
     }
+    const settled: Promise<R> = query.then(
+      (value) => {
+        scope.pending.delete(settled);
+        return value;
+      },
+      (err: unknown) => {
+        scope.pending.delete(settled);
+        scope.seen.add(err);
+        track(scope, err);
+        throw err;
+      },
+    );
     scope.pending.add(settled);
     // A failure nobody awaits is not lost: it fails the scope. Marking it
     // handled keeps it from also being reported as unhandled.

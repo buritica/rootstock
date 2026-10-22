@@ -216,9 +216,12 @@ describe("every transactor", () => {
           });
         });
         let committed = false;
-        void done.then(() => {
-          committed = true;
-        });
+        void done.then(
+          () => {
+            committed = true;
+          },
+          () => undefined,
+        );
         await new Promise((r) => setTimeout(r, 0));
         // The transaction waits for its savepoints rather than exiting under them.
         expect(committed).toBe(false);
@@ -230,7 +233,8 @@ describe("every transactor", () => {
         release();
         expect(await messageOf(async () => pending)).toBe(closed);
         expect(await messageOf(async () => deep)).toBe(closed);
-        await done;
+        // The savepoint failed after fn settled, so the transaction fails too.
+        expect(await messageOf(async () => done)).toBe(closed);
         // Only the begin and savepoint entries reached the driver; no query did.
         expect(calls.filter(([c]) => /unsafe|execute|tag$/.test(c))).toEqual([]);
       });
@@ -690,4 +694,87 @@ describe("drizzleTransactor", () => {
       "db.tx.tx.execute",
     ]);
   });
+});
+
+describe("savepoints, helpers and failures after fn settled", () => {
+  test("a nested savepoint whose exit failed, caught and rolled back by its parent savepoint, does not fail begin", async () => {
+    const exitError = Object.assign(new Error("release failed"), { code: "25P02" });
+    const client = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) =>
+        fn(
+          Object.assign(tagDouble("db.tx", []), {
+            savepoint: async (cb: (sp: unknown) => unknown) =>
+              cb(
+                Object.assign(tagDouble("db.tx.sp", []), {
+                  savepoint: async (inner: (sp: unknown) => unknown) => {
+                    await inner(tagDouble("db.tx.sp.sp", []));
+                    throw exitError;
+                  },
+                }),
+              ),
+          }),
+        ),
+    });
+    const value = await postgresJsTransactor(client).begin(async (tx) => {
+      const err = await tx
+        .savepoint((mid) => mid.savepoint(async () => 1).catch(() => undefined))
+        .catch((e: unknown) => e);
+      expect(err).toBe(exitError);
+      await tx.unsafe("select 1");
+      return "committed";
+    });
+    expect(value).toBe("committed");
+  });
+
+  for (const [id, make] of FACTORIES) {
+    test(`${id}: a savepoint that outlives fn and fails rejects begin`, async () => {
+      const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+      const t = make([]);
+      const done = t.begin(async (tx: TxSql) => {
+        void tx.savepoint(async (sp) => {
+          await gate;
+          return sp.unsafe("select 1");
+        });
+        return "returned";
+      });
+      await new Promise((r) => setTimeout(r, 1));
+      release();
+      expect(await messageOf(() => done)).toBe(
+        `${id}: this transaction has already settled — its handle can no longer be used`,
+      );
+    });
+
+    test(`${id}: a query that resolves after fn returned does not fail begin through its savepoint`, async () => {
+      const t = make([]);
+      const value = await t.begin(async (tx: TxSql) => {
+        void tx.savepoint(async (sp) => sp.unsafe("select 1"));
+        return "returned";
+      });
+      expect(value).toBe("returned");
+    });
+  }
+
+  for (const over of [postgresJsTransactor, bunSqlTransactor]) {
+    test(`${over.name}: a call the driver does not send is refused at once, not as a rejection`, async () => {
+      const notAQuery = { helper: true };
+      const client = Object.assign(tagDouble("db", []), {
+        begin: async (fn: (tx: unknown) => unknown) =>
+          fn(
+            Object.assign(() => notAQuery, {
+              unsafe: () => {
+                throw new TypeError("driver threw");
+              },
+            }),
+          ),
+      });
+      const t = over(client);
+      await t.begin(async (tx) => {
+        expect(() => tx.unsafe("select 1")).toThrow("driver threw");
+        expect(() => tx`select 1`).toThrow(
+          `${t.id}: a transaction handle sends a tagged template or unsafe() at once — driver helpers, fragments and query methods go through native`,
+        );
+        return undefined;
+      });
+    });
+  }
 });
