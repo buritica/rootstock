@@ -1,4 +1,4 @@
-import { quoted, type Transactor, type TxSql } from "./db-surface.ts";
+import { quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import { statusOf } from "./status.ts";
@@ -67,7 +67,7 @@ export async function applyMigrationList(
     // then finds it applied.
     await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${schema}`}::text)::bigint)`;
     const { exists } = await preflight(tx, schema);
-    if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoted(schema)}`);
+    if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const status = await statusOf(tx, slice, list);
     const [tamper] = status.tampered;
     if (tamper !== undefined) {
@@ -93,11 +93,11 @@ export async function applyMigrationList(
       );
     }
     if (status.pending.length > 0) {
-      await tx.unsafe(`SET LOCAL search_path TO ${quoted(schema)}`);
+      await tx.unsafe(`SET LOCAL search_path TO ${quoteIdentifier(schema)}`);
       for (const m of status.pending) {
         for (const statement of m.statements) await tx.unsafe(statement);
         await tx.unsafe(
-          `INSERT INTO ${quoted(schema)}.schema_migrations (filename, sha256) VALUES ($1, $2)`,
+          `INSERT INTO ${quoteIdentifier(schema)}.schema_migrations (filename, sha256) VALUES ($1, $2)`,
           [m.filename, m.sha256],
         );
       }

@@ -1,4 +1,4 @@
-import { quoted, type Sql } from "./db-surface.ts";
+import { quoteIdentifier, type Sql } from "../db/index.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 
@@ -29,7 +29,7 @@ export async function statusOf(
   list: readonly RootstockMigration[],
 ): Promise<RootstockMigrationStatus> {
   const { schema } = slice;
-  const table = `${quoted(schema)}.schema_migrations`;
+  const table = `${quoteIdentifier(schema)}.schema_migrations`;
   const [found] = await sql<{ schemaExists: boolean; tracked: boolean }>`
     select to_regnamespace(${schema}::text) is not null as "schemaExists",
            to_regclass(${table}::text) is not null as "tracked"`;

@@ -1,14 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { applyMigrationList, applyRootstockMigrations } from "./apply.ts";
-import type { Sql } from "./db-surface.ts";
-import { parseMigration, type RootstockMigration, rootstockMigrations } from "./migrations.ts";
-import { migrateSlice } from "./slice.ts";
-import { rootstockMigrationStatus } from "./status.ts";
+import type { Sql } from "../db/index.ts";
 import {
   openSecond,
   openTestTransactor,
   type TestTransactor,
-} from "./test-transactor.pg-support.ts";
+} from "../db/transactor.pg-support.ts";
+import { applyMigrationList, applyRootstockMigrations } from "./apply.ts";
+import { parseMigration, type RootstockMigration, rootstockMigrations } from "./migrations.ts";
+import { migrateSlice } from "./slice.ts";
+import { rootstockMigrationStatus } from "./status.ts";
 
 // The applier against a real Postgres, once per transactor kind. Every case
 // works in schemas of its own (`rs_t_<hex>`) and drops them when it is done.

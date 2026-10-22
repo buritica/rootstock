@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { checkIdentifier } from "./db-surface.ts";
+import { quoteIdentifier } from "../db/index.ts";
+import { checkIdentifier } from "./identifier.ts";
 
 // One table of names, judged by migrate's copy of the identifier rule and by
 // `db`'s `quoteIdentifier`. The two must accept and refuse the same names and
@@ -56,16 +57,10 @@ describe("migrate's identifier rule", () => {
   });
 });
 
-test("db's quoteIdentifier gives the same verdict for every name", async () => {
-  const db: Record<string, unknown> = await import("../db/index.ts");
-  // Until `db` ships, its index is the empty foundation stub; once it exports
-  // anything, quoteIdentifier must be among it and the comparison runs.
-  if (Object.keys(db).length === 0) return;
-  const quoteIdentifier = db.quoteIdentifier as (name: unknown) => string;
-  expect(typeof quoteIdentifier).toBe("function");
+test("db's quoteIdentifier gives the same verdict for every name", () => {
   for (const [name] of NAMES) {
     expect(
-      outcome(() => quoteIdentifier(name)),
+      outcome(() => quoteIdentifier(name as string)),
       String(name),
     ).toEqual(outcome(() => checkIdentifier("identifier", name)));
   }

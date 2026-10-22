@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Sql, Transactor } from "./db-surface.ts";
+import type { Sql, Transactor } from "../db/index.ts";
 import { applyRootstockMigrations, rootstockMigrationStatus } from "./index.ts";
 import { type MigrateSlice, type MigrateSliceInput, migrateSlice } from "./slice.ts";
 

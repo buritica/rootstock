@@ -1,4 +1,4 @@
-import { checkIdentifier, q } from "./db-surface.ts";
+import { checkIdentifier, q } from "./identifier.ts";
 
 export interface MigrateSliceInput {
   /** Identifier rule of `db`'s `quoteIdentifier`. Default "rootstock". */
