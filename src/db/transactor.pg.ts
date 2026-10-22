@@ -279,6 +279,63 @@ describe("begin", () => {
     );
   });
 
+  test("a sibling query sent while the driver rolls back is refused and writes nothing", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const boom = new Error("boom");
+        let sibling: Promise<unknown> | undefined;
+        const err = await rejection(
+          t.begin(async (tx) => {
+            const failing = Promise.reject(boom);
+            // The usual Promise.all shape: one branch fails, the other is
+            // still going and writes as soon as it notices.
+            sibling = (async () => {
+              await failing.catch(() => undefined);
+              for (let i = 0; i < 5; i++) await Promise.resolve();
+              return insertId(tx, table, 2);
+            })();
+            await Promise.all([failing, sibling]);
+          }),
+        );
+        expect(err).toBe(boom);
+        const refused = (await rejection(sibling as Promise<unknown>)) as Error;
+        expect(refused.message).toBe(
+          `${t.id}: this transaction has already settled — its handle can no longer be used`,
+        );
+        expect(await ids(t.sql, table)).toEqual([]);
+      }),
+    );
+  });
+
+  test("a savepoint outliving its transaction is refused, and the connection stays clean", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+        let pending: Promise<unknown> | undefined;
+        await t.begin(async (tx) => {
+          await insertId(tx, table, 1);
+          pending = tx.savepoint(async (sp) => {
+            await gate;
+            return insertId(sp, table, 2);
+          });
+          // Keep the unawaited savepoint's rejection from going unhandled.
+          pending.catch(() => undefined);
+        });
+        release();
+        // It rejects, with the refusal or, where the driver then tries ROLLBACK
+        // TO SAVEPOINT on the settled connection, with that statement's error.
+        const refused = await pending?.then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(refused).toBeInstanceOf(Error);
+        // The one connection is usable, and in no transaction left over.
+        await t.begin((tx) => insertId(tx, table, 3));
+        expect(await ids(t.sql, table)).toEqual([1, 3]);
+      }),
+    );
+  });
+
   test("a server error fn caught still rolls back and rejects begin, on every driver", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {

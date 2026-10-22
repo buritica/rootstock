@@ -4,8 +4,13 @@ export type Row = Record<string, unknown>;
 
 /**
  * The query surface every rootstock component takes: a tagged template and
- * `unsafe`. Always await a query: postgres.js and Bun.SQL queries are lazy and
- * never run unless awaited, while drizzle's run at once.
+ * `unsafe`. Always await a query. On a transactor's root `sql`, postgres.js
+ * and Bun.SQL queries are lazy and never run unless awaited, while drizzle's
+ * run at once. On a `begin` or savepoint handle every driver's query is sent
+ * at once and comes back as a plain promise, not the driver's query object:
+ * the handle watches each result for a server error (see `begin`), and
+ * watching it starts it. A query left unawaited there still runs, and if it
+ * fails nothing handles the rejection.
  */
 export interface Sql {
   <T = Row>(strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T[]>;
@@ -15,12 +20,14 @@ export interface Sql {
 export interface TxSql<N = unknown> extends Sql {
   /**
    * A nested savepoint. A throw inside rolls back only the savepoint, then
-   * rethrows the same error. A server error on one of its queries rolls it
-   * back even when fn caught it, as `begin` does. Savepoints on one transaction must not overlap:
-   * they are a stack on one connection, and rolling back one that started
-   * first also undoes one started after it. While one is open, a query
-   * through the outer handle is refused: it would run inside the savepoint
-   * and roll back with it.
+   * rethrows the same error (if the rollback itself fails, the driver's error
+   * comes back instead). A server error on an awaited query through `sp` rolls
+   * it back even when fn caught it, as `begin` does. Savepoints are a stack on
+   * one connection, so a second savepoint on the same handle while one is open
+   * is refused: rolling back the first would also undo the second. To nest,
+   * call `sp.savepoint`. While one is open, a query through the outer handle is
+   * refused too: it would run inside the savepoint and roll back with it.
+   * Savepoints and queries sent through `native` bypass these refusals.
    */
   savepoint<T>(fn: (sp: TxSql<N>, native: N) => Promise<T>): Promise<T>;
 }
@@ -37,11 +44,14 @@ export interface Transactor<N = unknown> {
   readonly sql: Sql;
   /**
    * One transaction. Commits when fn resolves; rolls back and rethrows the
-   * same error when it rejects. A query through `tx` that failed on the server
-   * left the transaction aborted, so if fn caught it and resolved anyway, the
-   * transaction rolls back and rejects with that error, on every driver.
-   * Queries sent through `native` are not tracked. `tx` is valid only until
-   * fn settles; a query through it afterwards is refused.
+   * same error when it rejects (if the rollback itself fails, the driver's
+   * error comes back instead). An awaited query through `tx` that failed on
+   * the server left the transaction aborted, so if fn caught it and resolved
+   * anyway, the transaction rolls back and rejects with the first such error,
+   * on every driver. Queries sent through `native`, and drizzle's refusal of a
+   * value before sending, are not tracked. `tx` is valid only until fn
+   * settles; a query through it afterwards, even one racing the driver's
+   * COMMIT or ROLLBACK, is refused.
    */
   begin<T>(fn: (tx: TxSql<N>, native: N) => Promise<T>): Promise<T>;
 }
@@ -96,7 +106,7 @@ interface Driver {
 
 /** One transaction or savepoint scope, as its handle sees it. */
 interface Scope {
-  /** Set when the driver's call settles. */
+  /** Set when fn settles, or when the driver's call does. */
   closed: boolean;
   /** A savepoint started through this scope's handle has not settled yet. */
   childOpen: boolean;
@@ -111,9 +121,12 @@ const isClosed = (scope: Scope): boolean =>
 
 /**
  * Enters a transaction or savepoint and hands fn a handle over the driver's
- * object. The handle closes when the driver's call settles, or when any scope
- * it nests in does: a query through it afterwards would run as autocommit on
- * a connection the driver lent to someone else, so it is refused instead.
+ * object. The handle closes when fn settles, or when any scope it nests in
+ * does. A query through it afterwards would run after the driver's COMMIT or
+ * ROLLBACK: as autocommit on a connection the driver may have lent to someone
+ * else, or, for a savepoint, in the parent after the savepoint rolled back. It
+ * is refused instead. The driver's own exit statement for a savepoint that
+ * outlives its parent is outside rootstock's control.
  */
 function enter<N, T>(
   driver: Driver,
@@ -122,17 +135,30 @@ function enter<N, T>(
   parent?: Scope,
 ): Promise<T> {
   const scope: Scope = { closed: false, childOpen: false, parent };
-  const settled = nest(async (native) => {
-    const value = await fn(txHandle<N>(driver, native, scope), native as N);
-    // Postgres aborts a transaction on any server error, and one driver then
-    // answers COMMIT with a silent rollback. Throwing here makes every driver
-    // roll back the scope and reject instead.
-    if (scope.failed !== undefined) throw scope.failed;
-    return value;
-  });
-  return (settled as Promise<T>).finally(() => {
+  const close = () => {
     scope.closed = true;
-  });
+  };
+  let settled: PromiseLike<unknown>;
+  try {
+    settled = nest(async (native) => {
+      let value: T;
+      try {
+        value = await fn(txHandle<N>(driver, native, scope), native as N);
+      } finally {
+        close();
+      }
+      // Postgres aborts a transaction on any server error, and one driver then
+      // answers COMMIT with a silent rollback. Throwing here makes every driver
+      // roll back the scope and reject instead.
+      if (scope.failed !== undefined) throw scope.failed;
+      return value;
+    });
+  } catch (err) {
+    // A driver entry that throws instead of rejecting.
+    close();
+    return Promise.reject(err);
+  }
+  return Promise.resolve(settled as PromiseLike<T>).finally(close);
 }
 
 function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
@@ -152,8 +178,9 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
       "a savepoint is open on this transaction — use the savepoint's handle until it settles",
     );
     if (refused) return Promise.reject(refused);
-    // Only an error with a SQLSTATE came from the server; a refusal raised
-    // before sending leaves the transaction usable.
+    // A refusal raised before sending carries no code and leaves the
+    // transaction usable. pgCode also matches a few socket errors (EPIPE);
+    // those leave the transaction dead anyway, so tracking them is harmless.
     return run().catch((err: unknown) => {
       if (scope.failed === undefined && pgCode(err) !== undefined) scope.failed = err;
       throw err;
