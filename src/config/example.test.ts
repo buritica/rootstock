@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { concurrencySlice } from "../concurrency/index.ts";
 import { clientSlice } from "../db/index.ts";
 import { migrateSlice } from "../migrate/index.ts";
+import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
 import { printRootstockConfig } from "./print.ts";
@@ -14,8 +15,6 @@ import type {
   MigrateSlice,
   SliceParsers,
 } from "./slices.ts";
-
-const parsers: SliceParsers = { clientSlice, migrateSlice, concurrencySlice };
 
 // The one test double: each parser copies its input and returns it unfrozen
 // and unbranded, so the freezes nested-frozen observes are config's own and
@@ -34,7 +33,7 @@ const unfrozen = {
     }) as unknown as ConcurrencySlice,
 } satisfies SliceParsers;
 
-const define = (input: RootstockConfigInput) => composeRootstockConfig(parsers, input);
+const define = defineRootstockConfig;
 
 const exampleInput: RootstockConfigInput = {
   client: {
@@ -221,7 +220,7 @@ describe("print", () => {
 
   test("unbranded-slice-refused", () => {
     const slice = migrateSlice({ ahead: "refuse" });
-    // biome-ignore lint/suspicious/noExplicitAny: an unbranded object on purpose
+    // biome-ignore lint/suspicious/noExplicitAny: a real slice, but not a config
     expect(messageOf(() => printRootstockConfig(slice as any))).toBe(UNBRANDED);
   });
 });
@@ -576,11 +575,12 @@ describe("brand and failure paths", () => {
   test("parser-errors-come-before-invariant-ids", () => {
     const boom = new Error("concurrencySlice: widths is required");
     const failing = {
-      ...parsers,
+      clientSlice,
+      migrateSlice,
       concurrencySlice: () => {
         throw boom;
       },
-    } as unknown as SliceParsers;
+    } satisfies SliceParsers;
     let caught: unknown;
     try {
       composeRootstockConfig(failing, { ...exampleInput, invariants: [holds("Bad")] });
