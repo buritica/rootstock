@@ -1,12 +1,16 @@
 import { quoteIdentifier, type Sql, type TxSql } from "../db/index.ts";
+import { q } from "../internal/slice.ts";
 import { fail } from "./errors.ts";
+import { checkIdentifier } from "./identifier.ts";
 import type { MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { type TrackedSource, type Tracker, trackerTable } from "./tracked.ts";
 
-// The SQL each tracker kind needs (contract §1.2). Status and apply read and
-// write a tracker only through here. Every function assumes the caller holds
-// whatever lock its step needs; none of them takes one.
+// The SQL each tracker kind needs (contract §1.2). applyMigrations and
+// migrationStatus (B-R3, B-R4) read and write app trackers only through here.
+// Every function assumes the caller holds whatever lock its step needs; none
+// of them takes one, and none emits an event: bootstrap reports what it did
+// and the applier emits once the transaction has committed.
 
 /** One tracker row, read the same way on every driver. */
 export interface TrackerRow {
@@ -23,17 +27,16 @@ export interface TrackerRead {
   readonly schemaExists: boolean;
   /** The tracker table exists. */
   readonly tracked: boolean;
-  /** Always true for drizzle and rootstock; a filename tracker once it has `sha256`. */
+  /** The table exists and has its hash column (a filename tracker gains `sha256` on upgrade). */
   readonly hashColumn: boolean;
-  /** drizzle by `id`, the other kinds by filename (code-unit order). */
+  /** drizzle by `id`, the other kinds by filename in byte order (C collation). */
   readonly rows: readonly TrackerRow[];
 }
 
-export type TrackerEvent =
-  | { type: "migrate.tracker_created" | "migrate.tracker_upgraded"; source: string; table: string }
-  | { type: "migrate.hash_stamped"; source: string; id: string };
-
+/** What bootstrap did, for the applier to report after commit. */
 export interface TrackerBootstrap {
+  /** `schema.table`. */
+  readonly table: string;
   readonly created: boolean;
   readonly upgraded: boolean;
   /** Ids whose NULL hash was stamped. */
@@ -52,9 +55,30 @@ interface Resolved {
   readonly sql: string;
   /** The expression a row's key is read from and compared with `SourceMigration.key`. */
   readonly keyExpr: string;
+  readonly hashCol: "hash" | "sha256";
 }
 
+const KINDS: ReadonlySet<string> = new Set(["drizzle", "filename", "rootstock"]);
+
+function identifier(what: string, value: unknown): void {
+  try {
+    checkIdentifier(what, value);
+  } catch (err) {
+    fail((err as Error).message.replace(/^rootstock: /, ""));
+  }
+}
+
+/** Refuses a hand-built tracker the factories would not have returned. */
 function resolve(tracker: Tracker, slice: MigrateSlice): Resolved {
+  if (!KINDS.has((tracker as { kind?: unknown })?.kind as string)) {
+    fail(
+      `tracker kind must be "drizzle", "filename" or "rootstock" — got ${q((tracker as { kind?: unknown })?.kind)}`,
+    );
+  }
+  if (tracker.kind !== "rootstock") {
+    identifier("tracker schema", tracker.schema);
+    identifier("tracker table", tracker.table);
+  }
   const { schema, table } = trackerTable(tracker, slice);
   return {
     tracker,
@@ -63,25 +87,50 @@ function resolve(tracker: Tracker, slice: MigrateSlice): Resolved {
     sql: `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`,
     // created_at is bigint: ::text keeps it exact and a string on every driver.
     keyExpr: tracker.kind === "drizzle" ? "created_at::text" : "filename",
+    hashCol: tracker.kind === "drizzle" ? "hash" : "sha256",
   };
 }
 
+function shapeRefusal(t: Resolved, found: string, expected: string): never {
+  fail(
+    `${t.name} is not a tracker rootstock can read — found ${found}; expected ${expected}`,
+    "ERR_ROOTSTOCK_MIG_TRACKER_SHAPE",
+  );
+}
+
+/**
+ * What the catalog says about a tracker. A relation that is not a table, or a
+ * hash column that is not text, refuses (E-MIG-TRACKER-SHAPE) rather than
+ * surfacing later as a driver error. Without USAGE on the tracker's schema the
+ * driver's 42501 comes back, as in 0.3.0's status.
+ */
 async function catalog(
   sql: Sql,
   t: Resolved,
 ): Promise<{ schemaExists: boolean; tracked: boolean; hashColumn: boolean }> {
-  const [row] = await sql<{ schemaExists: boolean; tracked: boolean; sha256: boolean }>`
+  const [row] = await sql<{
+    schemaExists: boolean;
+    relkind: string | null;
+    hashType: string | null;
+  }>`
     select to_regnamespace(${t.schema}::text) is not null as "schemaExists",
-           to_regclass(${t.sql}::text) is not null as "tracked",
-           exists (select 1 from pg_attribute
-                   where attrelid = to_regclass(${t.sql}::text)
-                     and attname = 'sha256' and not attisdropped) as "sha256"`;
-  if (row === undefined) fail("the tracker catalog query returned no row");
-  return {
-    schemaExists: row.schemaExists,
-    tracked: row.tracked,
-    hashColumn: t.tracker.kind === "filename" ? row.sha256 : true,
-  };
+           (select relkind::text from pg_class where oid = to_regclass(${t.sql}::text)) as relkind,
+           (select format_type(atttypid, atttypmod) from pg_attribute
+             where attrelid = to_regclass(${t.sql}::text)
+               and attname = ${t.hashCol}::text and not attisdropped) as "hashType"`;
+  if (row === undefined)
+    throw new Error("rootstock migrate: the tracker catalog query returned no row");
+  const tracked = row.relkind !== null;
+  if (tracked && row.relkind !== "r" && row.relkind !== "p") {
+    shapeRefusal(t, `a relation of kind ${q(row.relkind)}`, "a table");
+  }
+  if (row.hashType !== null && row.hashType !== "text") {
+    shapeRefusal(t, `column ${t.hashCol} ${row.hashType}`, `${t.hashCol} text`);
+  }
+  if (tracked && row.hashType === null && t.tracker.kind !== "filename") {
+    shapeRefusal(t, `no column ${t.hashCol}`, `${t.hashCol} text`);
+  }
+  return { schemaExists: row.schemaExists, tracked, hashColumn: row.hashType !== null };
 }
 
 /** The table's rows, or only those recorded under `key`. */
@@ -93,7 +142,7 @@ async function selectRows(
 ): Promise<readonly TrackerRow[]> {
   const drizzle = t.tracker.kind === "drizzle";
   const rowId = drizzle ? "id::text" : "null::text";
-  const hash = drizzle ? "hash" : hashColumn ? "sha256" : "null::text";
+  const hash = hashColumn ? t.hashCol : "null::text";
   const order = drizzle ? "id" : `filename collate "C"`;
   const where = key === undefined ? "" : ` where ${t.keyExpr} = $1`;
   const rows = await sql.unsafe<{ rowId: string | null; key: string | null; hash: string | null }>(
@@ -162,23 +211,23 @@ function createDdl(t: Resolved): string {
  * without having created it.
  */
 async function assertUpgradable(tx: TxSql, t: Resolved): Promise<void> {
-  const cols = await tx.unsafe<{ col: string; owner: boolean; user: string }>(
-    `select a.attname::text || ' ' || format_type(a.atttypid, a.atttypmod)
-              || case when a.attnum = any(i.indkey::int2[]) then ' (primary key)' else '' end as col,
-            pg_get_userbyid(c.relowner) = current_user as owner, current_user::text as "user"
-       from pg_class c
-       join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-       left join pg_index i on i.indrelid = c.oid and i.indisprimary
-      where c.oid = to_regclass($1::text)
-      order by a.attnum`,
+  const [rel] = await tx.unsafe<{ owner: boolean; user: string; cols: string[] | null }>(
+    `select pg_get_userbyid(c.relowner) = current_user as owner, current_user::text as "user",
+            (select array_agg(a.attname::text || ' ' || format_type(a.atttypid, a.atttypmod)
+                              || case when a.attnum = any(i.indkey::int2[]) then ' (primary key)' else '' end
+                              order by a.attnum)
+               from pg_attribute a
+               left join pg_index i on i.indrelid = c.oid and i.indisprimary
+              where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped) as cols
+       from pg_class c where c.oid = to_regclass($1::text)`,
     [t.sql],
   );
-  const found = cols.map((c) => c.col);
-  const owner = cols[0]?.owner === true;
+  const found = rel?.cols ?? [];
+  const owner = rel?.owner === true;
   const expected = ["applied_at timestamp with time zone", "filename text (primary key)"];
   if (owner && [...found].sort().join() === expected.join()) return;
   fail(
-    `${t.name} is not a tracker rootstock can upgrade — found columns ${found.join(", ")}${owner ? "" : `, not owned by ${cols[0]?.user ?? "the current user"}`}; expected exactly filename text primary key and applied_at timestamptz`,
+    `${t.name} is not a tracker rootstock can upgrade — found columns ${found.length > 0 ? found.join(", ") : "(none)"}${owner ? "" : `, not owned by ${rel?.user ?? "the current user"}`}; expected exactly filename text primary key and applied_at timestamptz`,
     "ERR_ROOTSTOCK_MIG_TRACKER_SHAPE",
   );
 }
@@ -187,21 +236,28 @@ async function assertUpgradable(tx: TxSql, t: Resolved): Promise<void> {
  * Makes a source's tracker ready to apply against, in the caller's bootstrap
  * transaction (contract §1.4 step 1): creates a missing table (and schema),
  * adds `sha256` to a hash-less filename tracker behind the shape guard, and
- * stamps each NULL hash whose file is in `source` with that file's hash. One
- * event per action. rootstock's own tracker is left to rootstock's first
- * migration, as in 0.3.0. Running it again on a ready tracker does nothing.
+ * stamps each NULL hash whose file is in `source` with that file's hash. It
+ * emits nothing: a later throw rolls the whole transaction back, so the caller
+ * reports the result only after commit. rootstock's own tracker is left to
+ * rootstock's first migration, as in 0.3.0. Running it again on a ready
+ * tracker does nothing. Ownership is compared exactly (the contract's rule),
+ * so a table owned by a role the current user merely belongs to is refused.
  */
 export async function bootstrapTracker(
   tx: TxSql,
   source: TrackedSource,
   slice: MigrateSlice,
-  emit: (event: TrackerEvent) => void,
 ): Promise<TrackerBootstrap> {
   const { tracker } = source;
-  if (tracker.kind === "rootstock") {
-    return Object.freeze({ created: false, upgraded: false, stamped: Object.freeze([]) });
-  }
   const t = resolve(tracker, slice);
+  if (tracker.kind === "rootstock") {
+    return Object.freeze({
+      table: t.name,
+      created: false,
+      upgraded: false,
+      stamped: Object.freeze([]),
+    });
+  }
   const { schemaExists, tracked, hashColumn } = await catalog(tx, t);
   let created = false;
   let upgraded = false;
@@ -209,21 +265,20 @@ export async function bootstrapTracker(
     if (!schemaExists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(t.schema)}`);
     await tx.unsafe(createDdl(t));
     created = true;
-    emit({ type: "migrate.tracker_created", source: source.name, table: t.name });
   } else if (!hashColumn) {
     await assertUpgradable(tx, t);
     await tx.unsafe(`ALTER TABLE ${t.sql} ADD COLUMN sha256 text ${HASH_CHECK}`);
     upgraded = true;
-    emit({ type: "migrate.tracker_upgraded", source: source.name, table: t.name });
   }
   const stamped: string[] = [];
   if (tracker.kind === "filename" && !created && source.migrations.length > 0) {
     // One statement whatever the count; a row already stamped is never
-    // rewritten. The pairs travel as one JSON text, since not every transactor
-    // binds arrays.
+    // rewritten. The pairs travel as one text parameter cast to json, since
+    // not every transactor binds arrays, and a json-typed parameter is
+    // re-encoded by bun-sql and postgres-js into a JSON string scalar.
     const done = await tx.unsafe<{ key: string }>(
       `UPDATE ${t.sql} AS t SET sha256 = v.hash
-         FROM json_to_recordset($1::json) AS v(key text, hash text)
+         FROM json_to_recordset($1::text::json) AS v(key text, hash text)
         WHERE t.filename = v.key AND t.sha256 IS NULL
         RETURNING t.filename AS key`,
       [JSON.stringify(source.migrations.map((m) => ({ key: m.key, hash: m.sha256 })))],
@@ -232,8 +287,7 @@ export async function bootstrapTracker(
     for (const m of source.migrations) {
       if (!keys.has(m.key)) continue;
       stamped.push(m.id);
-      emit({ type: "migrate.hash_stamped", source: source.name, id: m.id });
     }
   }
-  return Object.freeze({ created, upgraded, stamped: Object.freeze(stamped) });
+  return Object.freeze({ table: t.name, created, upgraded, stamped: Object.freeze(stamped) });
 }

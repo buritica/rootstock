@@ -1,4 +1,4 @@
-import { sliceRefusals } from "../internal/slice.ts";
+import { own, sliceRefusals } from "../internal/slice.ts";
 import { checkIdentifier } from "./identifier.ts";
 import type { MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
@@ -26,8 +26,10 @@ function tableOptions(
   const refuse = sliceRefusals(fn);
   const given = opts === undefined ? {} : refuse.record("options", opts);
   refuse.refuseUnknownKeys(given, TABLE_KEYS, "options.");
-  const pick = (key: "schema" | "table"): string =>
-    given[key] === undefined ? defaults[key] : checkIdentifier(`${fn}: ${key}`, given[key]);
+  const pick = (key: "schema" | "table"): string => {
+    const value = own(given, key);
+    return value === undefined ? defaults[key] : checkIdentifier(`${fn}: options.${key}`, value);
+  };
   return { schema: pick("schema"), table: pick("table") };
 }
 

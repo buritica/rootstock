@@ -15,6 +15,7 @@ describe("tracker factories", () => {
       table: "schema_migrations",
     });
     expect(Object.isFrozen(drizzleTracker())).toBe(true);
+    expect(Object.isFrozen(filenameTracker({ table: "t" }))).toBe(true);
   });
 
   test("take a schema and table, each defaulting on its own", () => {
@@ -31,8 +32,8 @@ describe("tracker factories", () => {
   });
 
   test.each([
-    [() => drizzleTracker({ schema: "Drizzle" }), /drizzleTracker: schema must match/],
-    [() => filenameTracker({ table: "a;b" }), /filenameTracker: table must match/],
+    [() => drizzleTracker({ schema: "Drizzle" }), /drizzleTracker: options\.schema must match/],
+    [() => filenameTracker({ table: "a;b" }), /filenameTracker: options\.table must match/],
     [() => filenameTracker({ table: "x".repeat(64) }), /at most 63 bytes/],
     [
       () => drizzleTracker({ tabel: "x" } as never),
@@ -43,11 +44,19 @@ describe("tracker factories", () => {
     expect(call).toThrow(message);
   });
 
+  test("an inherited option is ignored, as every slice parser ignores one", () => {
+    expect(filenameTracker(Object.create({ table: "x" }))).toEqual(filenameTracker());
+  });
+
   test("trackerTable resolves rootstock's own into the slice's schema", () => {
     const slice = migrateSlice({ schema: "rs", ahead: "refuse" });
     expect(trackerTable({ kind: "rootstock" }, slice)).toEqual({
       schema: "rs",
       table: "schema_migrations",
+    });
+    expect(trackerTable(filenameTracker({ table: "app_migrations" }), slice)).toEqual({
+      schema: "public",
+      table: "app_migrations",
     });
     expect(trackerTable(drizzleTracker(), slice)).toEqual({
       schema: "drizzle",
