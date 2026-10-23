@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { SourceMigration } from "./sources.ts";
-import { type MigrationStatus, renderMigrationStatus, type SourceStatus } from "./status.ts";
+import { renderMigrationStatus, type SourceStatus, summarizeStatus } from "./status.ts";
 
 const H1 = "1".repeat(64);
 const H2 = "2".repeat(64);
@@ -34,22 +34,7 @@ const pending = (id: string): SourceMigration => ({
   statements: [],
 });
 
-function status(sources: SourceStatus[]): MigrationStatus {
-  const behind = sources.some((s) => s.pending.length > 0);
-  const ahead = sources.some((s) => s.ahead.length > 0);
-  const tampered = sources.some((s) => s.tampered.length > 0);
-  const trackerRot = sources.some(
-    (s) => s.unknown.length > 0 || s.duplicate.length > 0 || s.accepted.some((a) => a.stale),
-  );
-  return {
-    sources,
-    behind,
-    ahead,
-    tampered,
-    trackerRot,
-    red: behind || ahead || tampered || trackerRot,
-  };
-}
+const status = summarizeStatus;
 
 describe("renderMigrationStatus", () => {
   test("golden: every segment, then both remedy lines", () => {

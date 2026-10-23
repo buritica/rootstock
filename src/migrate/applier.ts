@@ -4,11 +4,10 @@ import { fail, failAs, reason, refusalCode } from "./errors.ts";
 import type { MigrationKind } from "./marker.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
-import { acceptanceOf, type SourceState, sourceState } from "./state.ts";
+import { acceptanceOf, readStates, type SourceState } from "./state.ts";
 import type { TrackedSource } from "./tracked.ts";
 import {
   bootstrapTracker,
-  readTracker,
   recordApplied,
   stampHashes,
   trackerName,
@@ -242,15 +241,6 @@ interface Run {
   readonly opts: ApplyOptions;
   readonly texts: Texts;
   readonly emit: (e: MigrateEvent) => void;
-}
-
-async function readStates(transactor: Transactor, run: Run): Promise<SourceState[]> {
-  const states: SourceState[] = [];
-  for (const source of run.sources) {
-    const read = await readTracker(transactor.sql, source.tracker, run.slice);
-    states.push(sourceState(source, read, run.slice.accepted));
-  }
-  return states;
 }
 
 /** Contract §1.4 step 2's refusals, first match wins. */
@@ -517,7 +507,7 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
     for (const e of done.events) emit(e);
   }
 
-  const states = await readStates(transactor, run);
+  const states = await readStates(transactor.sql, run.slice, run.sources);
   refuseIfBlocked(run, states);
   const plan = planOf(run, states);
   emit({
@@ -588,7 +578,7 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
 }
 
 async function verify(transactor: Transactor, run: Run, plan: MigrationPlan): Promise<void> {
-  const after = await readStates(transactor, run);
+  const after = await readStates(transactor.sql, run.slice, run.sources);
   const planned = new Set(plan.apply.map((a) => label(a.source, a.id)));
   const stillPending = after
     .flatMap((s) => s.pending.map((m) => label(m.source, m.id)))

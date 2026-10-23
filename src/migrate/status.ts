@@ -1,9 +1,8 @@
 import type { Sql } from "../db/index.ts";
 import { rootstockSource } from "./apply.ts";
-import type { RootstockMigration } from "./migrations.ts";
-import { rootstockMigrations } from "./migrations.ts";
+import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
-import { type SourceState, sourceState } from "./state.ts";
+import { hasStale, readStates, type SourceState, sourceState } from "./state.ts";
 import type { TrackedSource } from "./tracked.ts";
 import { readTracker } from "./tracker-db.ts";
 import { validateSources } from "./validate.ts";
@@ -39,18 +38,19 @@ export async function migrationStatus(
 ): Promise<MigrationStatus> {
   assertMigrateSlice("migrationStatus", slice);
   validateSources("migrationStatus", slice, sources);
-  const states: SourceStatus[] = [];
-  for (const source of sources) {
-    states.push(sourceState(source, await readTracker(sql, source.tracker, slice), slice.accepted));
-  }
+  return summarizeStatus(await readStates(sql, slice, sources));
+}
+
+/** The red flags of a set of source states (contract §1.3), pure. */
+export function summarizeStatus(states: readonly SourceStatus[]): MigrationStatus {
   const behind = states.some((s) => s.pending.length > 0);
   const ahead = states.some((s) => s.ahead.length > 0);
   const tampered = states.some((s) => s.tampered.length > 0);
   const trackerRot = states.some(
-    (s) => s.unknown.length > 0 || s.duplicate.length > 0 || s.accepted.some((a) => a.stale),
+    (s) => s.unknown.length > 0 || s.duplicate.length > 0 || hasStale(s),
   );
   return Object.freeze({
-    sources: Object.freeze(states),
+    sources: Object.freeze([...states]),
     behind,
     ahead,
     tampered,
@@ -71,8 +71,7 @@ function sourceLine(s: SourceStatus): string {
     );
   if (s.unknown.length > 0) red.push(`unknown rows: ${s.unknown.map((u) => u.rowId).join(", ")}`);
   if (s.duplicate.length > 0) red.push(`duplicate keys: ${s.duplicate.join(", ")}`);
-  const stale = s.accepted.some((a) => a.stale);
-  const parts = red.length === 0 && !stale ? [`ok (${s.applied.length} applied)`] : red;
+  const parts = red.length === 0 && !hasStale(s) ? [`ok (${s.applied.length} applied)`] : red;
   if (s.accepted.length > 0)
     parts.push(
       `accepted: ${s.accepted.map((a) => `${a.id} (${a.reason})${a.stale ? " STALE" : ""}`).join(", ")}`,
@@ -128,11 +127,8 @@ export async function rootstockMigrationStatus(
   const source = rootstockSource(slice);
   const read = await readTracker(sql, source.tracker, slice);
   const s = sourceState(source, read, slice.accepted);
-  const shipped = new Map(rootstockMigrations().map((m) => [m.filename, m]));
-  const pending = s.pending
-    .map((m) => shipped.get(m.id))
-    .filter((m): m is RootstockMigration => m !== undefined)
-    .sort((a, b) => (a.filename < b.filename ? -1 : 1));
+  const ids = new Set(s.pending.map((m) => m.id));
+  const pending = rootstockMigrations().filter((m) => ids.has(m.filename));
   return Object.freeze({
     schema: slice.schema,
     schemaExists: read.schemaExists,

@@ -1,7 +1,8 @@
-import type { AcceptedHash } from "./slice.ts";
+import type { Sql } from "../db/index.ts";
+import type { AcceptedHash, MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import type { TrackedSource } from "./tracked.ts";
-import type { TrackerRead, TrackerRow } from "./tracker-db.ts";
+import { readTracker, type TrackerRead, type TrackerRow } from "./tracker-db.ts";
 
 /**
  * One source compared with its tracker (contract §1.3's vocabulary), pure:
@@ -152,4 +153,20 @@ export function sourceState(
     outOfOrder: Object.freeze(outOfOrder),
     unhashed: Object.freeze(unhashed),
   });
+}
+
+/** Every source's state, read unlocked, one tracker snapshot per source. */
+export async function readStates(
+  sql: Sql,
+  slice: MigrateSlice,
+  sources: readonly TrackedSource[],
+): Promise<SourceState[]> {
+  // Independent reads: a pooled client runs them side by side.
+  const reads = await Promise.all(sources.map((s) => readTracker(sql, s.tracker, slice)));
+  return sources.map((s, i) => sourceState(s, reads[i] as TrackerRead, slice.accepted));
+}
+
+/** An acceptance whose pair no longer matches the row and the file. */
+export function hasStale(s: SourceState): boolean {
+  return s.accepted.some((a) => a.stale);
 }
