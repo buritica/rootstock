@@ -436,15 +436,15 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
         scope.pending.delete(open);
       });
       scope.pending.add(open);
-      const handed = new SavepointPromise<T>((resolve, reject) => {
-        open.then(resolve, reject);
+      const handed: SavepointPromise<T> = new SavepointPromise<T>((resolve, reject) => {
+        open.then(resolve, (err: unknown) => {
+          scope.rejected.push([handed, err]);
+          reject(err);
+        });
       });
       // Handled here without claiming it: a failure nobody takes fails this
       // scope at its exit instead of being reported as unhandled.
       Promise.prototype.then.call(handed, undefined, () => undefined);
-      open.catch((err: unknown) => {
-        scope.rejected.push([handed as SavepointPromise<unknown>, err]);
-      });
       return handed;
     },
   });
