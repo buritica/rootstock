@@ -107,7 +107,22 @@ describe("concurrencySlice", () => {
     [
       "entry that is not an object",
       { widths: { fetch: 4 } },
-      "concurrencySlice: widths.fetch.default is required",
+      "concurrencySlice: widths.fetch must be an object — got 4",
+    ],
+    [
+      "entry that is null",
+      { widths: { fetch: null } },
+      "concurrencySlice: widths.fetch must be an object — got null",
+    ],
+    [
+      "entry that is an array",
+      { widths: { fetch: [1, 2] } },
+      "concurrencySlice: widths.fetch must be an object — got [1,2]",
+    ],
+    [
+      "unknown key before a missing field",
+      { widths: { fetch: { max: 4, wdith: 2 } } },
+      "concurrencySlice: widths.fetch.wdith is not a known key",
     ],
     [
       "unknown key holding a secret-looking value",
@@ -152,7 +167,12 @@ describe("concurrencySlice", () => {
     [
       "default NaN",
       { widths: { fetch: { default: Number.NaN, max: 4 } } },
-      "concurrencySlice: widths.fetch.default must be an integer >= 1 and <= max — got null",
+      "concurrencySlice: widths.fetch.default must be an integer >= 1 and <= max — got NaN",
+    ],
+    [
+      "max Infinity",
+      { widths: { fetch: { default: 1, max: Number.POSITIVE_INFINITY } } },
+      "concurrencySlice: widths.fetch.max must be an integer from 1 to 256 — got Infinity",
     ],
   ])("refuses %s with the exact text", (_label, value, text) => {
     expect(parse(value)).toBe(text);
@@ -185,7 +205,12 @@ describe("width", () => {
     ["zero", 0, 'width: "fetch" requested 0 — must be an integer from 1 to 8'],
     ["negative", -1, 'width: "fetch" requested -1 — must be an integer from 1 to 8'],
     ["fractional", 1.5, 'width: "fetch" requested 1.5 — must be an integer from 1 to 8'],
-    ["NaN", Number.NaN, 'width: "fetch" requested null — must be an integer from 1 to 8'],
+    ["NaN", Number.NaN, 'width: "fetch" requested NaN — must be an integer from 1 to 8'],
+    [
+      "-Infinity",
+      Number.NEGATIVE_INFINITY,
+      'width: "fetch" requested -Infinity — must be an integer from 1 to 8',
+    ],
   ])("refuses a request %s with the exact text", (_label, requested, text) => {
     expect(message(() => width(slice(), "fetch", requested))).toBe(text);
   });

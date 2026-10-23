@@ -25,7 +25,11 @@ export interface TxSql<N = unknown> extends Sql {
    * savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO fails, the driver's error
    * comes back instead and the enclosing transaction is aborted, so it fails
    * too. Await it: the enclosing scope waits for a savepoint left running,
-   * and fails if it fails after that scope's fn settled. Savepoints are a
+   * and fails if it fails after that scope's fn settled. A failed savepoint
+   * whose promise nobody took (no `await`, `then`, `catch`, `finally` or
+   * `Promise.all`-style combinator, before the scope's exit) fails the
+   * enclosing scope with its error too, as a query nobody awaited does: its
+   * work was rolled back and nobody would otherwise know. Savepoints are a
    * stack on one connection, so a second savepoint on the same handle while one is open
    * is refused: rolling back the first would also undo the second. To nest,
    * call `sp.savepoint`. While one is open, a query through the outer handle is
@@ -36,6 +40,76 @@ export interface TxSql<N = unknown> extends Sql {
 }
 
 export type TransactorId = "postgres-js" | "bun-sql" | "drizzle";
+
+/**
+ * The `code` on every error a transactor raises itself, so a caller can tell
+ * them apart without matching message text. Errors from the driver or the
+ * server come back as the same object, untouched, and carry the driver's own
+ * fields; `pgCode` reads their SQLSTATE. None of these codes has a SQLSTATE's
+ * shape, so `pgCode` never mistakes one for a server error.
+ */
+export type TransactorErrorCode =
+  | "ERR_ROOTSTOCK_TX_CLOSED"
+  | "ERR_ROOTSTOCK_TX_OVERLAP"
+  | "ERR_ROOTSTOCK_TX_BUSY"
+  | "ERR_ROOTSTOCK_TX_NOT_SENT"
+  | "ERR_ROOTSTOCK_DRZ_UNDEFINED"
+  | "ERR_ROOTSTOCK_DRZ_SCALAR"
+  | "ERR_ROOTSTOCK_DRZ_PARAM"
+  | "ERR_ROOTSTOCK_DRZ_UNUSED"
+  | "ERR_ROOTSTOCK_DRZ_ARRAY";
+
+/**
+ * Why a transaction or savepoint rolled back and rejected:
+ * - `threw`: fn threw or rejected;
+ * - `query-failed`: fn resolved, but a query through the handle had failed on
+ *   the server (caught by fn, or never awaited);
+ * - `savepoint-exit-failed`: a savepoint's own SAVEPOINT, RELEASE or ROLLBACK TO
+ *   failed, leaving this transaction aborted;
+ * - `savepoint-failed-late`: a savepoint still running when fn settled failed
+ *   afterwards, so nobody in fn could handle it;
+ * - `savepoint-unclaimed`: a savepoint failed and nobody ever awaited it or
+ *   attached a handler to it;
+ * - `driver`: none of the above; the driver's own begin, COMMIT or ROLLBACK
+ *   rejected.
+ */
+export type TransactorRollbackCause =
+  | "threw"
+  | "query-failed"
+  | "savepoint-exit-failed"
+  | "savepoint-failed-late"
+  | "savepoint-unclaimed"
+  | "driver";
+
+export interface TransactorScopeInfo {
+  readonly transactor: TransactorId;
+  readonly scope: "transaction" | "savepoint";
+}
+
+/**
+ * Optional observers. Each is called synchronously; one that throws is
+ * ignored, so an observer can never change what a transaction does. They are
+ * handed no error object and no message: a driver's message can carry bound
+ * values, so only the SQLSTATE is passed on.
+ */
+export interface TransactorHooks {
+  /**
+   * fn settled while queries or a savepoint sent through its handle were still
+   * running, so the scope waits for them before its COMMIT or ROLLBACK. A
+   * savepoint that waits on something released only after the transaction
+   * settles waits forever; this is the one sign of that.
+   */
+  readonly onWait?: (
+    info: TransactorScopeInfo & { readonly queries: number; readonly savepointOpen: boolean },
+  ) => void;
+  /** A transaction or savepoint rolled back and is about to reject. */
+  readonly onRollback?: (
+    info: TransactorScopeInfo & {
+      readonly cause: TransactorRollbackCause;
+      readonly code: string | undefined;
+    },
+  ) => void;
+}
 
 export interface Transactor<N = unknown> {
   readonly id: TransactorId;
@@ -59,7 +133,8 @@ export interface Transactor<N = unknown> {
    * a savepoint whose own SAVEPOINT, RELEASE or ROLLBACK TO failed on the
    * server rejects `begin` the same way. A query nobody awaited still runs,
    * and `begin` waits for it and fails with it like any other, as it does
-   * with a savepoint that fails after fn settled. Queries sent
+   * with a savepoint that fails after fn settled or that nobody took. The
+   * optional hooks report why a scope rolled back and when one is waiting. Queries sent
    * through `native`, and drizzle's refusals (a value before sending, a result
    * that is not rows after it), are not tracked. `tx` is valid only until fn
    * settles; a query through it afterwards, even one racing the driver's
@@ -116,6 +191,7 @@ interface Driver {
   surfaceOf: (native: unknown) => Sql;
   /** How a driver object nests a savepoint. */
   savepointOf: (native: unknown) => Nest;
+  hooks: TransactorHooks;
 }
 
 /** One transaction or savepoint scope, as its handle sees it. */
@@ -126,6 +202,10 @@ interface Scope {
   childOpen: boolean;
   /** The first server error a query through this handle rejected with. */
   failed?: unknown;
+  /** Why `failed` fails the scope. */
+  failedBy?: TransactorRollbackCause;
+  /** Savepoints started through this handle that rejected, with their errors. */
+  rejected: Array<readonly [SavepointPromise<unknown>, unknown]>;
   /** Queries and savepoints sent through this handle that have not settled. */
   pending: Set<PromiseLike<unknown>>;
   /** Every error fn threw or a query through the handle rejected with. */
@@ -160,7 +240,14 @@ function enter<N, T>(
     parent,
     pending: new Set(),
     seen: new Set(),
+    rejected: [],
   };
+  const where: TransactorScopeInfo = {
+    transactor: driver.id,
+    scope: parent === undefined ? "transaction" : "savepoint",
+  };
+  // Set when this scope itself rejects from inside the driver's callback.
+  let cause: TransactorRollbackCause | undefined;
   const close = () => {
     scope.closed = true;
   };
@@ -172,11 +259,25 @@ function enter<N, T>(
         value = await fn(txHandle<N>(driver, native, scope), native as N);
       } catch (reason) {
         scope.seen.add(reason);
+        cause = "threw";
         throw reason;
       } finally {
         close();
+        if (scope.pending.size > 0) {
+          const savepointOpen = scope.childOpen;
+          observe(driver.hooks.onWait, {
+            ...where,
+            queries: scope.pending.size - (savepointOpen ? 1 : 0),
+            savepointOpen,
+          });
+        }
         // Closed, so nothing joins `pending` while this waits.
         await Promise.allSettled(scope.pending);
+        // A savepoint that failed with nobody holding its promise would
+        // otherwise commit this scope without its work, and say nothing.
+        for (const [sp, err] of scope.rejected) {
+          if (!sp.claimed) fail(scope, err, "savepoint-unclaimed");
+        }
       }
       // Postgres aborts a transaction on any server error, and one driver then
       // answers COMMIT with a silent rollback. Throwing here makes every driver
@@ -184,6 +285,7 @@ function enter<N, T>(
       // error, so a savepoint's parent does not count it as an exit failure.
       if (scope.failed !== undefined) {
         scope.seen.add(scope.failed);
+        cause = scope.failedBy;
         throw scope.failed;
       }
       return value;
@@ -191,6 +293,7 @@ function enter<N, T>(
   } catch (err) {
     // A driver entry that throws instead of rejecting.
     close();
+    observe(driver.hooks.onRollback, { ...where, cause: "driver", code: pgCode(err) });
     return Promise.reject(err);
   }
   return Promise.resolve(settled as PromiseLike<T>)
@@ -201,10 +304,13 @@ function enter<N, T>(
       // those statements fail with count, and only when fn's scope did not
       // already see the error: postgres.js rejects a savepoint that rolled
       // back cleanly with the first error any query in it hit, `native` too.
-      if (parent !== undefined && isExitFailure(err) && !scope.seen.has(err)) track(parent, err);
+      if (parent !== undefined && isExitFailure(err) && !scope.seen.has(err)) {
+        track(parent, err, "savepoint-exit-failed");
+      }
       // A savepoint that failed after its parent's fn settled: nobody in that
       // fn could handle it, so its work is not committed without it.
-      if (parent?.closed && parent.failed === undefined) parent.failed = err;
+      if (parent?.closed) fail(parent, err, "savepoint-failed-late");
+      observe(driver.hooks.onRollback, { ...where, cause: cause ?? "driver", code: pgCode(err) });
       throw err;
     });
 }
@@ -215,11 +321,54 @@ function isExitFailure(err: unknown): boolean {
   return code === "25P02" || code === "3B001" || code?.startsWith("08") === true;
 }
 
+/** Fails a scope with the first error it is handed; later ones do not replace it. */
+function fail(scope: Scope, err: unknown, by: TransactorRollbackCause): void {
+  if (scope.failed !== undefined) return;
+  scope.failed = err;
+  scope.failedBy = by;
+}
+
 /** Records the first server error on a scope; a refusal raised before sending carries no code. */
-function track(scope: Scope, err: unknown): void {
+function track(scope: Scope, err: unknown, by: TransactorRollbackCause): void {
   // pgCode also matches a few socket errors (EPIPE); those leave the
   // transaction dead anyway, so tracking them is harmless.
-  if (scope.failed === undefined && pgCode(err) !== undefined) scope.failed = err;
+  if (pgCode(err) !== undefined) fail(scope, err, by);
+}
+
+/** Calls an observer, if there is one; what it throws is dropped. */
+function observe<I>(hook: ((info: I) => void) | undefined, info: I): void {
+  try {
+    hook?.(info);
+  } catch {
+    // An observer must never change what the transaction does.
+  }
+}
+
+/** An error the transactor raises itself, carrying its code. */
+function refusal(code: TransactorErrorCode, message: string): Error {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * A savepoint's promise, which notes whether anyone took it. `await` on a
+ * subclass goes through `then`, where on a plain Promise it does not, and so
+ * do `catch`, `finally` and `Promise.all`. Its derived promises are plain.
+ */
+class SavepointPromise<T> extends Promise<T> {
+  claimed = false;
+
+  static override get [Symbol.species](): PromiseConstructor {
+    return Promise;
+  }
+
+  // biome-ignore lint/suspicious/noThenProperty: the point is to see who subscribes
+  override then<A = T, B = never>(
+    onFulfilled?: ((value: T) => A | PromiseLike<A>) | null,
+    onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null,
+  ): Promise<A | B> {
+    this.claimed = true;
+    return super.then(onFulfilled, onRejected);
+  }
 }
 
 const BUSY =
@@ -231,14 +380,17 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
   // Savepoints are a stack on one connection. While one is open, a query
   // through this handle would run inside it and roll back with it, and a
   // second savepoint's rollback would also undo the first; both are refused.
-  const refusal = (whileChildOpen: string): Error | undefined =>
+  const refusedNow = (whileChildOpen: TransactorErrorCode, message: string): Error | undefined =>
     isClosed(scope)
-      ? new Error(`${id}: this transaction has already settled — its handle can no longer be used`)
+      ? refusal(
+          "ERR_ROOTSTOCK_TX_CLOSED",
+          `${id}: this transaction has already settled — its handle can no longer be used`,
+        )
       : scope.childOpen
-        ? new Error(`${id}: ${whileChildOpen}`)
+        ? refusal(whileChildOpen, `${id}: ${message}`)
         : undefined;
   const send = <R>(run: () => Promise<R>): Promise<R> => {
-    const refused = refusal(BUSY);
+    const refused = refusedNow("ERR_ROOTSTOCK_TX_BUSY", BUSY);
     if (refused) return Promise.reject(refused);
     // Started now, through the driver's own `then`, so it runs inside this
     // scope whoever awaits it, and the scope waits for it before its exit. A
@@ -246,7 +398,8 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
     // here rather than coming back a rejection nobody handles.
     const query = run();
     if (typeof query?.then !== "function") {
-      throw new Error(
+      throw refusal(
+        "ERR_ROOTSTOCK_TX_NOT_SENT",
         `${id}: a transaction handle sends a tagged template or unsafe() at once — driver helpers, fragments and query methods go through native`,
       );
     }
@@ -258,7 +411,7 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
       (err: unknown) => {
         scope.pending.delete(settled);
         scope.seen.add(err);
-        track(scope, err);
+        track(scope, err, "query-failed");
         throw err;
       },
     );
@@ -271,7 +424,8 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
   return surface((strings, ...values) => send(() => base(strings, ...values)), {
     unsafe: (query: string, params?: readonly unknown[]) => send(() => base.unsafe(query, params)),
     savepoint: <T>(fn: (sp: TxSql<N>, native: N) => Promise<T>): Promise<T> => {
-      const refused = refusal(
+      const refused = refusedNow(
+        "ERR_ROOTSTOCK_TX_OVERLAP",
         "a savepoint is already open on this transaction — await it before starting another",
       );
       if (refused) return Promise.reject(refused);
@@ -282,7 +436,16 @@ function txHandle<N>(driver: Driver, native: unknown, scope: Scope): TxSql<N> {
         scope.pending.delete(open);
       });
       scope.pending.add(open);
-      return open;
+      const handed: SavepointPromise<T> = new SavepointPromise<T>((resolve, reject) => {
+        open.then(resolve, (err: unknown) => {
+          scope.rejected.push([handed, err]);
+          reject(err);
+        });
+      });
+      // Handled here without claiming it: a failure nobody takes fails this
+      // scope at its exit instead of being reported as unhandled.
+      Promise.prototype.then.call(handed, undefined, () => undefined);
+      return handed;
     },
   });
 }
@@ -306,11 +469,13 @@ function tagSurface(native: unknown): Sql {
 function tagTransactor<N>(
   id: Exclude<TransactorId, "drizzle">,
   client: TagDriver & { begin: Nest },
+  hooks: TransactorHooks = {},
 ): Transactor<N> {
   const driver: Driver = {
     id,
     surfaceOf: tagSurface,
     savepointOf: (native) => (cb) => (native as { savepoint: Nest }).savepoint(cb),
+    hooks,
   };
   return Object.freeze({
     id,
@@ -329,8 +494,11 @@ function tagTransactor<N>(
  * Binding `undefined` is refused by the driver; pass `null`. The id is the
  * factory's, not checked against the client: the client types are structural.
  */
-export function postgresJsTransactor<N = unknown>(client: PostgresJsClientLike): Transactor<N> {
-  return tagTransactor<N>("postgres-js", client);
+export function postgresJsTransactor<N = unknown>(
+  client: PostgresJsClientLike,
+  hooks?: TransactorHooks,
+): Transactor<N> {
+  return tagTransactor<N>("postgres-js", client, hooks);
 }
 
 /**
@@ -339,8 +507,11 @@ export function postgresJsTransactor<N = unknown>(client: PostgresJsClientLike):
  * is the factory's, not checked against the client: the client types are
  * structural.
  */
-export function bunSqlTransactor<N = unknown>(client: BunSqlClientLike): Transactor<N> {
-  return tagTransactor<N>("bun-sql", client);
+export function bunSqlTransactor<N = unknown>(
+  client: BunSqlClientLike,
+  hooks?: TransactorHooks,
+): Transactor<N> {
+  return tagTransactor<N>("bun-sql", client, hooks);
 }
 
 interface DrizzleExecutor {
@@ -367,7 +538,8 @@ function drizzleTemplate(
     }
     const n = Number(part);
     if (n > params.length) {
-      throw new Error(
+      throw refusal(
+        "ERR_ROOTSTOCK_DRZ_PARAM",
         `drizzleTransactor: unsafe() query references $${n} but ${params.length} parameter(s) were passed`,
       );
     }
@@ -376,7 +548,8 @@ function drizzleTemplate(
   });
   for (let n = 1; n <= params.length; n += 1) {
     if (!referenced.has(n)) {
-      throw new Error(
+      throw refusal(
+        "ERR_ROOTSTOCK_DRZ_UNUSED",
         `drizzleTransactor: unsafe() parameter ${n} is never referenced in the query`,
       );
     }
@@ -414,7 +587,10 @@ function refuseUnbindable(values: readonly unknown[]): readonly unknown[] {
   for (let i = 0; i < values.length; i += 1) {
     const value = values[i];
     if (value === undefined) {
-      throw new Error(`drizzleTransactor: value ${i + 1} is undefined — bind null instead`);
+      throw refusal(
+        "ERR_ROOTSTOCK_DRZ_UNDEFINED",
+        `drizzleTransactor: value ${i + 1} is undefined — bind null instead`,
+      );
     }
     if (!isScalar(value)) {
       const kind = Array.isArray(value)
@@ -422,7 +598,10 @@ function refuseUnbindable(values: readonly unknown[]): readonly unknown[] {
         : typeof (value as { getSQL?: unknown }).getSQL === "function"
           ? "sql"
           : typeof value;
-      throw new Error(`drizzleTransactor: value ${i + 1} is not a bindable scalar — got ${kind}`);
+      throw refusal(
+        "ERR_ROOTSTOCK_DRZ_SCALAR",
+        `drizzleTransactor: value ${i + 1} is not a bindable scalar — got ${kind}`,
+      );
     }
   }
   return values;
@@ -434,7 +613,8 @@ function drizzleSurface(x: DrizzleExecutor, sql: DrizzleSqlTagLike): Sql {
     if (!Array.isArray(result)) {
       const kind =
         typeof result === "object" && result !== null ? "an object without rows" : typeof result;
-      throw new Error(
+      throw refusal(
+        "ERR_ROOTSTOCK_DRZ_ARRAY",
         `drizzleTransactor: execute() returned ${kind}, not an array of rows — only drivers whose execute() resolves to a row array are supported`,
       );
     }
@@ -470,11 +650,13 @@ function drizzleSurface(x: DrizzleExecutor, sql: DrizzleSqlTagLike): Sql {
 export function drizzleTransactor<N = unknown>(
   db: DrizzleDbLike,
   deps: { sql: DrizzleSqlTagLike },
+  hooks: TransactorHooks = {},
 ): Transactor<N> {
   const driver: Driver = {
     id: "drizzle",
     surfaceOf: (native) => drizzleSurface(native as DrizzleExecutor, deps.sql),
     savepointOf: (native) => (cb) => (native as DrizzleExecutor).transaction(cb),
+    hooks,
   };
   return Object.freeze({
     id: "drizzle" as const,

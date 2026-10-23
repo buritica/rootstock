@@ -386,6 +386,39 @@ describe("begin", () => {
     );
   });
 
+  test("a savepoint nobody took that failed rolls back begin and rejects with its error", async () => {
+    await withTransactor((t) =>
+      withTable(t, "id int primary key", async (table) => {
+        const boom = new Error("lost savepoint work");
+        const err = await rejection(
+          t.begin(async (tx) => {
+            await insertId(tx, table, 1);
+            void tx.savepoint(async (sp) => {
+              await insertId(sp, table, 2);
+              throw boom;
+            });
+            // fn keeps going and never takes the savepoint's promise.
+            await new Promise((r) => setTimeout(r, 50));
+            return "resolved";
+          }),
+        );
+        expect(err).toBe(boom);
+        expect(await ids(t.sql, table)).toEqual([]);
+        // Taken and caught, the same failure is fn's to recover from.
+        await t.begin(async (tx) => {
+          await insertId(tx, table, 1);
+          const sp = tx.savepoint(async (inner) => {
+            await insertId(inner, table, 2);
+            throw boom;
+          });
+          await new Promise((r) => setTimeout(r, 50));
+          await sp.catch(() => undefined);
+        });
+        expect(await ids(t.sql, table)).toEqual([1]);
+      }),
+    );
+  });
+
   test("a query made in a transaction runs in it, whenever and however it is awaited", async () => {
     await withTransactor((t) =>
       withTable(t, "id int primary key", async (table) => {

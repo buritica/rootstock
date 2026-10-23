@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { pgCode } from "./pg-code.ts";
 import {
   bunSqlTransactor,
   type DrizzleSqlTagLike,
   drizzleTransactor,
   postgresJsTransactor,
+  type TransactorHooks,
   type TxSql,
 } from "./transactor.ts";
 
@@ -775,6 +777,284 @@ describe("savepoints, helpers and failures after fn settled", () => {
         );
         return undefined;
       });
+    });
+  }
+});
+
+describe("refusal codes", () => {
+  for (const [id, make] of FACTORIES) {
+    test(`${id}: every refusal the transactor raises carries its code, and pgCode ignores it`, async () => {
+      const codes: unknown[] = [];
+      const codeOf = async (run: () => Promise<unknown>) => {
+        const err = await run().catch((e: unknown) => e);
+        codes.push((err as { code?: unknown }).code);
+        expect(pgCode(err)).toBeUndefined();
+      };
+      let leaked: TxSql | undefined;
+      await make([]).begin(async (tx) => {
+        leaked = tx;
+        const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+        const open = tx.savepoint(() => gate);
+        await codeOf(() => tx.savepoint(async () => 1));
+        await codeOf(() => tx.unsafe("select 1"));
+        release();
+        await open;
+      });
+      await codeOf(() => (leaked as TxSql).unsafe("select 1"));
+      expect(codes).toEqual([
+        "ERR_ROOTSTOCK_TX_OVERLAP",
+        "ERR_ROOTSTOCK_TX_BUSY",
+        "ERR_ROOTSTOCK_TX_CLOSED",
+      ]);
+    });
+  }
+
+  test("a call the driver does not send carries ERR_ROOTSTOCK_TX_NOT_SENT", async () => {
+    const client = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) =>
+        fn(Object.assign(() => ({}), { unsafe: () => ({}) })),
+    });
+    await postgresJsTransactor(client).begin(async (tx) => {
+      let code: unknown;
+      try {
+        void tx`select 1`;
+      } catch (err) {
+        code = (err as { code?: unknown }).code;
+      }
+      expect(code).toBe("ERR_ROOTSTOCK_TX_NOT_SENT");
+    });
+  });
+
+  test("drizzle's own refusals carry theirs", async () => {
+    const codeOf = async (run: () => Promise<unknown>) =>
+      ((await run().catch((e: unknown) => e)) as { code?: unknown }).code;
+    const t = drizzleTransactor(drizzleDouble("db", []), { sql: drizzleSqlDouble });
+    expect(await codeOf(() => t.sql`select ${undefined}`)).toBe("ERR_ROOTSTOCK_DRZ_UNDEFINED");
+    expect(await codeOf(() => t.sql`select ${[1]}`)).toBe("ERR_ROOTSTOCK_DRZ_SCALAR");
+    expect(await codeOf(() => t.sql.unsafe("select $2", [1]))).toBe("ERR_ROOTSTOCK_DRZ_PARAM");
+    expect(await codeOf(() => t.sql.unsafe("select 1", [1]))).toBe("ERR_ROOTSTOCK_DRZ_UNUSED");
+    const odd = drizzleTransactor(drizzleDouble("db", [], { result: { rows: [] } }), {
+      sql: drizzleSqlDouble,
+    });
+    expect(await codeOf(() => odd.sql`select 1`)).toBe("ERR_ROOTSTOCK_DRZ_ARRAY");
+  });
+});
+
+describe("hooks", () => {
+  type Seen = Array<[string, Record<string, unknown>]>;
+  const hooksInto = (seen: Seen): TransactorHooks => ({
+    onWait: (info) => seen.push(["wait", { ...info }]),
+    onRollback: (info) => seen.push(["rollback", { ...info }]),
+  });
+  const MAKERS = [
+    ["postgres-js", (h: TransactorHooks) => postgresJsTransactor(tagDouble("db", []), h)],
+    ["bun-sql", (h: TransactorHooks) => bunSqlTransactor(tagDouble("db", []), h)],
+    [
+      "drizzle",
+      (h: TransactorHooks) =>
+        drizzleTransactor(drizzleDouble("db", []), { sql: drizzleSqlDouble }, h),
+    ],
+  ] as const;
+
+  for (const [id, make] of MAKERS) {
+    describe(id, () => {
+      test("a committed transaction reports nothing", async () => {
+        const seen: Seen = [];
+        await make(hooksInto(seen)).begin(async (tx) => {
+          await tx.savepoint((sp) => sp.unsafe("select 1"));
+        });
+        expect(seen).toEqual([]);
+      });
+
+      test("fn that threw reports cause threw, on the savepoint and the transaction", async () => {
+        const seen: Seen = [];
+        const boom = new Error("boom");
+        await make(hooksInto(seen))
+          .begin(async (tx) => {
+            await tx.savepoint(async () => {
+              throw boom;
+            });
+          })
+          .catch(() => undefined);
+        expect(seen).toEqual([
+          ["rollback", { transactor: id, scope: "savepoint", cause: "threw", code: undefined }],
+          ["rollback", { transactor: id, scope: "transaction", cause: "threw", code: undefined }],
+        ]);
+      });
+
+      test("a server error fn caught reports query-failed with its SQLSTATE", async () => {
+        const seen: Seen = [];
+        await make(hooksInto(seen))
+          .begin(async (tx) => {
+            await tx.unsafe(FAIL).catch(() => undefined);
+          })
+          .catch(() => undefined);
+        expect(seen).toEqual([
+          [
+            "rollback",
+            { transactor: id, scope: "transaction", cause: "query-failed", code: "23505" },
+          ],
+        ]);
+      });
+
+      test("fn settling with a savepoint still open reports the wait", async () => {
+        const seen: Seen = [];
+        const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+        const done = make(hooksInto(seen)).begin(async (tx) => {
+          void tx.savepoint(() => gate);
+          return "returned";
+        });
+        await new Promise((r) => setTimeout(r, 1));
+        expect(seen).toEqual([
+          ["wait", { transactor: id, scope: "transaction", queries: 0, savepointOpen: true }],
+        ]);
+        release();
+        expect(await done).toBe("returned");
+      });
+
+      test("an observer that throws changes nothing", async () => {
+        const angry: TransactorHooks = {
+          onWait: () => {
+            throw new Error("observer");
+          },
+          onRollback: () => {
+            throw new Error("observer");
+          },
+        };
+        const boom = new Error("boom");
+        const err = await make(angry)
+          .begin(async () => {
+            throw boom;
+          })
+          .catch((e: unknown) => e);
+        expect(err).toBe(boom);
+      });
+    });
+  }
+
+  test("a savepoint exit failure, a late savepoint and the driver each name their cause", async () => {
+    const exitError = Object.assign(new Error("release failed"), { code: "25P02" });
+    const exitClient = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) =>
+        fn(
+          Object.assign(tagDouble("db.tx", []), {
+            savepoint: async (cb: (sp: unknown) => unknown) => {
+              await cb(tagDouble("db.tx.sp", []));
+              throw exitError;
+            },
+          }),
+        ),
+    });
+    const seen: Seen = [];
+    await postgresJsTransactor(exitClient, hooksInto(seen))
+      .begin(async (tx) => {
+        await tx.savepoint(async () => 1).catch(() => undefined);
+      })
+      .catch(() => undefined);
+    expect(seen.at(-1)).toEqual([
+      "rollback",
+      {
+        transactor: "postgres-js",
+        scope: "transaction",
+        cause: "savepoint-exit-failed",
+        code: "25P02",
+      },
+    ]);
+
+    const late: Seen = [];
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+    const done = postgresJsTransactor(tagDouble("db", []), hooksInto(late)).begin(async (tx) => {
+      void tx.savepoint(async (sp) => {
+        await gate;
+        return sp.unsafe("select 1");
+      });
+    });
+    await new Promise((r) => setTimeout(r, 1));
+    release();
+    await done.catch(() => undefined);
+    expect(late.at(-1)?.[1].cause).toBe("savepoint-failed-late");
+
+    const commitError = Object.assign(new Error("commit failed"), { code: "40001" });
+    const driverSeen: Seen = [];
+    const committing = Object.assign(tagDouble("db", []), {
+      begin: async (fn: (tx: unknown) => unknown) => {
+        await fn(tagDouble("db.tx", []));
+        throw commitError;
+      },
+    });
+    await postgresJsTransactor(committing, hooksInto(driverSeen))
+      .begin(async () => 1)
+      .catch(() => undefined);
+    expect(driverSeen).toEqual([
+      [
+        "rollback",
+        { transactor: "postgres-js", scope: "transaction", cause: "driver", code: "40001" },
+      ],
+    ]);
+  });
+});
+
+describe("a savepoint nobody takes", () => {
+  const unhandled: unknown[] = [];
+  const listen = (reason: unknown) => unhandled.push(reason);
+
+  for (const [id, make] of FACTORIES) {
+    test(`${id}: one that fails while fn runs fails begin, and is not reported unhandled`, async () => {
+      process.on("unhandledRejection", listen);
+      try {
+        unhandled.length = 0;
+        const boom = new Error("lost work");
+        const err = await make([])
+          .begin(async (tx) => {
+            void tx.savepoint(async () => {
+              throw boom;
+            });
+            // fn keeps running after the savepoint failed, and never takes it.
+            await new Promise((r) => setTimeout(r, 10));
+            return "resolved";
+          })
+          .catch((e: unknown) => e);
+        await new Promise((r) => setTimeout(r, 10));
+        expect(err).toBe(boom);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", listen);
+      }
+    });
+
+    test(`${id}: one fn takes later, by await or catch, is fn's to recover`, async () => {
+      const t = make([]);
+      const awaited = await t.begin(async (tx) => {
+        const sp = tx.savepoint(async () => {
+          throw new Error("recovered");
+        });
+        await new Promise((r) => setTimeout(r, 10));
+        try {
+          await sp;
+        } catch {
+          return "committed";
+        }
+        return "not reached";
+      });
+      expect(awaited).toBe("committed");
+      const caught = await t.begin(async (tx) => {
+        await tx
+          .savepoint(async () => {
+            throw new Error("recovered");
+          })
+          .catch(() => undefined);
+        return "committed";
+      });
+      expect(caught).toBe("committed");
+      const all = await t.begin(async (tx) => {
+        const results = await Promise.allSettled([
+          tx.savepoint(async () => {
+            throw new Error("recovered");
+          }),
+        ]);
+        return results[0]?.status;
+      });
+      expect(all).toBe("rejected");
     });
   }
 });

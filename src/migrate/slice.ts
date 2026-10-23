@@ -1,4 +1,5 @@
-import { checkIdentifier, q } from "./identifier.ts";
+import { type Brand, isRecord, own, sliceBrand, sliceRefusals } from "../internal/slice.ts";
+import { checkIdentifier } from "./identifier.ts";
 
 export interface MigrateSliceInput {
   /** Identifier rule of `db`'s `quoteIdentifier`. Default "rootstock". */
@@ -14,31 +15,26 @@ export interface MigrateSlice {
   readonly ahead: "refuse" | "allow";
 }
 
-const KNOWN_KEYS = new Set(["schema", "ahead"]);
-const BUILT = new WeakSet<object>();
+const KNOWN_KEYS: ReadonlySet<string> = new Set(["schema", "ahead"]);
+const refuse = sliceRefusals("migrateSlice");
+const brand: Brand<MigrateSlice> = sliceBrand("MigrateSlice", "migrateSlice");
 
 /** Parses the migrate slice into a frozen, branded object. */
 export function migrateSlice(input: MigrateSliceInput): MigrateSlice {
-  for (const key of Object.keys(input)) {
-    if (!KNOWN_KEYS.has(key)) throw new Error(`migrateSlice: ${key} is not a known key`);
-  }
+  const fields: Record<string, unknown> = isRecord(input) ? input : {};
+  refuse.refuseUnknownKeys(fields, KNOWN_KEYS, "");
+  const rawSchema = own(fields, "schema");
   const schema =
-    input.schema === undefined
-      ? "rootstock"
-      : checkIdentifier("migrateSlice: schema", input.schema);
-  if (input.ahead === undefined) throw new Error("migrateSlice: ahead is required");
-  if (input.ahead !== "refuse" && input.ahead !== "allow") {
-    throw new Error(`migrateSlice: ahead must be "refuse" or "allow" — got ${q(input.ahead)}`);
+    rawSchema === undefined ? "rootstock" : checkIdentifier("migrateSlice: schema", rawSchema);
+  const ahead = own(fields, "ahead");
+  if (ahead === undefined) throw refuse.required("ahead");
+  if (ahead !== "refuse" && ahead !== "allow") {
+    throw refuse.invalid("ahead", '"refuse" or "allow"', ahead);
   }
-  const slice = Object.freeze({ schema, ahead: input.ahead }) as MigrateSlice;
-  BUILT.add(slice);
-  return slice;
+  return brand.mark(Object.freeze({ schema, ahead }) as MigrateSlice);
 }
 
 /** Refuses any slice `migrateSlice` did not return, naming the caller. */
 export function assertMigrateSlice(fn: string, slice: unknown): asserts slice is MigrateSlice {
-  if (typeof slice === "object" && slice !== null && BUILT.has(slice)) return;
-  throw new Error(
-    `${fn}: expected a MigrateSlice built by migrateSlice() — got an object that parser did not return`,
-  );
+  brand.assert(fn, slice);
 }

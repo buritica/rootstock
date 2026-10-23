@@ -1,4 +1,4 @@
-import { q } from "./quote-value.ts";
+import { q } from "../internal/slice.ts";
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 // Postgres truncates a longer identifier with only a NOTICE. The rule is
