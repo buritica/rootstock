@@ -105,9 +105,15 @@ describe("composition (B-O3)", () => {
     const v1 = read(folder("journal", { ...files, "meta/_journal.json": journal(tags) }));
 
     // A fresh database carries an unmarked baselined file: deploy refuses it,
-    // the manual entry applies it on purpose.
-    expect((await cli(["apply", "--deploy"], slice, v1)).code).toBe(1);
-    expect((await cli(["apply", "--manual", "--allow-heavy"], slice, v1)).code).toBe(0);
+    // and only it (the legacy-marked file reads as additive). The manual entry
+    // applies a baselined file without --allow-heavy.
+    expect(await cli(["apply", "--deploy"], slice, v1)).toEqual({
+      code: 1,
+      lines: [
+        "rootstock migrate: deploy refuses pending migration(s) that are heavy or unmarked: app/0000_old (unmarked (baselined)) — apply them by hand (bun run migrate apply --manual), then redeploy",
+      ],
+    });
+    expect((await cli(["apply", "--manual"], slice, v1)).code).toBe(0);
     expect(await cli(["status"], slice, v1)).toEqual({
       code: 0,
       lines: ["rootstock: ok (1 applied)", "app: ok (3 applied)"],
@@ -187,7 +193,10 @@ describe("composition (B-O3)", () => {
     });
   });
 
-  test("two databases: each run on its own, the worse code wins", async () => {
+  // Two slices on one connection: the stricter case for lock and tracker
+  // collisions. Combining the codes is the caller's loop; this shows each run
+  // is independent, with the refusing one first.
+  test("two databases, each run on its own: one refusing leaves the other to apply", async () => {
     const one = { slice: migrateSlice({ schema: schema() }), f: schema() };
     const two = { slice: migrateSlice({ schema: schema() }), f: schema() };
     const sourcesOf = (w: typeof one, heavy: boolean): TrackedSource[] => [
@@ -205,13 +214,19 @@ describe("composition (B-O3)", () => {
     ];
     await sql.unsafe(`CREATE SCHEMA "${one.f}"`);
     await sql.unsafe(`CREATE SCHEMA "${two.f}"`);
-    const codes = [
-      (await cli(["apply", "--deploy"], one.slice, sourcesOf(one, false))).code,
-      (await cli(["apply", "--deploy"], two.slice, sourcesOf(two, true))).code,
-    ];
-    expect(codes).toEqual([0, 1]);
-    expect(Math.max(...codes)).toBe(1);
+    const refused = await cli(["apply", "--deploy"], two.slice, sourcesOf(two, true));
+    expect(refused.code).toBe(1);
+    expect(refused.lines[0]).toContain("auth/20261020000000_t.sql (heavy)");
+    // Refused before any file ran: not even rootstock's own tracker exists.
+    const [tracker] = await sql.unsafe<{ name: string | null }>(
+      "select to_regclass($1::text)::text as name",
+      [`"${two.slice.schema}".schema_migrations`],
+    );
+    expect(tracker?.name).toBeNull();
+    expect((await cli(["apply", "--deploy"], one.slice, sourcesOf(one, false))).code).toBe(0);
     expect((await cli(["status"], one.slice, sourcesOf(one, false))).code).toBe(0);
-    expect((await cli(["status"], two.slice, sourcesOf(two, true))).code).toBe(1);
+    expect((await cli(["status"], two.slice, sourcesOf(two, true))).lines).toContain(
+      "fix: bun run migrate apply --manual",
+    );
   });
 });
