@@ -107,15 +107,6 @@ describe("assertThrowawayDb", () => {
     );
   });
 
-  test("unsafeAllow skips even an unparseable URL, and says so", () => {
-    const lines: string[] = [];
-    assertThrowawayDb("not a url", {
-      denyNames: [],
-      unsafeAllow: { reason: "r", log: (m) => lines.push(m) },
-    });
-    expect(lines).toEqual(['rootstock migrate: assertThrowawayDb skipped for "?"/"?" — r']);
-  });
-
   test("allowHosts replaces the default", () => {
     expect(() =>
       assertThrowawayDb("postgres://u@pg/app_test", { ...DENY, allowHosts: ["pg"] }),
@@ -134,18 +125,31 @@ describe("assertThrowawayDb", () => {
     },
   );
 
-  test("unsafeAllow skips the refusal and logs on every call", () => {
+  test("unsafeAllow skips the host check and logs on every call", () => {
     const lines: string[] = [];
     const opts = {
       ...DENY,
       unsafeAllow: { reason: "shared CI database", log: (m: string) => lines.push(m) },
     };
-    assertThrowawayDb("postgres://u:secret@remotehost/app_prod", opts);
+    assertThrowawayDb("postgres://u:secret@remotehost/app_ci", opts);
     assertThrowawayDb("postgres://u@localhost/app_test", opts);
     expect(lines).toEqual([
-      'rootstock migrate: assertThrowawayDb skipped for "remotehost"/"app_prod" — shared CI database',
-      'rootstock migrate: assertThrowawayDb skipped for "localhost"/"app_test" — shared CI database',
+      'rootstock migrate: assertThrowawayDb skipped the host check for "remotehost"/"app_ci" — shared CI database',
+      'rootstock migrate: assertThrowawayDb skipped the host check for "localhost"/"app_test" — shared CI database',
     ]);
+  });
+
+  test("unsafeAllow never lets through a denied name, a missing database or an unreadable URL", () => {
+    const lines: string[] = [];
+    const opts = { ...DENY, unsafeAllow: { reason: "r", log: (m: string) => lines.push(m) } };
+    expect(() => assertThrowawayDb("postgres://u@remotehost/app_prod", opts)).toThrow(
+      /is in denyNames/,
+    );
+    expect(() => assertThrowawayDb("postgres://app_prod@remotehost", opts)).toThrow(
+      /names no database/,
+    );
+    expect(() => assertThrowawayDb("not a url", opts)).toThrow(/that parses/);
+    expect(lines).toEqual([]);
   });
 
   test("refuses malformed options", () => {

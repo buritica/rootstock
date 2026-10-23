@@ -42,11 +42,15 @@ const tracked = (migrations: readonly SourceMigration[]): TrackedSource => ({
     : { kind: "drizzle", schema: "drizzle", table: "__drizzle_migrations" },
 });
 
-const check = (
+/** Findings without their prose, for asserting which rules fired. */
+const bare = (out: readonly OrderFinding[]) =>
+  out.map(({ source, id, problem }) => ({ source, id, problem }));
+
+const check = async (
   branch: readonly SourceMigration[],
   main: readonly SourceMigration[],
   slice = SLICE,
-) => checkMigrationOrder(slice, [tracked(branch)], async () => main, NOW);
+) => bare(await checkMigrationOrder(slice, [tracked(branch)], async () => main, NOW));
 
 const MAIN = { "20261001000000_a.sql": A, "20261002000000_b.sql": B };
 
@@ -250,14 +254,88 @@ describe("checkMigrationOrder", () => {
     ).rejects.toThrow(/checkMigrationOrder: expected a MigrateSlice/);
   });
 
+  test("deleted-on-branch: a main file gone from the branch, or renamed without renames.json", async () => {
+    expect(await check(sql({ "20261001000000_a.sql": A }), sql(MAIN))).toEqual([
+      { source: "app", id: "20261002000000_b.sql", problem: "deleted-on-branch" },
+    ]);
+    const before = { "0000_a.sql": A };
+    expect(await check(sql({ "20261001000000_a.sql": A }), sql(before))).toEqual([
+      { source: "app", id: "0000_a.sql", problem: "deleted-on-branch" },
+    ]);
+  });
+
+  test("stale-base: an unstamped file main already renamed", async () => {
+    const renames = JSON.stringify({ "0000_a.sql": "20261001000000_a.sql" });
+    const main = sql({ "20261001000000_a.sql": A, "renames.json": renames });
+    expect(await check(sql({ "0000_a.sql": A }), main)).toEqual([
+      { source: "app", id: "0000_a.sql", problem: "stale-base" },
+    ]);
+  });
+
+  test("each finding's detail says what the fix needs", async () => {
+    const detailOf = async (
+      branch: readonly SourceMigration[],
+      main: readonly SourceMigration[],
+      slice = SLICE,
+    ) =>
+      (await checkMigrationOrder(slice, [tracked(branch)], async () => main, NOW)).map(
+        (f) => f.detail,
+      );
+    expect(await detailOf(sql({ ...MAIN, "20261001120000_c.sql": C }), sql(MAIN))).toEqual([
+      "its key 20261001120000_c.sql must sort after main's newest, 20261002000000_b.sql (20261002000000_b.sql); regenerate it on top of main",
+    ]);
+    const branch = sql(MAIN);
+    const slice = migrateSlice({
+      ahead: "refuse",
+      accepted: [
+        {
+          source: "app",
+          id: "20261001000000_a.sql",
+          recorded: "f".repeat(64),
+          current: "e".repeat(64),
+          reason: "r",
+        },
+      ],
+    });
+    expect(await detailOf(branch, sql(MAIN), slice)).toEqual([
+      `the file's hash is ${branch[0]?.sha256}, the entry's current is ${"e".repeat(64)}`,
+    ]);
+    const renamed = sql({
+      "20261001000000_a.sql": A,
+      "renames.json": JSON.stringify({ "0000_a.sql": "20261001000000_a.sql" }),
+    });
+    const onOld = migrateSlice({
+      ahead: "refuse",
+      accepted: [
+        {
+          source: "app",
+          id: "0000_a.sql",
+          recorded: "f".repeat(64),
+          current: "e".repeat(64),
+          reason: "r",
+        },
+      ],
+    });
+    expect(await detailOf(renamed, renamed, onOld)).toEqual([
+      "0000_a.sql was renamed to 20261001000000_a.sql; accept it under its current id",
+    ]);
+  });
+
   test("findings are frozen", async () => {
-    const out = await check(sql({ ...MAIN, "0003_c.sql": C }), sql(MAIN));
+    const out = await checkMigrationOrder(
+      SLICE,
+      [tracked(sql({ ...MAIN, "0003_c.sql": C }))],
+      async () => sql(MAIN),
+      NOW,
+    );
     expect(Object.isFrozen(out)).toBe(true);
     expect(Object.isFrozen(out[0])).toBe(true);
   });
 });
 
 /** A fake git over one ref's tree, recording every call. */
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+
 function fakeGit(
   tree: Record<string, string | Uint8Array>,
   opts: { shallow?: boolean; fail?: string } = {},
@@ -268,8 +346,15 @@ function fakeGit(
     if (opts.fail !== undefined && args[0] === opts.fail)
       throw new Error(`git ${opts.fail} failed`);
     const [cmd] = args;
+    if (cmd === "rev-parse" && args[1] === "--verify") return enc.encode(`${SHA}\n`);
     if (cmd === "rev-parse") return enc.encode(opts.shallow ? "true\n" : "false\n");
     if (cmd === "fetch") return new Uint8Array();
+    if (cmd === "ls-tree" && args[3] === "--") {
+      // The probe from the root: one entry when the path exists, else nothing.
+      const path = args[4] as string;
+      const exists = Object.keys(tree).some((p) => p.startsWith(`${path}/`));
+      return enc.encode(exists ? `040000 tree 0000\t${path}\0` : "");
+    }
     if (cmd === "ls-tree") {
       const dir = (args[2] as string).replace(/^[^:]+:/, "").replace(/\/$/, "");
       const children = new Map<string, string>();
@@ -351,7 +436,16 @@ describe("gitMainReader", () => {
       fetch: "always",
       folders: { app: { path: "db/mig", layout: "sql" } },
     })("app");
-    expect(calls.slice(0, 3).map((c) => c[0])).toEqual(["rev-parse", "fetch", "ls-tree"]);
+    expect(calls.slice(0, 4).map((c) => c.slice(0, 2).join(" "))).toEqual([
+      "rev-parse --is-shallow-repository",
+      "fetch --no-tags",
+      "rev-parse --verify",
+      "ls-tree -z",
+    ]);
+    // Every read names the one resolved commit, never the moving ref.
+    expect(calls.filter((c) => c[0] === "cat-file").every((c) => c[2]?.startsWith(`${SHA}:`))).toBe(
+      true,
+    );
   });
 
   test("a throwing run makes checkMigrationOrder reject", async () => {
@@ -364,7 +458,7 @@ describe("gitMainReader", () => {
     const err = await checkMigrationOrder(SLICE, [tracked(sql(MAIN))], read, NOW).catch((e) => e);
     expect(err.code).toBe("ERR_ROOTSTOCK_MIG_IO");
     expect(err.message).toBe(
-      'rootstock migrate: source "app": cannot list origin/main:db/mig/ — git ls-tree failed',
+      'rootstock migrate: source "app": cannot look for origin/main:db/mig/ — git ls-tree failed',
     );
   });
 
@@ -460,7 +554,7 @@ describe("gitMainReader", () => {
       fetch: "never",
       folders: { app: { path: "db/mig", layout: "sql" } },
     })("app");
-    expect(calls.some((c) => c[0] === "fetch" || c[0] === "rev-parse")).toBe(false);
+    expect(calls.some((c) => c[0] === "fetch" || c[1] === "--is-shallow-repository")).toBe(false);
   });
 
   test("a git failure rejects, naming the ref, with the I/O code and cause", async () => {
@@ -476,14 +570,90 @@ describe("gitMainReader", () => {
     expect(err.cause.message).toBe("git fetch failed");
   });
 
-  test("a missing folder rejects, never reads as empty", async () => {
+  test("a folder main does not have reads as a new source, with no history", async () => {
     const { run } = fakeGit(SQL_TREE);
     const read = gitMainReader({
       run,
       fetch: "never",
       folders: { app: { path: "nowhere", layout: "sql" } },
     });
-    await expect(read("app")).rejects.toThrow('source "app": cannot list origin/main:nowhere/');
+    expect(await read("app")).toEqual([]);
+    const branch = sql({ "20261003000000_c.sql": C, "0001_x.sql": BARE });
+    expect(bare(await checkMigrationOrder(SLICE, [tracked(branch)], read, NOW))).toEqual([
+      { source: "app", id: "0001_x.sql", problem: "name" },
+      { source: "app", id: "0001_x.sql", problem: "unmarked" },
+    ]);
+  });
+
+  test("a failed fetch is not kept: the next call fetches again", async () => {
+    let failing = true;
+    const { run: inner, calls } = fakeGit(SQL_TREE);
+    const run = async (args: readonly string[]) => {
+      if (args[0] === "fetch" && failing) {
+        failing = false;
+        throw new Error("network blip");
+      }
+      return inner(args);
+    };
+    const read = gitMainReader({
+      run,
+      fetch: "always",
+      folders: { app: { path: "db/mig", layout: "sql" } },
+    });
+    await expect(read("app")).rejects.toThrow("cannot fetch origin/main — network blip");
+    expect(await read("app")).toEqual(sql(MAIN));
+    expect(calls.filter((c) => c[0] === "fetch")).toHaveLength(1);
+  });
+
+  test("a shell error's stderr is kept and credentials are masked", async () => {
+    const run = async () => {
+      throw Object.assign(new Error("Failed with exit code 128"), {
+        stderr: enc.encode("fatal: unable to access 'https://user:tok3n@gitremote/r.git/'\n"),
+      });
+    };
+    const err = await gitMainReader({ run, fetch: "always", folders: {} })("x").catch((e) => e);
+    expect(err.message).toMatch(/no folder for source "x"/);
+    const read = gitMainReader({
+      run,
+      fetch: "always",
+      folders: { x: { path: "m", layout: "sql" } },
+    });
+    const fetchErr = await read("x").catch((e) => e);
+    expect(fetchErr.message).toContain(
+      "Failed with exit code 128: fatal: unable to access 'https://***@gitremote/r.git/'",
+    );
+    expect(fetchErr.message).not.toContain("tok3n");
+  });
+
+  test("a bad folder is refused before any fetch", async () => {
+    const { run, calls } = fakeGit(SQL_TREE);
+    await expect(
+      gitMainReader({ run, fetch: "always", folders: { app: { path: "", layout: "sql" } } })("app"),
+    ).rejects.toThrow(/folder path must be relative/);
+    expect(calls).toEqual([]);
+  });
+
+  test("reads are bounded: never more than a few git processes at once", async () => {
+    const tree: Record<string, string> = {};
+    for (let i = 0; i < 40; i++) tree[`m/2026100100${String(i).padStart(4, "0")}_f.sql`] = A;
+    const { run: inner } = fakeGit(tree);
+    let live = 0;
+    let peak = 0;
+    const run = async (args: readonly string[]) => {
+      live++;
+      peak = Math.max(peak, live);
+      await Promise.resolve();
+      try {
+        return await inner(args);
+      } finally {
+        live--;
+      }
+    };
+    await gitMainReader({ run, fetch: "never", folders: { app: { path: "m", layout: "sql" } } })(
+      "app",
+    );
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(peak).toBeGreaterThan(1);
   });
 
   test("a reader refusal on main names the ref", async () => {
@@ -530,7 +700,7 @@ describe("gitMainReader", () => {
       folders: { app: { path: "db/mig", layout: "sql" } },
     });
     const branch = sql({ ...MAIN, "0003_c.sql": C });
-    expect(await checkMigrationOrder(SLICE, [tracked(branch)], read, NOW)).toEqual([
+    expect(bare(await checkMigrationOrder(SLICE, [tracked(branch)], read, NOW))).toEqual([
       { source: "app", id: "0003_c.sql", problem: "name" },
       { source: "app", id: "0003_c.sql", problem: "older-than-main" },
     ]);

@@ -51,7 +51,10 @@ const isSocket = (host: string): boolean => host.startsWith("/");
  * a URL that names no host (PGHOST) or no database (PGDATABASE, or the user),
  * and a `service` parameter (a service file). A URL that does not parse is
  * refused too. Pure: no I/O, and no message carries the URL's password.
- * `unsafeAllow` skips every check, an unparseable URL included, and logs it.
+ * `unsafeAllow` skips only the host checks, logging on every call; a denied
+ * name, a missing database and an unreadable URL are refused regardless.
+ * `allowHosts` replaces the default list: a CI service container named
+ * `postgres` is `allowHosts: ["localhost", "127.0.0.1", "::1", "postgres"]`.
  */
 export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {
   if (!isRecord(opts)) badOption(`options must be an object — got ${q(opts)}`);
@@ -76,27 +79,34 @@ export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {
   }
 
   const target = parse(url);
-  const shownHosts = target === undefined ? "?" : target.hosts.join(",");
-  const shownDbs = target === undefined ? "?" : target.dbs.join(",");
-  if (unsafeAllow !== undefined) {
-    unsafeAllow.log(
-      `rootstock migrate: assertThrowawayDb skipped for ${q(shownHosts)}/${q(shownDbs)} — ${unsafeAllow.reason}`,
-    );
-    return;
-  }
   if (target === undefined) {
     refuse("?", "?", "the URL is not a postgres:// or postgresql:// URL that parses");
   }
   const { hosts, dbs, service } = target;
-  if (service) refuse(shownHosts, shownDbs, "a service parameter names its host in a file");
-  if (hosts.length === 0)
-    refuse(shownHosts, shownDbs, "the URL names no host, so a driver would use PGHOST");
+  const shownHosts = hosts.join(",");
+  const shownDbs = dbs.join(",");
   if (dbs.length === 0) {
     refuse(
       shownHosts,
       shownDbs,
       "the URL names no database, so a driver would use PGDATABASE or the user",
     );
+  }
+  const deny = new Set(denyNames.map((n) => n.toLowerCase()));
+  const denied = dbs.find((db) => deny.has(db.toLowerCase()));
+  if (denied !== undefined) {
+    refuse(shownHosts, shownDbs, `the database name ${q(denied)} is in denyNames`);
+  }
+  if (unsafeAllow !== undefined) {
+    // The one escape hatch: a host outside allowHosts. Never a denied name.
+    unsafeAllow.log(
+      `rootstock migrate: assertThrowawayDb skipped the host check for ${q(shownHosts)}/${q(shownDbs)} — ${unsafeAllow.reason}`,
+    );
+    return;
+  }
+  if (service) refuse(shownHosts, shownDbs, "a service parameter names its host in a file");
+  if (hosts.length === 0) {
+    refuse(shownHosts, shownDbs, "the URL names no host, so a driver would use PGHOST");
   }
   const allowed = new Set(allowHosts.map((h) => h.toLowerCase()));
   const stray = hosts.find((h) => !isSocket(h) && !allowed.has(h.toLowerCase()));
@@ -107,10 +117,6 @@ export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {
       `host ${q(stray)} is not in allowHosts (${[...allowed].join(", ")})`,
     );
   }
-  const deny = new Set(denyNames.map((n) => n.toLowerCase()));
-  const denied = dbs.find((db) => deny.has(db.toLowerCase()));
-  if (denied !== undefined)
-    refuse(shownHosts, shownDbs, `the database name ${q(denied)} is in denyNames`);
 }
 
 function parse(url: string): { hosts: string[]; dbs: string[]; service: boolean } | undefined {

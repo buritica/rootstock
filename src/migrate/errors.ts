@@ -1,6 +1,12 @@
 /** The text of a thrown value, for a refusal that names its cause. */
 export function reason(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  let text = err instanceof Error ? err.message : String(err);
+  // A shell error (Bun.$) keeps git's own words in stderr, not in its message.
+  const stderr = (err as { stderr?: unknown } | null)?.stderr;
+  const said = stderr instanceof Uint8Array ? new TextDecoder().decode(stderr) : stderr;
+  if (typeof said === "string" && said.trim() !== "") text = `${text}: ${said.trim()}`;
+  // Never print credentials a remote URL may carry.
+  return text.replace(/\/\/[^/@\s]+@/g, "//***@");
 }
 
 /**
