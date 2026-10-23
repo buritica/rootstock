@@ -14,13 +14,15 @@ const LINE_BREAK = /\r\n|\n|\r|\u2028|\u2029/;
  * a prefix that is not [a-z][a-z0-9-]*.
  */
 export function markerPattern(...prefixes: readonly string[]): RegExp {
-  if (prefixes.length === 0) throw new Error("rootstock migrate: markerPattern needs a prefix");
+  const refuse = (message: string): never => {
+    throw Object.assign(new Error(`rootstock migrate: ${message}`), {
+      code: "ERR_ROOTSTOCK_MIG_SRC",
+    });
+  };
+  if (prefixes.length === 0) refuse("markerPattern needs a prefix");
   for (const prefix of prefixes) {
-    if (!NAME_RULE.test(prefix)) {
-      throw new Error(
-        `rootstock migrate: marker prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`,
-      );
-    }
+    if (!NAME_RULE.test(prefix))
+      refuse(`marker prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`);
   }
   return new RegExp(`^--\\s*(?:${prefixes.join("|")})-migration:\\s*(additive|heavy)\\s*$`);
 }
@@ -31,9 +33,14 @@ export function markerPattern(...prefixes: readonly string[]): RegExp {
  * heavy wins: that is the direction that stops a deploy rather than runs it.
  */
 export function matchMarker(text: string, pattern: RegExp): MigrationKind | null {
+  // A g or y flag would carry lastIndex from one line to the next and skip markers.
+  const once =
+    pattern.global || pattern.sticky
+      ? new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ""))
+      : pattern;
   let kind: MigrationKind | null = null;
   for (const line of text.replace(/^\uFEFF/, "").split(LINE_BREAK, MARKER_WINDOW_LINES)) {
-    const found = pattern.exec(line)?.[1] as MigrationKind | undefined;
+    const found = once.exec(line)?.[1] as MigrationKind | undefined;
     if (found === "heavy") return "heavy";
     if (found !== undefined) kind = found;
   }

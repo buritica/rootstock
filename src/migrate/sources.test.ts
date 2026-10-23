@@ -200,7 +200,7 @@ describe("drizzleJournal", () => {
       "missing file",
       () =>
         drizzleJournal(folder({ "meta/_journal.json": journal([{ tag: "a", when: 1 }]) }), OPTS),
-      /"a" has no readable file a\.sql/,
+      /"a" has no readable file \S*\/a\.sql/,
     ],
     [
       "unknown baseline",
@@ -530,7 +530,7 @@ describe("renames.json", () => {
 
   const refusals: [string, Record<string, string>, RegExp][] = [
     ["not an object", { "renames.json": "[]" }, /must map old filenames to new ones/],
-    ["not JSON", { "renames.json": "{" }, /cannot read renames\.json/],
+    ["not JSON", { "renames.json": "{" }, /renames\.json is not JSON/],
     [
       "a non-.sql name",
       { "renames.json": renames({ a: "20260101000000_a.sql" }) },
@@ -547,7 +547,7 @@ describe("renames.json", () => {
         "0000_a.sql": OLD,
         "renames.json": renames({ "0000_a.sql": "20260101000000_a.sql" }),
       },
-      /which is still in the folder/,
+      /which is a file in the folder — that name is recorded as applied/,
     ],
     [
       "two old names mapped to one new name",
@@ -565,7 +565,7 @@ describe("renames.json", () => {
         "20260102000000_b.sql": OLD,
         "renames.json": renames({ "20260102000000_b.sql": "20260101000000_a.sql" }),
       },
-      /which is still in the folder/,
+      /which is a file in the folder — that name is recorded as applied/,
     ],
   ];
   for (const [what, extra, message] of refusals) {
@@ -759,7 +759,7 @@ describe("refusal texts and codes", () => {
       /"markers" is not a known key/,
     );
     expect(() => drizzleJournal(dir, { name: "app", marker: { prefix: "app" } } as never)).toThrow(
-      /marker\."prefix" is not a known key/,
+      /marker\."prefix" is not a known key — known: baseline, legacy; a prefix moved to marker\.legacy\.prefix/,
     );
     expect(() =>
       drizzleJournal(dir, {
@@ -770,6 +770,109 @@ describe("refusal texts and codes", () => {
     expect(() => drizzleJournal(dir, { name: "app", marker: { legacy: 1 } } as never)).toThrow(
       /marker legacy must be an object/,
     );
+  });
+});
+
+describe("imagine-pass refusals", () => {
+  const codeOf = (run: () => unknown): { code?: unknown; cause?: unknown } => {
+    try {
+      run();
+    } catch (err) {
+      return err as { code?: unknown; cause?: unknown };
+    }
+    throw new Error("expected a refusal");
+  };
+
+  test("a read failure carries ERR_ROOTSTOCK_MIG_IO and keeps its cause", () => {
+    const listing = codeOf(() => sqlFolder(join(ROOT, "missing-folder"), OPTS));
+    expect(listing.code).toBe("ERR_ROOTSTOCK_MIG_IO");
+    expect((listing.cause as { code?: unknown }).code).toBe("ENOENT");
+    const cause = new Error("EIO");
+    const file = codeOf(() =>
+      sqlFolderFrom(
+        ["0000_a.sql"],
+        () => {
+          throw cause;
+        },
+        OPTS,
+      ),
+    );
+    expect(file.code).toBe("ERR_ROOTSTOCK_MIG_IO");
+    expect(file.cause).toBe(cause);
+    const journalFile = codeOf(() => drizzleJournal(folder({ "x.sql": OLD }), OPTS));
+    expect(journalFile.code).toBe("ERR_ROOTSTOCK_MIG_IO");
+    const tagFile = codeOf(() =>
+      drizzleJournalFrom(
+        DRIZZLE_JOURNAL,
+        () => {
+          throw cause;
+        },
+        OPTS,
+      ),
+    );
+    expect(tagFile.code).toBe("ERR_ROOTSTOCK_MIG_IO");
+  });
+
+  test("a content refusal is not an I/O one", () => {
+    expect(codeOf(() => sqlFolder(folder({ "a.txt": "x" }), OPTS)).code).toBe(
+      "ERR_ROOTSTOCK_MIG_SRC",
+    );
+    expect(
+      codeOf(() => sqlFolder(folder({ "20260101000000_a.sql": A, "renames.json": "{" }), OPTS))
+        .code,
+    ).toBe("ERR_ROOTSTOCK_MIG_SRC");
+  });
+
+  test("a name ending .sql in another case is refused, on disk and in memory", () => {
+    const dir = folder({ "20260101000000_a.sql": A, "20260102000000_b.SQL": H });
+    expect(() => sqlFolder(dir, OPTS)).toThrow(/"20260102000000_b\.SQL" in \S+ would never run/);
+    expect(() =>
+      sqlFolderFrom(["20260101000000_a.sql", "x.Sql"], () => new Uint8Array(), OPTS),
+    ).toThrow(/"x\.Sql" would never run — name it \.sql/);
+  });
+
+  test("a chained rename says to map straight to the newest name", () => {
+    const dir = folder({
+      "20260101000000_a.sql": A,
+      "renames.json": JSON.stringify({
+        "0000_a.sql": "0000_b.sql",
+        "0000_b.sql": "20260101000000_a.sql",
+      }),
+    });
+    expect(() => sqlFolder(dir, OPTS)).toThrow(
+      /renames do not chain: map "0000_a\.sql" straight to "20260101000000_a\.sql"/,
+    );
+  });
+
+  test("a renames.json refusal names the folder", () => {
+    const dir = folder({ "20260101000000_a.sql": A, "renames.json": "[]" });
+    expect(() => sqlFolder(dir, OPTS)).toThrow(`${dir}/renames.json must map`);
+  });
+
+  test("timestampRenames names the file ahead and an invalid Date", () => {
+    expect(() =>
+      timestampRenames([
+        { id: "0000_a", at: new Date("2026-01-02T00:00:00Z") },
+        { id: "0001_b", at: new Date("2026-01-01T00:00:00Z") },
+      ]),
+    ).toThrow(/before the file ahead of it \("20260102000000_a"\)/);
+    expect(() => timestampRenames([{ id: "0000_a", at: new Date("nope") }])).toThrow(
+      /needs a valid date — got an invalid Date/,
+    );
+  });
+
+  test("markerPattern refusals carry the source code", () => {
+    expect(codeOf(() => markerPattern()).code).toBe("ERR_ROOTSTOCK_MIG_SRC");
+    expect(codeOf(() => markerPattern("App")).code).toBe("ERR_ROOTSTOCK_MIG_SRC");
+  });
+
+  test("matchMarker reads every line even with a global or sticky pattern", () => {
+    const text = "-- app-migration: additive\n-- app-migration: heavy\n";
+    for (const flags of ["g", "y", "gy"]) {
+      const p = new RegExp(markerPattern("app").source, flags);
+      expect(matchMarker(text, p)).toBe("heavy");
+      expect(matchMarker(text, p)).toBe("heavy");
+    }
   });
 });
 

@@ -79,9 +79,19 @@ const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 // it); dropping is the one that runs, since Postgres rejects a leading U+FEFF.
 const DROP_BOM = new TextDecoder("utf-8");
 
-/** Every reader refusal carries a code, so a caller never branches on text. */
-function fail(message: string, code = "ERR_ROOTSTOCK_MIG_SRC"): never {
-  throw Object.assign(new Error(`rootstock migrate: ${message}`), { code });
+/**
+ * Every reader refusal carries a code, so a caller never branches on text:
+ * ERR_ROOTSTOCK_MIG_IO when a file or folder could not be read (the cause is
+ * kept, and re-running may help), ERR_ROOTSTOCK_MIG_SRC when what was read or
+ * passed is wrong (a commit or a config change is the fix).
+ */
+function fail(message: string, code = "ERR_ROOTSTOCK_MIG_SRC", cause?: unknown): never {
+  const err = new Error(`rootstock migrate: ${message}`, cause === undefined ? {} : { cause });
+  throw Object.assign(err, { code });
+}
+
+function failIo(message: string, cause: unknown): never {
+  fail(`${message} — ${reason(cause)}`, "ERR_ROOTSTOCK_MIG_IO", cause);
 }
 
 /** Refuses an own key `allowed` does not name, so a stale option shape is never silently read as empty. */
@@ -93,7 +103,12 @@ function onlyKeys(
 ): void {
   for (const key of Object.keys(value)) {
     if (!allowed.includes(key)) {
-      fail(`source ${q(source)}: ${path}${q(key)} is not a known key`);
+      // The one shape change a 0.5.0 upgrade meets names where the key went.
+      const moved =
+        path === "marker." && key === "prefix" ? "; a prefix moved to marker.legacy.prefix" : "";
+      fail(
+        `source ${q(source)}: ${path}${q(key)} is not a known key — known: ${allowed.join(", ")}${moved}`,
+      );
     }
   }
 }
@@ -224,7 +239,7 @@ function readOrFail(readFile: ReadFile, name: string, what: string): Uint8Array 
   try {
     return readFile(name);
   } catch (err) {
-    fail(`${what} — ${reason(err)}`);
+    failIo(what, err);
   }
 }
 
@@ -263,7 +278,7 @@ function journalFrom(
   }
   const entries = (parsed as { entries?: unknown } | null)?.entries;
   if (!Array.isArray(entries) || entries.length === 0) {
-    fail(`source ${q(source)}: the journal has no entries — wrong folder?`);
+    fail(`source ${q(source)}: ${where}meta/_journal.json has no entries — wrong folder?`);
   }
   const tags = new Set<string>();
   const whens = new Set<number>();
@@ -285,7 +300,7 @@ function journalFrom(
       readOrFail(
         readFile,
         `${r.tag}.sql`,
-        `source ${q(source)}: journal entry ${q(r.tag)} has no readable file ${r.tag}.sql`,
+        `source ${q(source)}: journal entry ${q(r.tag)} has no readable file ${where}${r.tag}.sql`,
       ),
     );
     return {
@@ -332,42 +347,48 @@ function rawKeys(text: string): string[] {
 /** `renames.json`: `{ "<name applied under>": "<current name>" }`, returned as current → applied. */
 function readRenames(
   source: string,
+  where: string,
   names: ReadonlySet<string>,
   readFile: ReadFile,
 ): ReadonlyMap<string, string> {
   if (!names.has(RENAMES)) return new Map();
-  let text: string;
+  const file = `${where}${RENAMES}`;
+  const text = DROP_BOM.decode(
+    readOrFail(readFile, RENAMES, `source ${q(source)}: cannot read ${file}`),
+  );
   let parsed: unknown;
   try {
-    text = DROP_BOM.decode(readFile(RENAMES));
     parsed = JSON.parse(text);
   } catch (err) {
-    fail(`source ${q(source)}: cannot read ${RENAMES} — ${reason(err)}`);
+    fail(`source ${q(source)}: ${file} is not JSON — ${reason(err)}`);
   }
   if (!isRecord(parsed)) {
-    fail(`source ${q(source)}: ${RENAMES} must map old filenames to new ones — got ${q(parsed)}`);
+    fail(`source ${q(source)}: ${file} must map old filenames to new ones — got ${q(parsed)}`);
   }
   const keys = rawKeys(text);
   const repeated = keys.find((k, i) => keys.indexOf(k) !== i);
   if (repeated !== undefined) {
-    fail(`source ${q(source)}: ${RENAMES} names ${q(repeated)} twice — JSON keeps only the last`);
+    fail(`source ${q(source)}: ${file} names ${q(repeated)} twice — JSON keeps only the last`);
   }
   const byNew = new Map<string, string>();
   for (const [from, to] of Object.entries(parsed)) {
     if (typeof to !== "string" || !from.endsWith(".sql") || !to.endsWith(".sql")) {
-      fail(`source ${q(source)}: ${RENAMES} entry ${q(from)} must map a .sql name to a .sql name`);
+      fail(`source ${q(source)}: ${file} entry ${q(from)} must map a .sql name to a .sql name`);
     }
     if (!names.has(to)) {
+      const chained = Object.hasOwn(parsed, to)
+        ? ` — renames do not chain: map ${q(from)} straight to ${q(parsed[to])}`
+        : "";
       fail(
-        `source ${q(source)}: ${RENAMES} maps ${q(from)} to ${q(to)}, which is not in the folder`,
+        `source ${q(source)}: ${file} maps ${q(from)} to ${q(to)}, which is not in the folder${chained}`,
       );
     }
     if (names.has(from)) {
       fail(
-        `source ${q(source)}: ${RENAMES} maps ${q(from)}, which is still in the folder — a renamed file's old name must be gone`,
+        `source ${q(source)}: ${file} maps ${q(from)}, which is a file in the folder — that name is recorded as applied, so a file under it would never run: rename the file`,
       );
     }
-    if (byNew.has(to)) fail(`source ${q(source)}: ${RENAMES} maps two names to ${q(to)}`);
+    if (byNew.has(to)) fail(`source ${q(source)}: ${file} maps two names to ${q(to)}`);
     byNew.set(to, from);
   }
   return byNew;
@@ -382,9 +403,10 @@ function readRenames(
  * and its `key` the old one, so a renamed file is never re-applied. Renames do
  * not chain: renaming a file again rewrites its entry (`old → newest`).
  *
- * Refuses: a repeated name, a folder with no `.sql` file, a file it cannot
- * read, and a `renames.json` that is not a JSON object of `.sql` names, repeats
- * a key, maps to a name not in the folder, maps from a name still in it, or
+ * `names` must be regular files only (a reader of a git tree drops subtrees).
+ * Refuses: a repeated name, a name ending `.sql` in another case (it would
+ * never run), a folder with no `.sql` file, a file it cannot read, and a
+ * `renames.json` that is not a JSON object of `.sql` names, repeats a key, maps to a name not in the folder, maps from a name still in it, or
  * maps two names to one.
  */
 export function sqlFolderFrom(
@@ -406,7 +428,13 @@ function folderFrom(
     const repeated = names.find((n, i) => names.indexOf(n) !== i);
     fail(`source ${q(source)}: ${q(repeated)} is listed twice`);
   }
-  const renamed = readRenames(source, present, readFile);
+  const cased = names.find((n) => !n.endsWith(".sql") && n.toLowerCase().endsWith(".sql"));
+  if (cased !== undefined) {
+    fail(
+      `source ${q(source)}: ${q(cased)}${where && ` in ${where}`} would never run — name it .sql`,
+    );
+  }
+  const renamed = readRenames(source, where, present, readFile);
   const files = names.filter((f) => f.endsWith(".sql")).sort();
   if (files.length === 0) {
     fail(`source ${q(source)}: ${where || "the source"} holds no .sql file — wrong folder?`);
@@ -436,7 +464,7 @@ export function sqlFolder(folder: string | URL, opts: SourceOptions): readonly S
   try {
     listed = readdirSync(dir);
   } catch (err) {
-    fail(`source ${q(opened.source)}: cannot list ${opened.where} — ${reason(err)}`);
+    failIo(`source ${q(opened.source)}: cannot list ${opened.where}`, err);
   }
   // Regular files only (a symlink counts as its target): a subfolder named
   // *.sql is skipped, and a dangling link is refused when it is read.
@@ -516,7 +544,11 @@ export function timestampRenames(
     seen.add(id);
     const kept = secondOf(id);
     if (kept !== undefined) {
-      if (id <= lastName) refuseRename(`${q(id)} does not sort after ${q(lastName)}`);
+      if (id <= lastName) {
+        refuseRename(
+          `${q(id)} does not sort after ${q(lastName)} (the name before it, which may have moved to the next free second)`,
+        );
+      }
       lastName = id;
       lastSecond = kept;
       lastWanted = Math.max(lastWanted, kept);
@@ -531,17 +563,21 @@ export function timestampRenames(
       refuseRename(`${q(id)}: a numbered name must be lower-case [a-z0-9_-] after its number`);
     }
     if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
-      refuseRename(`${q(id)} needs a valid date — got ${q(at)}`);
+      refuseRename(
+        `${q(id)} needs a valid date — got ${at instanceof Date ? "an invalid Date" : q(at)}`,
+      );
     }
     const wanted = Math.floor(at.getTime() / 1000);
     if (wanted < lastWanted) {
       refuseRename(
-        `${q(id)} is dated ${at.toISOString()}, before the file ahead of it — its name would reorder the source`,
+        `${q(id)} is dated ${at.toISOString()}, before the file ahead of it (${q(lastName)}) — its name would reorder the source`,
       );
     }
     const second = Math.max(wanted, lastSecond + 1);
     const stamp = stampOf(second);
-    if (stamp === undefined) refuseRename(`${q(id)} is dated outside 1970–9999`);
+    if (stamp === undefined) {
+      refuseRename(`${q(id)} is dated outside 1970–9999 — got ${q(at.getTime())} ms`);
+    }
     const to = `${stamp}_${rest.replaceAll("-", "_")}${ext}`;
     out.push({ from: id, to });
     lastName = to;
