@@ -45,14 +45,14 @@
     "test:db": "bun scripts/test-db.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.14",
-    "@types/bun": "1.4.2",
-    "drizzle-orm": "0.45.3",
+    "@biomejs/biome": "2.5.15",
+    "@types/bun": "1.4.3",
+    "drizzle-orm": "0.45.4",
     "jszip": "3.10.2",
     "mammoth": "1.13.0",
     "postgres": "3.4.9",
     "typescript": "7.0.2",
-    "unpdf": "1.8.1"
+    "unpdf": "1.9.1"
   },
   "publishConfig": {
     "access": "public",
