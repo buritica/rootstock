@@ -7,6 +7,8 @@ test("migrate exports exactly the frozen surface", async () => {
     "checkMigrationOrder",
     "drizzleJournal",
     "drizzleJournalFrom",
+    "drizzleTracker",
+    "filenameTracker",
     "gitMainReader",
     "migrateSlice",
     "rootstockMigrationStatus",

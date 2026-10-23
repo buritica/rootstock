@@ -30,4 +30,9 @@ export {
 } from "./sources.ts";
 export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";
 export { assertThrowawayDb, type ThrowawayOptions } from "./throwaway.ts";
-export type { TrackedSource, Tracker } from "./tracked.ts";
+export {
+  drizzleTracker,
+  filenameTracker,
+  type TrackedSource,
+  type Tracker,
+} from "./tracked.ts";
