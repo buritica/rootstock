@@ -5,4 +5,13 @@ export {
   rootstockMigrations,
 } from "./migrations.ts";
 export { type MigrateSlice, type MigrateSliceInput, migrateSlice } from "./slice.ts";
+export {
+  drizzleJournal,
+  type MarkerRule,
+  parseMarker,
+  type SourceMigration,
+  type SourceOptions,
+  sqlFolder,
+  unmarkedAfterBaseline,
+} from "./sources.ts";
 export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";
