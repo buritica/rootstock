@@ -14,7 +14,7 @@ export interface RootstockMigrationStatus {
   /** Applied and not shipped. */
   readonly ahead: readonly string[];
   readonly tampered: readonly { filename: string; recorded: string; shipped: string }[];
-  /** pending, ahead (only when the slice refuses ahead) or tampered is non-empty. */
+  /** pending, ahead or tampered is non-empty (ahead always counts since 0.5.0). */
   readonly red: boolean;
 }
 
@@ -60,8 +60,7 @@ export async function statusOf(
     pending: Object.freeze(pending),
     ahead: Object.freeze(ahead),
     tampered: Object.freeze(tampered),
-    red:
-      pending.length > 0 || tampered.length > 0 || (ahead.length > 0 && slice.ahead === "refuse"),
+    red: pending.length > 0 || tampered.length > 0 || ahead.length > 0,
   });
 }
 

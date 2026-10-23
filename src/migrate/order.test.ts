@@ -10,7 +10,7 @@ const B = "-- rootstock-migration: additive\nCREATE TABLE b (id int);\n";
 const C = "-- rootstock-migration: additive\nCREATE TABLE c (id int);\n";
 const BARE = "CREATE TABLE d (id int);\n";
 const NOW = () => new Date("2026-10-23T00:00:00Z");
-const SLICE = migrateSlice({ ahead: "refuse" });
+const SLICE = migrateSlice({});
 
 function sql(files: Record<string, string>, baseline?: string): readonly SourceMigration[] {
   return sqlFolderFrom(
@@ -201,7 +201,6 @@ describe("checkMigrationOrder", () => {
     const current = branch[0]?.sha256 as string;
     const other = "f".repeat(64);
     const slice = migrateSlice({
-      ahead: "refuse",
       accepted: [
         { source: "app", id: "20261001000000_a.sql", recorded: other, current, reason: "ok" },
         {
@@ -286,7 +285,6 @@ describe("checkMigrationOrder", () => {
     ]);
     const branch = sql(MAIN);
     const slice = migrateSlice({
-      ahead: "refuse",
       accepted: [
         {
           source: "app",
@@ -305,7 +303,6 @@ describe("checkMigrationOrder", () => {
       "renames.json": JSON.stringify({ "0000_a.sql": "20261001000000_a.sql" }),
     });
     const onOld = migrateSlice({
-      ahead: "refuse",
       accepted: [
         {
           source: "app",

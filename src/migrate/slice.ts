@@ -16,8 +16,6 @@ export interface AcceptedHash {
 export interface MigrateSliceInput {
   /** Identifier rule of `db`'s `quoteIdentifier`. Default "rootstock". */
   schema?: string;
-  /** What to do when the database has applied rootstock migrations this package does not ship. Required. */
-  ahead: "refuse" | "allow";
   /** Applied files whose hash differs from today's file, each accepted for exactly one pair. */
   accepted?: readonly AcceptedHash[];
 }
@@ -26,11 +24,10 @@ declare const migrateSliceBrand: unique symbol;
 export interface MigrateSlice {
   readonly [migrateSliceBrand]: true;
   readonly schema: string;
-  readonly ahead: "refuse" | "allow";
   readonly accepted: readonly AcceptedHash[];
 }
 
-const KNOWN_KEYS: ReadonlySet<string> = new Set(["schema", "ahead", "accepted"]);
+const KNOWN_KEYS: ReadonlySet<string> = new Set(["schema", "accepted"]);
 const ACCEPTED_KEYS: ReadonlySet<string> = new Set([
   "source",
   "id",
@@ -43,19 +40,14 @@ const refuse = sliceRefusals("migrateSlice");
 const brand: Brand<MigrateSlice> = sliceBrand("MigrateSlice", "migrateSlice");
 
 /** Parses the migrate slice into a frozen, branded object. */
-export function migrateSlice(input: MigrateSliceInput): MigrateSlice {
+export function migrateSlice(input: MigrateSliceInput = {}): MigrateSlice {
   const fields: Record<string, unknown> = isRecord(input) ? input : {};
   refuse.refuseUnknownKeys(fields, KNOWN_KEYS, "");
   const rawSchema = own(fields, "schema");
   const schema =
     rawSchema === undefined ? "rootstock" : checkIdentifier("migrateSlice: schema", rawSchema);
-  const ahead = own(fields, "ahead");
-  if (ahead === undefined) throw refuse.required("ahead");
-  if (ahead !== "refuse" && ahead !== "allow") {
-    throw refuse.invalid("ahead", '"refuse" or "allow"', ahead);
-  }
   const accepted = parseAccepted(own(fields, "accepted"));
-  return brand.mark(Object.freeze({ schema, ahead, accepted }) as MigrateSlice);
+  return brand.mark(Object.freeze({ schema, accepted }) as MigrateSlice);
 }
 
 function parseAccepted(raw: unknown): readonly AcceptedHash[] {

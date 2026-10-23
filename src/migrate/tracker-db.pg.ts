@@ -21,7 +21,7 @@ let main: TestTransactor;
 let sql: Sql;
 let tx: Transactor;
 const made: string[] = [];
-const SLICE = migrateSlice({ schema: "rs_k_unused", ahead: "refuse" });
+const SLICE = migrateSlice({ schema: "rs_k_unused" });
 
 function schema(): string {
   const s = `rs_k_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
@@ -535,7 +535,7 @@ describe("reads", () => {
       filenameTracker({ schema: schema() }),
       { kind: "rootstock" } as const,
     ]) {
-      const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+      const slice = migrateSlice({ schema: schema() });
       expect(await readTracker(sql, tracker, slice)).toEqual({
         schemaExists: false,
         tracked: false,
@@ -547,7 +547,7 @@ describe("reads", () => {
   });
 
   test("rootstock's own tracker is read in the slice's schema and never bootstrapped", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     const src = { name: "rootstock", migrations: [], tracker: { kind: "rootstock" } } as const;
     expect(await tx.begin((t) => bootstrapTracker(t, src, slice))).toEqual({
       table: `${slice.schema}.schema_migrations`,

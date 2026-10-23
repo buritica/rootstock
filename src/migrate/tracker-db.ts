@@ -186,6 +186,14 @@ async function selectRows(
   );
 }
 
+/**
+ * `schema.table` of a tracker, refusing one the factories would not have
+ * returned. Two sources resolving to the same name share a table.
+ */
+export function trackerName(tracker: Tracker, slice: MigrateSlice): string {
+  return resolve(tracker, slice).name;
+}
+
 /** Every row of a source's tracker. Read-only; a missing table reads as untracked. */
 export async function readTracker(
   sql: Sql,

@@ -91,7 +91,7 @@ afterAll(async () => {
 
 describe("applyRootstockMigrations", () => {
   test("fresh database: creates the schema, applies, status clean", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     const before = await rootstockMigrationStatus(sql, slice);
     expect(before).toMatchObject({ schemaExists: false, tracked: false, applied: [], red: true });
     expect(before.pending.map((m) => m.filename)).toEqual([FILE]);
@@ -121,7 +121,7 @@ describe("applyRootstockMigrations", () => {
   });
 
   test("re-run applies nothing and writes nothing", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     await applyMigrationList(main.transactor, slice, SHIPPED);
     const again = await applyMigrationList(main.transactor, slice, SHIPPED);
     expect(again).toEqual({
@@ -137,8 +137,8 @@ describe("applyRootstockMigrations", () => {
   test("parallel-isolation: two schemas on two backends each hold only their own row", async () => {
     const second = openSecond();
     try {
-      const a = migrateSlice({ schema: schema(), ahead: "refuse" });
-      const b = migrateSlice({ schema: schema(), ahead: "refuse" });
+      const a = migrateSlice({ schema: schema() });
+      const b = migrateSlice({ schema: schema() });
       const [ra, rb] = await Promise.all([
         applyMigrationList(main.transactor, a, SHIPPED),
         applyMigrationList(second.transactor, b, SHIPPED),
@@ -162,7 +162,7 @@ describe("applyRootstockMigrations", () => {
     try {
       let failures = 0;
       for (let i = 0; i < 50; i++) {
-        const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+        const slice = migrateSlice({ schema: schema() });
         const settled = await Promise.allSettled([
           applyMigrationList(main.transactor, slice, SHIPPED),
           applyMigrationList(second.transactor, slice, SHIPPED),
@@ -180,23 +180,30 @@ describe("applyRootstockMigrations", () => {
     }
   }, 60_000);
 
-  test("kill-mid-run-converges: a failing statement leaves no schema and no row", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+  test("kill-mid-run-converges: a failing file rolls back alone; the files before it stay applied", async () => {
+    const slice = migrateSlice({ schema: schema() });
     const err = await applyMigrationList(main.transactor, slice, [...SHIPPED, BROKEN]).then(
       () => undefined,
       (e: unknown) => e,
     );
     expect(sqlstate(err)).toBe("22012");
-    expect(await exists(slice.schema)).toBe(false);
-    const leaked = await one<{ t: boolean }>("select to_regclass('ok_t') is not null as t");
+    expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual([FILE]);
+    const leaked = await one<{ t: boolean }>(
+      `select to_regclass('"${slice.schema}".ok_t') is not null or to_regclass('ok_t') is not null as t`,
+    );
     expect(leaked?.t).toBe(false);
     const report = await applyMigrationList(main.transactor, slice, SHIPPED);
-    expect(report.applied).toEqual([FILE]);
-    expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual([FILE]);
+    expect(report).toEqual({
+      schema: slice.schema,
+      schemaCreated: false,
+      applied: [],
+      alreadyApplied: 1,
+      ahead: [],
+    });
   });
 
   test("tampered-refused: a changed sha refuses and writes nothing", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     await applyMigrationList(main.transactor, slice, SHIPPED);
     const zeros = "0".repeat(64);
     await sql.unsafe(`update "${slice.schema}".schema_migrations set sha256 = $1`, [zeros]);
@@ -212,41 +219,35 @@ describe("applyRootstockMigrations", () => {
     expect(status.red).toBe(true);
   });
 
-  test("ahead-refuse: an unshipped applied row refuses, or is reported under allow", async () => {
+  test("ahead-refuse: an unshipped applied row always refuses; with a pending file it has diverged", async () => {
     const name = schema();
-    const refuse = migrateSlice({ schema: name, ahead: "refuse" });
-    const allow = migrateSlice({ schema: name, ahead: "allow" });
-    await applyMigrationList(main.transactor, refuse, SHIPPED);
+    const slice = migrateSlice({ schema: name });
+    await applyMigrationList(main.transactor, slice, SHIPPED);
     await sql.unsafe(`insert into "${name}".schema_migrations (filename, sha256) values ($1, $2)`, [
       FUTURE,
       "a".repeat(64),
     ]);
-    expect(await refusal(applyMigrationList(main.transactor, refuse, SHIPPED))).toBe(
-      `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock, or set ahead: "allow" in the migrate slice`,
+    expect(await refusal(applyMigrationList(main.transactor, slice, SHIPPED))).toBe(
+      `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock`,
     );
-    expect(await applyMigrationList(main.transactor, allow, SHIPPED)).toEqual({
-      schema: name,
-      schemaCreated: false,
-      applied: [],
-      alreadyApplied: 1,
-      ahead: [FUTURE],
-    });
-    expect((await rootstockMigrationStatus(sql, refuse)).red).toBe(true);
-    expect((await rootstockMigrationStatus(sql, allow)).red).toBe(false);
-    for (const slice of [refuse, allow]) {
-      expect(await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, EXTRA]))).toBe(
-        `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship, and is missing ${EXTRA.filename} — the database and this package have diverged; refusing`,
-      );
-    }
+    expect((await rootstockMigrationStatus(sql, slice)).red).toBe(true);
+    expect(await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, EXTRA]))).toBe(
+      `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship, and is missing ${EXTRA.filename} — the database and this package have diverged; refusing`,
+    );
     expect(await rowsOf(name)).toHaveLength(2);
   });
 
   test("heavy: refused without allowHeavy, applied with it", async () => {
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     expect(await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, HEAVY]))).toBe(
       `applyRootstockMigrations: pending migration(s) marked heavy: ${HEAVY.filename} — apply them deliberately with { allowHeavy: true }, then re-run`,
     );
-    expect(await exists(slice.schema)).toBe(false);
+    // Bootstrap commits the schema before the refusal; no file ran, so no tracker either.
+    expect(await exists(slice.schema)).toBe(true);
+    const tracker = await one<{ t: boolean }>(
+      `select to_regclass('"${slice.schema}".schema_migrations') is not null as t`,
+    );
+    expect(tracker?.t).toBe(false);
     const report = await applyMigrationList(main.transactor, slice, [...SHIPPED, HEAVY], {
       allowHeavy: true,
     });
@@ -278,7 +279,7 @@ describe("applyRootstockMigrations", () => {
     }
 
     test("no database CREATE and no schema: refused with the remedy", async () => {
-      const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+      const slice = migrateSlice({ schema: schema() });
       const message = await asApp(() =>
         refusal(applyMigrationList(main.transactor, slice, SHIPPED)),
       );
@@ -288,14 +289,14 @@ describe("applyRootstockMigrations", () => {
     });
 
     test("pre-created-schema: applies without database CREATE", async () => {
-      const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+      const slice = migrateSlice({ schema: schema() });
       await sql.unsafe(`CREATE SCHEMA "${slice.schema}" AUTHORIZATION rs_app`);
       const report = await asApp(() => applyMigrationList(main.transactor, slice, SHIPPED));
       expect(report).toMatchObject({ schemaCreated: false, applied: [FILE] });
     });
 
     test("a schema without USAGE or CREATE names what is missing", async () => {
-      const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+      const slice = migrateSlice({ schema: schema() });
       const s = slice.schema;
       await sql.unsafe(`CREATE SCHEMA "${s}" AUTHORIZATION rs_owner`);
       expect(await asApp(() => refusal(applyMigrationList(main.transactor, slice, SHIPPED)))).toBe(
@@ -329,7 +330,7 @@ describe("applyRootstockMigrations", () => {
           "select filename, applied_at::text as at from public.schema_migrations order by 1",
         );
       const before = await snapshot();
-      const slice = migrateSlice({ ahead: "refuse" });
+      const slice = migrateSlice({});
       expect(slice.schema).toBe("rootstock");
       expect((await applyRootstockMigrations(main.transactor, slice)).applied).toEqual([FILE]);
       expect(await snapshot()).toEqual(before);
@@ -342,7 +343,7 @@ describe("applyRootstockMigrations", () => {
 
   test("search-path-restored: the same session's search_path is unchanged after commit", async () => {
     const [before] = await sql<{ search_path: string }>`show search_path`;
-    const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
+    const slice = migrateSlice({ schema: schema() });
     expect((await applyMigrationList(main.transactor, slice, SHIPPED)).applied).toEqual([FILE]);
     const [after] = await sql<{ search_path: string }>`show search_path`;
     expect(after).toEqual(before);

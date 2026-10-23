@@ -21,7 +21,7 @@ const profile = {
 
 const input = {
   client: { profiles: { app: profile } },
-  migrate: { ahead: "refuse" },
+  migrate: {},
   concurrency: { widths: { fetch: { default: 2, max: 4 } } },
 } as RootstockConfigInput;
 
@@ -39,9 +39,9 @@ describe("defineRootstockConfig", () => {
   });
 
   test("a slice parser's refusal reaches the caller unchanged", () => {
-    expect(() => defineRootstockConfig({ ...input, migrate: {} as never })).toThrow(
-      "migrateSlice: ahead is required",
-    );
+    expect(() =>
+      defineRootstockConfig({ ...input, migrate: { ahead: "refuse" } as never }),
+    ).toThrow("migrateSlice: ahead is not a known key");
   });
 });
 

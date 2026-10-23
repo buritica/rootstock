@@ -49,7 +49,7 @@ describe("tracker factories", () => {
   });
 
   test("trackerTable resolves rootstock's own into the slice's schema", () => {
-    const slice = migrateSlice({ schema: "rs", ahead: "refuse" });
+    const slice = migrateSlice({ schema: "rs" });
     expect(trackerTable({ kind: "rootstock" }, slice)).toEqual({
       schema: "rs",
       table: "schema_migrations",

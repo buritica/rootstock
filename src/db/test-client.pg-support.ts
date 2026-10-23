@@ -44,20 +44,20 @@ function testTransactorKind(): TestTransactorKind {
   return known;
 }
 
-function open(): TestClient {
+function open(max = 1): TestClient {
   const url = required("ROOTSTOCK_TEST_DATABASE_URL");
   const kind = testTransactorKind();
   switch (kind) {
     case "bun-sql": {
-      const client = new SQL({ url, max: 1 });
+      const client = new SQL({ url, max });
       return { kind, client, close: () => client.close() };
     }
     case "postgres-js": {
-      const client = postgres(url, { max: 1, onnotice: () => {} });
+      const client = postgres(url, { max, onnotice: () => {} });
       return { kind, client, close: () => client.end() };
     }
     case "drizzle": {
-      const client = drizzle(postgres(url, { max: 1, onnotice: () => {} }));
+      const client = drizzle(postgres(url, { max, onnotice: () => {} }));
       return { kind, client, close: () => client.$client.end() };
     }
   }
@@ -74,4 +74,12 @@ export function openTestClient(): TestClient {
  */
 export function openSecondClient(): TestClient {
   return open();
+}
+
+/**
+ * A client whose pool holds `max` backends, for the cases that must show a
+ * guarantee holds when a transactor's transactions land on different backends.
+ */
+export function openPooledClient(max: number): TestClient {
+  return open(max);
 }

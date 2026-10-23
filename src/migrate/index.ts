@@ -1,4 +1,13 @@
-export { type ApplyReport, applyRootstockMigrations } from "./apply.ts";
+export {
+  type ApplyOptions,
+  type ApplyResult,
+  applyMigrations,
+  type Backup,
+  type Entry,
+  type MigrateEvent,
+  type MigrationPlan,
+} from "./applier.ts";
+export { type ApplyReport, applyRootstockMigrations, rootstockSource } from "./apply.ts";
 export {
   type MigrationKind,
   type RootstockMigration,
