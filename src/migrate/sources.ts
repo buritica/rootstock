@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sha256Hex } from "../hash/index.ts";
 import { isRecord, q } from "../internal/slice.ts";
-import { fail, failIo, reason } from "./errors.ts";
+import { fail, failIo, reason, refusalCode } from "./errors.ts";
 import { type MigrationKind, markerPattern, matchMarker, NAME_RULE } from "./marker.ts";
 
 /**
@@ -222,8 +222,7 @@ function readOrFail(readFile: ReadFile, name: string, what: string): Uint8Array 
     return readFile(name);
   } catch (err) {
     // A reader's own coded refusal (a file a git tree lacks) is a fact, not I/O.
-    const code = (err as { code?: unknown } | null)?.code;
-    if (typeof code === "string" && code.startsWith("ERR_ROOTSTOCK_MIG_")) throw err;
+    if (refusalCode(err) !== undefined) throw err;
     failIo(what, err);
   }
 }

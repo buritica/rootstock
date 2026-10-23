@@ -67,17 +67,15 @@ export async function applyMigrationList(
       fix: "applyRootstockMigrations(transactor, slice, { allowHeavy: true })",
       ...(opts?.allowHeavy === true ? { allowHeavy: true } : {}),
     },
-    { schema: slice.schema },
+    true,
   );
   const planned = new Set(outcome.plan.apply.map((a) => a.id));
-  const shipped = new Set(list.map((m) => m.filename));
   return Object.freeze({
     schema: slice.schema,
     schemaCreated: outcome.schemaCreated,
     applied: Object.freeze(outcome.applied.map((a) => a.id)),
     alreadyApplied:
-      list.filter((m) => shipped.has(m.filename) && !planned.has(m.filename)).length +
-      outcome.skippedConcurrent.length,
+      list.filter((m) => !planned.has(m.filename)).length + outcome.skippedConcurrent.length,
     ahead: Object.freeze([]),
   });
 }

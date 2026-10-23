@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { Sql } from "../db/index.ts";
+import { pgCode, type Sql } from "../db/index.ts";
 import {
   openSecond,
   openTestTransactor,
@@ -55,16 +55,6 @@ async function exists(s: string): Promise<boolean> {
 
 async function rowsOf(s: string): Promise<{ filename: string; sha256: string }[]> {
   return sql.unsafe(`select filename, sha256 from "${s}".schema_migrations order by filename`);
-}
-
-/** The SQLSTATE anywhere on an error's cause chain (drivers and drizzle nest it differently). */
-function sqlstate(err: unknown): string | undefined {
-  for (let e = err, hop = 0; e !== null && typeof e === "object" && hop < 5; hop++) {
-    const { code, errno, cause } = e as { code?: unknown; errno?: unknown; cause?: unknown };
-    for (const c of [code, errno]) if (typeof c === "string" && /^[0-9A-Z]{5}$/.test(c)) return c;
-    e = cause;
-  }
-  return undefined;
 }
 
 async function refusal(p: Promise<unknown>): Promise<string> {
@@ -186,7 +176,7 @@ describe("applyRootstockMigrations", () => {
       () => undefined,
       (e: unknown) => e,
     );
-    expect(sqlstate(err)).toBe("22012");
+    expect(pgCode(err)).toBe("22012");
     expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual([FILE]);
     const leaked = await one<{ t: boolean }>(
       `select to_regclass('"${slice.schema}".ok_t') is not null or to_regclass('ok_t') is not null as t`,

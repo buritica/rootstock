@@ -24,3 +24,14 @@ export function fail(message: string, code = "ERR_ROOTSTOCK_MIG_SRC", cause?: un
 export function failIo(message: string, cause: unknown): never {
   fail(`${message} — ${reason(cause)}`, "ERR_ROOTSTOCK_MIG_IO", cause);
 }
+
+/** The `code` of one of migrate's own refusals, or undefined for anything else. */
+export function refusalCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.startsWith("ERR_ROOTSTOCK_MIG_") ? code : undefined;
+}
+
+/** A refusal in Stage A's own words: no `rootstock migrate: ` prefix. */
+export function failAs(message: string, code: string): never {
+  throw Object.assign(new Error(message), { code });
+}

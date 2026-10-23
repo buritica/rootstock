@@ -45,6 +45,25 @@ export interface SourceState {
 
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 
+/**
+ * The slice's acceptance naming this file, and whether it covers exactly the
+ * pair (recorded, current). A file edited again after its acceptance is not
+ * covered, so it reads as tampered.
+ */
+export function acceptanceOf(
+  accepted: readonly AcceptedHash[],
+  source: string,
+  id: string,
+  recorded: string,
+  current: string,
+): { entry: AcceptedHash | undefined; covers: boolean } {
+  const entry = accepted.find((a) => a.source === source && a.id === id);
+  return {
+    entry,
+    covers: entry !== undefined && entry.recorded === recorded && entry.current === current,
+  };
+}
+
 /** Compares keys the way the tracker orders them: drizzle's as integers. */
 function keyBefore(a: string, b: string, numeric: boolean): boolean {
   return numeric ? BigInt(a) < BigInt(b) : a < b;

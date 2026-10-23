@@ -1,10 +1,10 @@
 import { quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
 import { own, q, sliceRefusals } from "../internal/slice.ts";
-import { fail } from "./errors.ts";
+import { fail, failAs, refusalCode } from "./errors.ts";
 import { type MigrationKind, NAME_RULE } from "./marker.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
-import { type SourceState, sourceState } from "./state.ts";
+import { acceptanceOf, type SourceState, sourceState } from "./state.ts";
 import type { TrackedSource } from "./tracked.ts";
 import {
   bootstrapTracker,
@@ -64,14 +64,6 @@ export type MigrateEvent =
   | { type: "migrate.refused"; code: string }
   | { type: "migrate.done"; applied: number; skippedConcurrent: number; ahead: number };
 
-/**
- * The rootstock-only entry point (0.3.0's `applyRootstockMigrations`) keeps
- * Stage A's texts byte-identical; nothing else sets this.
- */
-export interface LegacyTexts {
-  readonly schema: string;
-}
-
 /** The bootstrap transaction's own wait for a tracker lock (an old migrator mid-file). */
 const BOOTSTRAP_LOCK_TIMEOUT = "30s";
 const OPTION_KEYS: ReadonlySet<string> = new Set([
@@ -84,17 +76,74 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
 ]);
 const refuseCall = sliceRefusals("applyMigrations");
 
-function coded(message: string, code: string): never {
-  throw Object.assign(new Error(message), { code });
+const BACKUP_KEYS: ReadonlySet<string> = new Set(["run", "skip"]);
+
+/**
+ * The refusals whose words differ by entry point. The rootstock-only entry
+ * (0.3.0's `applyRootstockMigrations`) keeps Stage A's texts byte-identical.
+ */
+interface Texts {
+  tamper(
+    source: string,
+    id: string,
+    recorded: string,
+    current: string,
+    acceptedCurrent?: string,
+  ): never;
+  ahead(source: string, ids: readonly string[]): never;
+  heavy(blocked: readonly SourceMigration[]): never;
 }
 
-function lockKey(slice: MigrateSlice): string {
-  return `rootstock-migrate:${slice.schema}`;
+const SOURCE_TEXTS: Texts = {
+  tamper: (source, id, recorded, current, acceptedCurrent) =>
+    fail(
+      `source ${q(source)} recorded ${id} with hash ${recorded}, but the file now hashes to ${current}${acceptedCurrent === undefined ? "" : ` (its acceptance expects ${acceptedCurrent})`} — an applied migration changed after it ran; if that is known and harmless, add it to the migrate slice's accepted list with a reason; re-running will not fix this`,
+      "ERR_ROOTSTOCK_MIG_TAMPER_SRC",
+    ),
+  ahead: (source, ids) =>
+    fail(
+      `source ${q(source)} has applied ${ids.join(", ")}, which this checkout does not have — the database is ahead of this code; pull, or run from the deployed commit; after a rollback, fix forward with a deploy that carries them`,
+      "ERR_ROOTSTOCK_MIG_AHEAD_SRC",
+    ),
+  heavy: (blocked) =>
+    fail(
+      `pending migration(s) marked heavy or unmarked: ${blocked.map((m) => label(m.source, m.id)).join(", ")} — re-run with --allow-heavy to apply them deliberately`,
+      "ERR_ROOTSTOCK_MIG_HEAVY_SRC",
+    ),
+};
+
+function stageATexts(schema: string): Texts {
+  return {
+    tamper: (_source, id, recorded, current) =>
+      failAs(
+        `applyRootstockMigrations: ${schema}.schema_migrations records ${id} with sha256 ${recorded}, but this package ships ${current} — an applied migration changed after it ran; refusing, and re-running will not fix this`,
+        "ERR_ROOTSTOCK_MIG_TAMPER",
+      ),
+    ahead: (_source, ids) =>
+      failAs(
+        `applyRootstockMigrations: schema "${schema}" has applied ${ids.join(", ")}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock`,
+        "ERR_ROOTSTOCK_MIG_AHEAD",
+      ),
+    heavy: (blocked) =>
+      failAs(
+        `applyRootstockMigrations: pending migration(s) marked heavy: ${blocked.map((m) => m.id).join(", ")} — apply them deliberately with { allowHeavy: true }, then re-run`,
+        "ERR_ROOTSTOCK_MIG_HEAVY",
+      ),
+  };
 }
+
+function trackerRows(source: string, what: string): never {
+  fail(
+    `source ${q(source)}'s tracker has ${what} — fix those rows by hand (see the census procedure); re-running will not fix this`,
+    "ERR_ROOTSTOCK_MIG_TRACKER_ROWS",
+  );
+}
+
+const label = (source: string, id: string): string => `${source}/${id}`;
 
 async function lock(tx: TxSql, slice: MigrateSlice): Promise<void> {
   // Selected FROM the call so no driver has to decode a void column.
-  await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${lockKey(slice)}::text)::bigint)`;
+  await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${slice.schema}`}::text)::bigint)`;
 }
 
 function validate(slice: MigrateSlice, sources: unknown, opts: unknown): ApplyOptions {
@@ -107,7 +156,7 @@ function validate(slice: MigrateSlice, sources: unknown, opts: unknown): ApplyOp
     throw refuseCall.invalid("options.entry", '"deploy" or "manual"', entry);
   }
   const backup = refuseCall.record("options.backup", own(o, "backup"));
-  refuseCall.refuseUnknownKeys(backup, new Set(["run", "skip"]), "options.backup.");
+  refuseCall.refuseUnknownKeys(backup, BACKUP_KEYS, "options.backup.");
   const run = own(backup, "run");
   const skip = own(backup, "skip");
   if ((run === undefined) === (skip === undefined)) {
@@ -208,7 +257,7 @@ async function preflight(tx: TxSql, schema: string): Promise<{ exists: boolean }
   const { user } = who;
   if (!who.exists) {
     if (who.dbCreate) return { exists: false };
-    coded(
+    failAs(
       `applyRootstockMigrations: schema "${schema}" does not exist and role ${JSON.stringify(user)} cannot create it (no CREATE on this database) — have a superuser or a member of that role run CREATE SCHEMA "${schema}" AUTHORIZATION "${user}", then re-run`,
       "ERR_ROOTSTOCK_MIG_NOCREATE",
     );
@@ -220,7 +269,7 @@ async function preflight(tx: TxSql, schema: string): Promise<{ exists: boolean }
     throw new Error("applyRootstockMigrations: the privilege query returned no row");
   const missing = [...(can.usage ? [] : ["USAGE"]), ...(can.create ? [] : ["CREATE"])];
   if (missing.length > 0) {
-    coded(
+    failAs(
       `applyRootstockMigrations: role ${JSON.stringify(user)} lacks ${missing.join(" and ")} on schema "${schema}" — run GRANT ${missing.join(", ")} ON SCHEMA "${schema}" TO "${user}" as its owner, then re-run`,
       "ERR_ROOTSTOCK_MIG_NOUSAGE",
     );
@@ -232,7 +281,7 @@ interface Run {
   readonly slice: MigrateSlice;
   readonly sources: readonly TrackedSource[];
   readonly opts: ApplyOptions;
-  readonly legacy: LegacyTexts | undefined;
+  readonly texts: Texts;
   readonly emit: (e: MigrateEvent) => void;
 }
 
@@ -245,44 +294,32 @@ async function readStates(transactor: Transactor, run: Run): Promise<SourceState
   return states;
 }
 
-const label = (source: string, id: string): string => `${source}/${id}`;
-
 /** Contract §1.4 step 2's refusals, first match wins. */
 function refuseIfBlocked(run: Run, states: readonly SourceState[]): void {
-  const { opts, legacy, slice } = run;
+  const { opts, texts, slice } = run;
   for (const s of states) {
     if (s.unknown.length > 0 || s.duplicate.length > 0) {
-      const what = [
-        ...(s.unknown.length > 0
-          ? [`unknown rows with id ${s.unknown.map((u) => u.rowId).join(", ")}`]
-          : []),
-        ...(s.duplicate.length > 0 ? [`duplicate keys ${s.duplicate.join(", ")}`] : []),
-      ].join(" and ");
-      fail(
-        `source ${q(s.source)}'s tracker has ${what} — fix those rows by hand (see the census procedure); re-running will not fix this`,
-        "ERR_ROOTSTOCK_MIG_TRACKER_ROWS",
+      trackerRows(
+        s.source,
+        [
+          ...(s.unknown.length > 0
+            ? [`unknown rows with id ${s.unknown.map((u) => u.rowId).join(", ")}`]
+            : []),
+          ...(s.duplicate.length > 0 ? [`duplicate keys ${s.duplicate.join(", ")}`] : []),
+        ].join(" and "),
       );
     }
   }
   for (const s of states) {
     const [t] = s.tampered;
-    if (t === undefined) continue;
-    if (legacy !== undefined) {
-      coded(
-        `applyRootstockMigrations: ${legacy.schema}.schema_migrations records ${t.id} with sha256 ${t.recorded}, but this package ships ${t.current} — an applied migration changed after it ran; refusing, and re-running will not fix this`,
-        "ERR_ROOTSTOCK_MIG_TAMPER",
-      );
-    }
-    fail(
-      `source ${q(s.source)} recorded ${t.id} with hash ${t.recorded}, but the file now hashes to ${t.current}${t.acceptedCurrent === undefined ? "" : ` (its acceptance expects ${t.acceptedCurrent})`} — an applied migration changed after it ran; if that is known and harmless, add it to the migrate slice's accepted list with a reason; re-running will not fix this`,
-      "ERR_ROOTSTOCK_MIG_TAMPER_SRC",
-    );
+    if (t !== undefined) texts.tamper(s.source, t.id, t.recorded, t.current, t.acceptedCurrent);
   }
-  for (const s of states) {
+  for (const [i, s] of states.entries()) {
     if (s.ahead.length === 0 || s.pending.length === 0) continue;
     const pendingIds = s.pending.map((m) => m.id).join(", ");
-    if (s.source === "rootstock") {
-      coded(
+    // validate() pins rootstock's own source first; its divergence keeps Stage A's text.
+    if (i === 0) {
+      failAs(
         `applyRootstockMigrations: schema "${slice.schema}" has applied ${s.ahead.join(", ")}, which this package does not ship, and is missing ${pendingIds} — the database and this package have diverged; refusing`,
         "ERR_ROOTSTOCK_MIG_DIVERGED",
       );
@@ -295,19 +332,7 @@ function refuseIfBlocked(run: Run, states: readonly SourceState[]): void {
     );
   }
   if (opts.entry === "manual") {
-    for (const s of states) {
-      if (s.ahead.length === 0) continue;
-      if (legacy !== undefined) {
-        coded(
-          `applyRootstockMigrations: schema "${legacy.schema}" has applied ${s.ahead.join(", ")}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock`,
-          "ERR_ROOTSTOCK_MIG_AHEAD",
-        );
-      }
-      fail(
-        `source ${q(s.source)} has applied ${s.ahead.join(", ")}, which this checkout does not have — the database is ahead of this code; pull, or run from the deployed commit; after a rollback, fix forward with a deploy that carries them`,
-        "ERR_ROOTSTOCK_MIG_AHEAD_SRC",
-      );
-    }
+    for (const s of states) if (s.ahead.length > 0) texts.ahead(s.source, s.ahead);
   }
   const pending = states.flatMap((s) => s.pending);
   if (opts.entry === "deploy") {
@@ -328,17 +353,7 @@ function refuseIfBlocked(run: Run, states: readonly SourceState[]): void {
   }
   if (opts.allowHeavy === true) return;
   const blocked = pending.filter((m) => m.kind === "heavy" || (m.kind === null && !m.baselined));
-  if (blocked.length === 0) return;
-  if (legacy !== undefined) {
-    coded(
-      `applyRootstockMigrations: pending migration(s) marked heavy: ${blocked.map((m) => m.id).join(", ")} — apply them deliberately with { allowHeavy: true }, then re-run`,
-      "ERR_ROOTSTOCK_MIG_HEAVY",
-    );
-  }
-  fail(
-    `pending migration(s) marked heavy or unmarked: ${blocked.map((m) => label(m.source, m.id)).join(", ")} — re-run with --allow-heavy to apply them deliberately`,
-    "ERR_ROOTSTOCK_MIG_HEAVY_SRC",
-  );
+  if (blocked.length > 0) texts.heavy(blocked);
 }
 
 function planOf(run: Run, states: readonly SourceState[]): MigrationPlan {
@@ -391,8 +406,7 @@ async function bootstrap(
       try {
         done = await bootstrapTracker(tx, source, slice);
       } catch (err) {
-        if (String((err as { code?: unknown }).code ?? "").startsWith("ERR_ROOTSTOCK_MIG_"))
-          throw err;
+        if (refusalCode(err) !== undefined) throw err;
         throw Object.assign(
           new Error(
             `rootstock migrate: preparing source ${q(source.name)}'s tracker ${trackerName(source.tracker, slice)} failed (nothing was changed; another migrator holding it reads this way) — ${(err as Error).message}`,
@@ -436,24 +450,15 @@ async function applyOne(
   return transactor.begin(async (tx) => {
     await lock(tx, slice);
     const rows = await trackerRowsFor(tx, source.tracker, slice, m.key);
-    if (rows.length > 1) {
-      fail(
-        `source ${q(source.name)}'s tracker has duplicate keys ${m.key} — fix those rows by hand (see the census procedure); re-running will not fix this`,
-        "ERR_ROOTSTOCK_MIG_TRACKER_ROWS",
-      );
-    }
+    if (rows.length > 1) trackerRows(source.name, `duplicate keys ${m.key}`);
     const [row] = rows;
     if (row !== undefined) {
       // A NULL hash is a row an older migrator wrote after the bootstrap's
       // stamp: applied, and stamped by the next bootstrap.
       if (row.hash === null || row.hash === m.sha256) return "skipped";
-      const entry = slice.accepted.find((a) => a.source === source.name && a.id === m.id);
-      if (entry !== undefined && entry.recorded === row.hash && entry.current === m.sha256)
-        return "skipped";
-      fail(
-        `source ${q(source.name)} recorded ${m.id} with hash ${row.hash}, but the file now hashes to ${m.sha256}${entry === undefined ? "" : ` (its acceptance expects ${entry.current})`} — an applied migration changed after it ran; if that is known and harmless, add it to the migrate slice's accepted list with a reason; re-running will not fix this`,
-        "ERR_ROOTSTOCK_MIG_TAMPER_SRC",
-      );
+      const { entry, covers } = acceptanceOf(slice.accepted, source.name, m.id, row.hash, m.sha256);
+      if (covers) return "skipped";
+      run.texts.tamper(source.name, m.id, row.hash, m.sha256, entry?.current);
     }
     if (source.tracker.kind === "rootstock") {
       await tx.unsafe(`SET LOCAL search_path TO ${quoteIdentifier(slice.schema)}`);
@@ -476,7 +481,8 @@ export async function runMigrations(
   slice: MigrateSlice,
   sources: readonly TrackedSource[],
   rawOpts: ApplyOptions,
-  legacy?: LegacyTexts,
+  /** The rootstock-only entry point: Stage A's texts, byte-identical. */
+  stageA = false,
 ): Promise<ApplyOutcome> {
   const opts = validate(slice, sources, rawOpts);
   const hook = opts.onEvent;
@@ -487,13 +493,13 @@ export async function runMigrations(
       // A hook never changes what a run does.
     }
   };
-  const run: Run = { slice, sources, opts, legacy, emit };
+  const texts = stageA ? stageATexts(slice.schema) : SOURCE_TEXTS;
+  const run: Run = { slice, sources, opts, texts, emit };
   try {
     return await steps(transactor, run);
   } catch (err) {
-    const code = (err as { code?: unknown }).code;
-    if (typeof code === "string" && code.startsWith("ERR_ROOTSTOCK_MIG_"))
-      emit({ type: "migrate.refused", code });
+    const code = refusalCode(err);
+    if (code !== undefined) emit({ type: "migrate.refused", code });
     throw err;
   }
 }
@@ -563,6 +569,17 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
   }
 
   // Step 6: what was planned must now read as applied, and nothing tampered.
+  if (plan.apply.length > 0) await verify(transactor, run, plan);
+  emit({
+    type: "migrate.done",
+    applied: applied.length,
+    skippedConcurrent: skipped.length,
+    ahead: plan.ahead.length,
+  });
+  return result(Object.freeze(applied), Object.freeze(skipped));
+}
+
+async function verify(transactor: Transactor, run: Run, plan: MigrationPlan): Promise<void> {
   const after = await readStates(transactor, run);
   const planned = new Set(plan.apply.map((a) => label(a.source, a.id)));
   const stillPending = after
@@ -579,13 +596,6 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
       "ERR_ROOTSTOCK_MIG_VERIFY",
     );
   }
-  emit({
-    type: "migrate.done",
-    applied: applied.length,
-    skippedConcurrent: skipped.length,
-    ahead: plan.ahead.length,
-  });
-  return result(Object.freeze(applied), Object.freeze(skipped));
 }
 
 /**
