@@ -18,3 +18,4 @@ export {
   unmarkedAfterBaseline,
 } from "./sources.ts";
 export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";
+export { assertThrowawayDb, type ThrowawayOptions } from "./throwaway.ts";
