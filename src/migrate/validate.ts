@@ -1,5 +1,8 @@
-import { q, type SliceRefusals, sliceRefusals } from "../internal/slice.ts";
-import { fail, refusalCode } from "./errors.ts";
+import { isRecord, q, type SliceRefusals, sliceRefusals } from "../internal/slice.ts";
+
+type Refusals = Pick<SliceRefusals, "invalid" | "record">;
+
+import { fail } from "./errors.ts";
 import { NAME_RULE } from "./marker.ts";
 import type { MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
@@ -8,20 +11,26 @@ import { trackerName } from "./tracker-db.ts";
 
 /**
  * Every refusal here carries a code, so the caller's `migrate.refused` sees it:
- * a shape refusal (not an array, a bad name, a bad tracker) keeps its parser
- * text and gains ERR_ROOTSTOCK_MIG_SRC.
+ * a shape refusal (not an array, a bad name) keeps its parser text and gains
+ * ERR_ROOTSTOCK_MIG_SRC. Anything else thrown (a bug) passes through uncoded.
  */
 export function validateSources(caller: string, slice: MigrateSlice, sources: unknown): void {
-  try {
-    checkSources(sliceRefusals(caller), slice, sources);
-  } catch (err) {
-    if (err instanceof Error && refusalCode(err) === undefined)
-      Object.assign(err, { code: "ERR_ROOTSTOCK_MIG_SRC" });
-    throw err;
-  }
+  const plain = sliceRefusals(caller);
+  const coded = (err: Error): Error => Object.assign(err, { code: "ERR_ROOTSTOCK_MIG_SRC" });
+  checkSources(
+    {
+      invalid: (path, expected, value) => coded(plain.invalid(path, expected, value)),
+      record: (path, value) => {
+        if (isRecord(value)) return value;
+        throw coded(plain.invalid(path, "an object", value));
+      },
+    },
+    slice,
+    sources,
+  );
 }
 
-function checkSources(refuseCall: SliceRefusals, slice: MigrateSlice, sources: unknown): void {
+function checkSources(refuseCall: Refusals, slice: MigrateSlice, sources: unknown): void {
   if (!Array.isArray(sources) || sources.length === 0) {
     throw refuseCall.invalid("sources", "a non-empty array", sources);
   }

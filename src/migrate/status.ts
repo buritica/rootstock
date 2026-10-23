@@ -62,23 +62,30 @@ export function summarizeStatus(states: readonly SourceStatus[]): MigrationStatu
 const hex8 = (h: string): string => h.slice(0, 8);
 
 function sourceLine(s: SourceStatus): string {
-  const red: string[] = [];
-  if (s.pending.length > 0) red.push(`behind: ${s.pending.map((m) => m.id).join(", ")}`);
-  if (s.ahead.length > 0) red.push(`ahead: ${s.ahead.join(", ")}`);
-  if (s.tampered.length > 0)
-    red.push(
-      `TAMPERED: ${s.tampered.map((t) => `${t.id} recorded ${hex8(t.recorded)} now ${hex8(t.current)}`).join(", ")}`,
-    );
-  if (s.unknown.length > 0) red.push(`unknown rows: ${s.unknown.map((u) => u.rowId).join(", ")}`);
-  if (s.duplicate.length > 0) red.push(`duplicate keys: ${s.duplicate.join(", ")}`);
-  const parts = red.length === 0 && !hasStale(s) ? [`ok (${s.applied.length} applied)`] : red;
-  if (s.accepted.length > 0)
-    parts.push(
-      `accepted: ${s.accepted.map((a) => `${a.id} (${a.reason})${a.stale ? " STALE" : ""}`).join(", ")}`,
-    );
-  if (s.outOfOrder.length > 0) parts.push(`out of order: ${s.outOfOrder.join(", ")}`);
-  if (s.unhashed.length > 0) parts.push(`hashes not yet stamped: ${s.unhashed.length}`);
-  return `${s.source}: ${parts.join("; ")}`;
+  const ok =
+    s.pending.length +
+      s.ahead.length +
+      s.tampered.length +
+      s.unknown.length +
+      s.duplicate.length ===
+      0 && !hasStale(s);
+  // Contract §1.3's order.
+  const parts = [
+    ok ? `ok (${s.applied.length} applied)` : "",
+    s.pending.length > 0 ? `behind: ${s.pending.map((m) => m.id).join(", ")}` : "",
+    s.ahead.length > 0 ? `ahead: ${s.ahead.join(", ")}` : "",
+    s.tampered.length > 0
+      ? `TAMPERED: ${s.tampered.map((t) => `${t.id} recorded ${hex8(t.recorded)} now ${hex8(t.current)}`).join(", ")}`
+      : "",
+    s.accepted.length > 0
+      ? `accepted: ${s.accepted.map((a) => `${a.id} (${a.reason})${a.stale ? " STALE" : ""}`).join(", ")}`
+      : "",
+    s.unknown.length > 0 ? `unknown rows: ${s.unknown.map((u) => u.rowId).join(", ")}` : "",
+    s.duplicate.length > 0 ? `duplicate keys: ${s.duplicate.join(", ")}` : "",
+    s.outOfOrder.length > 0 ? `out of order: ${s.outOfOrder.join(", ")}` : "",
+    s.unhashed.length > 0 ? `hashes not yet stamped: ${s.unhashed.length}` : "",
+  ];
+  return `${s.source}: ${parts.filter((p) => p !== "").join("; ")}`;
 }
 
 /**
@@ -87,6 +94,11 @@ function sourceLine(s: SourceStatus): string {
  * command (contract §6 Q4), so the two are separate lines.
  */
 export function renderMigrationStatus(status: MigrationStatus, opts: { fix: string }): string {
+  if (typeof opts?.fix !== "string" || opts.fix.trim() === "") {
+    throw new Error(
+      `renderMigrationStatus: opts.fix must be a non-empty command — got ${JSON.stringify(opts?.fix)}`,
+    );
+  }
   const lines = status.sources.map(sourceLine);
   if (status.behind) lines.push(`fix: ${opts.fix}`);
   if (status.ahead) {
@@ -141,6 +153,9 @@ export async function rootstockMigrationStatus(
         Object.freeze({ filename: t.id, recorded: t.recorded, shipped: t.current }),
       ),
     ),
+    // 0.3.0's rule plus ahead (D48). Unknown and duplicate rows cannot occur
+    // under the filename primary key, and a stale acceptance never hides a
+    // tamper, so migrationStatus's tracker-rot flag is left out on purpose.
     red: s.pending.length > 0 || s.tampered.length > 0 || s.ahead.length > 0,
   });
 }

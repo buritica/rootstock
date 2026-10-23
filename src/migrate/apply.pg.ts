@@ -207,6 +207,23 @@ describe("applyRootstockMigrations", () => {
       { filename: FILE, recorded: zeros, shipped: SHIPPED[0]?.sha256 ?? "" },
     ]);
     expect(status.red).toBe(true);
+    // Since 0.5.0 a slice acceptance of exactly that pair hides it.
+    const accepted = migrateSlice({
+      schema: slice.schema,
+      accepted: [
+        {
+          source: "rootstock",
+          id: FILE,
+          recorded: zeros,
+          current: SHIPPED[0]?.sha256 ?? "",
+          reason: "test",
+        },
+      ],
+    });
+    expect(await rootstockMigrationStatus(sql, accepted)).toMatchObject({
+      tampered: [],
+      red: false,
+    });
   });
 
   test("ahead-refuse: an unshipped applied row always refuses; with a pending file it has diverged", async () => {
@@ -220,7 +237,11 @@ describe("applyRootstockMigrations", () => {
     expect(await refusal(applyMigrationList(main.transactor, slice, SHIPPED))).toBe(
       `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock`,
     );
-    expect((await rootstockMigrationStatus(sql, slice)).red).toBe(true);
+    expect(await rootstockMigrationStatus(sql, slice)).toMatchObject({
+      ahead: [FUTURE],
+      pending: [],
+      red: true,
+    });
     expect(await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, EXTRA]))).toBe(
       `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship, and is missing ${EXTRA.filename} — the database and this package have diverged; refusing`,
     );

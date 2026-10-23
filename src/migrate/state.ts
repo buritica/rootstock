@@ -161,9 +161,14 @@ export async function readStates(
   slice: MigrateSlice,
   sources: readonly TrackedSource[],
 ): Promise<SourceState[]> {
-  // Independent reads: a pooled client runs them side by side.
-  const reads = await Promise.all(sources.map((s) => readTracker(sql, s.tracker, slice)));
-  return sources.map((s, i) => sourceState(s, reads[i] as TrackerRead, slice.accepted));
+  // In source order, one at a time: the first failure is then always the same
+  // source's, so a refusal (and the exit code a CLI derives from it) does not
+  // depend on which query settled first.
+  const states: SourceState[] = [];
+  for (const s of sources) {
+    states.push(sourceState(s, await readTracker(sql, s.tracker, slice), slice.accepted));
+  }
+  return states;
 }
 
 /** An acceptance whose pair no longer matches the row and the file. */

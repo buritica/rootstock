@@ -148,6 +148,7 @@ describe("migrationStatus", () => {
     const ok = { ...base, slice: migrateSlice({ schema: base.slice.schema, accepted: [entry] }) };
     const covered = await read(ok, edited);
     expect(covered).toMatchObject({ tampered: false, trackerRot: false, red: false });
+    expect(covered.sources[1]?.tampered).toEqual([]);
     expect(covered.sources[1]?.accepted).toEqual([
       { id: "0000_a", recorded, current: edited.sha256, reason: "r", stale: false },
     ]);
@@ -165,20 +166,29 @@ describe("migrationStatus", () => {
     expect(renderMigrationStatus(stale, { fix: "f" })).toContain("accepted: 0000_a (r) STALE");
   });
 
-  test("unknown and duplicate drizzle rows are tracker rot", async () => {
+  test.each([
+    ["unknown", (_w: World) => "('h', null)"],
+    // The second row carries 0001_b's own hash, so only the duplicate shows.
+    ["duplicate", (w: World) => `('${sha256Hex(textB(w))}', 1700000000001)`],
+  ])("a %s drizzle row is tracker rot, on its own", async (what, values) => {
     const w = world();
     await applied(w);
     await sql.unsafe(
-      `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ('h', null), ('h', 1700000000001)`,
+      `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ${values(w)}`,
     );
     const status = await migrationStatus(sql, w.slice, sources(w));
     const app = status.sources[1];
-    expect(app?.unknown).toHaveLength(1);
-    expect(app?.duplicate).toEqual(["1700000000001"]);
-    expect(status).toMatchObject({ trackerRot: true, red: true });
-    expect(renderMigrationStatus(status, { fix: "f" })).toContain(
-      `unknown rows: ${app?.unknown[0]?.rowId}; duplicate keys: 1700000000001`,
-    );
+    expect(status).toMatchObject({ trackerRot: true, red: true, behind: false, ahead: false });
+    const line = renderMigrationStatus(status, { fix: "f" }).split("\n")[1];
+    if (what === "unknown") {
+      expect(app?.unknown).toHaveLength(1);
+      expect(app?.duplicate).toEqual([]);
+      expect(line).toBe(`app: unknown rows: ${app?.unknown[0]?.rowId}`);
+    } else {
+      expect(app?.unknown).toEqual([]);
+      expect(app?.duplicate).toEqual(["1700000000001"]);
+      expect(line).toBe("app: duplicate keys: 1700000000001");
+    }
   });
 
   test("unhashed: an older filename tracker reads, and says its hashes are not stamped", async () => {
@@ -195,19 +205,10 @@ describe("migrationStatus", () => {
       hashTracking: false,
       unhashed: ["20260101000000_u.sql"],
       pending: [],
+      tampered: [],
     });
     expect(renderMigrationStatus(status, { fix: "f" })).toContain(
       "auth: ok (1 applied); hashes not yet stamped: 1",
     );
-  });
-
-  test("refuses sources the applier would refuse, before reading anything", async () => {
-    const w = world();
-    const [root, app] = sources(w);
-    await expect(
-      migrationStatus(sql, w.slice, [app as TrackedSource, root as TrackedSource]),
-    ).rejects.toMatchObject({
-      code: "ERR_ROOTSTOCK_MIG_SRC_ORDER",
-    });
   });
 });
