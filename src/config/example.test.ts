@@ -1,36 +1,40 @@
 import { describe, expect, test } from "bun:test";
+import { concurrencySlice } from "../concurrency/index.ts";
+import { clientSlice } from "../db/index.ts";
+import { migrateSlice } from "../migrate/index.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
 import { printRootstockConfig } from "./print.ts";
 import type {
-  ClientSliceInput,
-  ClientSliceView,
-  ConcurrencySliceInput,
-  ConcurrencySliceView,
-  MigrateSliceInput,
-  MigrateSliceView,
+  ClientInput,
+  ClientSlice,
+  ConcurrencyInput,
+  ConcurrencySlice,
+  MigrateInput,
+  MigrateSlice,
   SliceParsers,
 } from "./slices.ts";
 
-// Test doubles of the three slice parsers, built from their frozen
-// signatures: each copies its input and returns it unfrozen, so every freeze
-// these tests observe is config's own. The O3 composition test replaces them
-// with the real parsers once those exist. The cast is what lets them stand
-// in for a real parser whose result also carries its slice's brand type.
-const doubles = {
-  clientSlice: (input: ClientSliceInput): ClientSliceView => ({
-    profiles: Object.fromEntries(Object.entries(input.profiles).map(([k, p]) => [k, { ...p }])),
-  }),
-  migrateSlice: (input: MigrateSliceInput): MigrateSliceView => ({
-    schema: input.schema ?? "rootstock",
-    ahead: input.ahead,
-  }),
-  concurrencySlice: (input: ConcurrencySliceInput): ConcurrencySliceView => ({
-    widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
-  }),
-} as unknown as SliceParsers;
+const parsers: SliceParsers = { clientSlice, migrateSlice, concurrencySlice };
 
-const define = (input: RootstockConfigInput) => composeRootstockConfig(doubles, input);
+// The one test double: each parser copies its input and returns it unfrozen
+// and unbranded, so the freezes nested-frozen observes are config's own and
+// print can be handed a slice that holds more than its frozen fields. The
+// casts are what let a plain object stand in for a branded slice.
+const unfrozen = {
+  clientSlice: (input: ClientInput) =>
+    ({
+      profiles: Object.fromEntries(Object.entries(input.profiles).map(([k, p]) => [k, { ...p }])),
+    }) as unknown as ClientSlice,
+  migrateSlice: (input: MigrateInput) =>
+    ({ schema: input.schema ?? "rootstock", ahead: input.ahead }) as unknown as MigrateSlice,
+  concurrencySlice: (input: ConcurrencyInput) =>
+    ({
+      widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
+    }) as unknown as ConcurrencySlice,
+} satisfies SliceParsers;
+
+const define = (input: RootstockConfigInput) => composeRootstockConfig(parsers, input);
 
 const exampleInput: RootstockConfigInput = {
   client: {
@@ -189,24 +193,20 @@ describe("print", () => {
 
   test("print keeps only the frozen fields a parser hands back", () => {
     const leaky = {
-      ...doubles,
-      clientSlice: (input: ClientSliceInput) => {
-        const view = (doubles.clientSlice as unknown as (i: ClientSliceInput) => ClientSliceView)(
-          input,
-        );
-        for (const p of Object.values(view.profiles)) {
+      ...unfrozen,
+      clientSlice: (input: ClientInput) => {
+        const slice = unfrozen.clientSlice(input);
+        for (const p of Object.values(slice.profiles)) {
           Object.assign(p, { url: ["postgres://u:p", "db.example.com/x"].join("@") });
         }
-        return view;
+        return slice;
       },
-      concurrencySlice: (input: ConcurrencySliceInput) => {
-        const view = (
-          doubles.concurrencySlice as unknown as (i: ConcurrencySliceInput) => ConcurrencySliceView
-        )(input);
-        for (const w of Object.values(view.widths)) Object.assign(w, { secret: "token" });
-        return view;
+      concurrencySlice: (input: ConcurrencyInput) => {
+        const slice = unfrozen.concurrencySlice(input);
+        for (const w of Object.values(slice.widths)) Object.assign(w, { secret: "token" });
+        return slice;
       },
-    } as unknown as SliceParsers;
+    } satisfies SliceParsers;
     expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
   });
 
@@ -220,7 +220,7 @@ describe("print", () => {
   });
 
   test("unbranded-slice-refused", () => {
-    const slice = doubles.migrateSlice({ ahead: "refuse" });
+    const slice = migrateSlice({ ahead: "refuse" });
     // biome-ignore lint/suspicious/noExplicitAny: an unbranded object on purpose
     expect(messageOf(() => printRootstockConfig(slice as any))).toBe(UNBRANDED);
   });
@@ -233,7 +233,7 @@ describe("define", () => {
     const spy: SliceParsers = {
       clientSlice: (i) => {
         calls.push("client");
-        return doubles.clientSlice(i);
+        return clientSlice(i);
       },
       migrateSlice: () => {
         calls.push("migrate");
@@ -241,7 +241,7 @@ describe("define", () => {
       },
       concurrencySlice: (i) => {
         calls.push("concurrency");
-        return doubles.concurrencySlice(i);
+        return concurrencySlice(i);
       },
     };
     let caught: unknown;
@@ -324,7 +324,8 @@ describe("define", () => {
   );
 
   test("nested-frozen", () => {
-    const config = define(exampleInput);
+    // The double hands back unfrozen slices, so every freeze here is config's.
+    const config = composeRootstockConfig(unfrozen, exampleInput);
     expect(Object.isFrozen(config)).toBe(true);
     expect(Object.isFrozen(config.invariants)).toBe(true);
     const app = config.client.profiles.app as { max: unknown };
@@ -404,11 +405,10 @@ describe("brand and failure paths", () => {
     // would be refused by every function that takes that slice.
     const made: Record<string, unknown> = {};
     const recording = {
-      clientSlice: (i: ClientSliceInput) => (made.client = doubles.clientSlice(i as never)),
-      migrateSlice: (i: MigrateSliceInput) => (made.migrate = doubles.migrateSlice(i as never)),
-      concurrencySlice: (i: ConcurrencySliceInput) =>
-        (made.concurrency = doubles.concurrencySlice(i as never)),
-    } as unknown as SliceParsers;
+      clientSlice: (i: ClientInput) => (made.client = clientSlice(i)),
+      migrateSlice: (i: MigrateInput) => (made.migrate = migrateSlice(i)),
+      concurrencySlice: (i: ConcurrencyInput) => (made.concurrency = concurrencySlice(i)),
+    } satisfies SliceParsers;
     const config = composeRootstockConfig(recording, exampleInput);
     expect(config.client).toBe(made.client as typeof config.client);
     expect(config.migrate).toBe(made.migrate as typeof config.migrate);
@@ -576,7 +576,7 @@ describe("brand and failure paths", () => {
   test("parser-errors-come-before-invariant-ids", () => {
     const boom = new Error("concurrencySlice: widths is required");
     const failing = {
-      ...doubles,
+      ...parsers,
       concurrencySlice: () => {
         throw boom;
       },

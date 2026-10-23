@@ -25,34 +25,27 @@ const input = {
   concurrency: { widths: { fetch: { default: 2, max: 4 } } },
 } as RootstockConfigInput;
 
-const exported = {
-  clientSlice: (db as Partial<SliceParsers>).clientSlice,
-  migrateSlice: (migrate as Partial<SliceParsers>).migrateSlice,
-  concurrencySlice: (concurrency as Partial<SliceParsers>).concurrencySlice,
+const parsers: SliceParsers = {
+  clientSlice: db.clientSlice,
+  migrateSlice: migrate.migrateSlice,
+  concurrencySlice: concurrency.concurrencySlice,
 };
 
 describe("defineRootstockConfig", () => {
-  test("uses the subpaths' own parsers, or refuses by name while one is missing", () => {
-    const missing = Object.entries(exported).find(([, p]) => typeof p !== "function");
-    if (missing) {
-      expect(() => defineRootstockConfig(input)).toThrow(
-        `defineRootstockConfig: ${missing[0]} is not exported by its subpath`,
-      );
-    } else {
-      expect(printRootstockConfig(defineRootstockConfig(input))).toBe(
-        printRootstockConfig(composeRootstockConfig(exported as SliceParsers, input)),
-      );
-    }
+  test("uses the subpaths' own parsers", () => {
+    expect(printRootstockConfig(defineRootstockConfig(input))).toBe(
+      printRootstockConfig(composeRootstockConfig(parsers, input)),
+    );
+  });
+
+  test("a slice parser's refusal reaches the caller unchanged", () => {
+    expect(() => defineRootstockConfig({ ...input, migrate: {} as never })).toThrow(
+      "migrateSlice: ahead is required",
+    );
   });
 });
 
 describe("composed with the real slice parsers", () => {
-  const parsers = {
-    clientSlice: db.clientSlice,
-    migrateSlice: migrate.migrateSlice,
-    concurrencySlice: concurrency.concurrencySlice,
-  } as SliceParsers;
-
   test("the composed client slice is still the parser's own, branded slice", () => {
     const config = composeRootstockConfig(parsers, input);
     expect(db.postgresJsOptions(config.client, "app")).toEqual({
