@@ -10,8 +10,12 @@ export interface ApplyReport {
   /** The bootstrap of this run created the schema. */
   readonly schemaCreated: boolean;
   readonly applied: readonly string[];
+  /** Files that needed nothing, including those another applier ran first. */
   readonly alreadyApplied: number;
-  /** Always empty since 0.5.0: a manual apply refuses a database that is ahead. */
+  /**
+   * @deprecated Always empty since 0.5.0: a manual apply refuses a database
+   * that is ahead.
+   */
   readonly ahead: readonly string[];
 }
 
@@ -80,7 +84,12 @@ export async function applyMigrationList(
   });
 }
 
-/** Applies every shipped rootstock migration the slice's schema has not applied. */
+/**
+ * Applies every shipped rootstock migration the slice's schema has not applied.
+ * Since 0.5.0 each file commits on its own (a failure leaves earlier files
+ * applied, and the created schema stays), and a database with rows this
+ * package does not ship always refuses.
+ */
 export function applyRootstockMigrations(
   transactor: Transactor,
   slice: MigrateSlice,

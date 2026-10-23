@@ -33,7 +33,7 @@ export interface SourceState {
     reason: string;
     stale: boolean;
   }[];
-  /** drizzle rows whose created_at is NULL or not a decimal integer. */
+  /** drizzle rows whose created_at is NULL or not an integer. */
   readonly unknown: readonly { rowId: number; hash: string }[];
   /** Keys held by more than one row. */
   readonly duplicate: readonly string[];
@@ -43,7 +43,8 @@ export interface SourceState {
   readonly unhashed: readonly string[];
 }
 
-const DECIMAL = /^(0|[1-9][0-9]*)$/;
+// A journal `when` the reader accepts is any safe integer, negative included.
+const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
 
 /**
  * The slice's acceptance naming this file, and whether it covers exactly the

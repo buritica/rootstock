@@ -1,6 +1,6 @@
-import { quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
+import { pgCode, quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
 import { own, q, sliceRefusals } from "../internal/slice.ts";
-import { fail, failAs, refusalCode } from "./errors.ts";
+import { fail, failAs, reason, refusalCode } from "./errors.ts";
 import { type MigrationKind, NAME_RULE } from "./marker.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
@@ -146,7 +146,7 @@ async function lock(tx: TxSql, slice: MigrateSlice): Promise<void> {
   await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${slice.schema}`}::text)::bigint)`;
 }
 
-function validate(slice: MigrateSlice, sources: unknown, opts: unknown): ApplyOptions {
+function validateOptions(slice: MigrateSlice, opts: unknown): ApplyOptions {
   assertMigrateSlice("applyMigrations", slice);
   const o = refuseCall.record("options", opts);
   refuseCall.refuseUnknownKeys(o, OPTION_KEYS, "options.");
@@ -186,12 +186,28 @@ function validate(slice: MigrateSlice, sources: unknown, opts: unknown): ApplyOp
   if (onEvent !== undefined && typeof onEvent !== "function") {
     throw refuseCall.invalid("options.onEvent", "a function", onEvent);
   }
-  if (own(o, "allowHeavy") === true && entry === "deploy") {
-    throw new Error(
-      'applyMigrations: options.allowHeavy is for entry "manual" only — a deploy never applies a heavy migration',
+  return Object.freeze({
+    entry,
+    backup: Object.freeze(
+      run === undefined
+        ? { skip: skip as string }
+        : { run: run as (plan: MigrationPlan) => Promise<void> },
+    ),
+    fix,
+    ...(own(o, "allowHeavy") === true ? { allowHeavy: true } : {}),
+    ...(own(o, "planOnly") === true ? { planOnly: true } : {}),
+    ...(onEvent === undefined ? {} : { onEvent: onEvent as ApplyOptions["onEvent"] }),
+  }) as ApplyOptions;
+}
+
+/** The refusals that carry a code, so the caller's `migrate.refused` sees them too. */
+function validateSources(slice: MigrateSlice, sources: unknown, opts: ApplyOptions): void {
+  if (opts.allowHeavy === true && opts.entry === "deploy") {
+    fail(
+      'options.allowHeavy is for entry "manual" only — a deploy never applies a heavy migration',
+      "ERR_ROOTSTOCK_MIG_DEPLOY_HEAVY",
     );
   }
-
   if (!Array.isArray(sources) || sources.length === 0) {
     throw refuseCall.invalid("sources", "a non-empty array", sources);
   }
@@ -235,12 +251,11 @@ function validate(slice: MigrateSlice, sources: unknown, opts: unknown): ApplyOp
       (m) => m?.source !== src.name,
     );
     if (stray !== undefined) {
-      throw new Error(
-        `applyMigrations: sources[${i}].migrations must all be source ${q(src.name)}'s — got ${q(stray?.id)} of source ${q(stray?.source)}`,
+      fail(
+        `sources[${i}].migrations must all be source ${q(src.name)}'s — got ${q(stray?.id)} of source ${q(stray?.source)}`,
       );
     }
   }
-  return o as unknown as ApplyOptions;
 }
 
 /**
@@ -314,21 +329,14 @@ function refuseIfBlocked(run: Run, states: readonly SourceState[]): void {
     const [t] = s.tampered;
     if (t !== undefined) texts.tamper(s.source, t.id, t.recorded, t.current, t.acceptedCurrent);
   }
-  for (const [i, s] of states.entries()) {
-    if (s.ahead.length === 0 || s.pending.length === 0) continue;
-    const pendingIds = s.pending.map((m) => m.id).join(", ");
-    // validate() pins rootstock's own source first; its divergence keeps Stage A's text.
-    if (i === 0) {
-      failAs(
-        `applyRootstockMigrations: schema "${slice.schema}" has applied ${s.ahead.join(", ")}, which this package does not ship, and is missing ${pendingIds} — the database and this package have diverged; refusing`,
-        "ERR_ROOTSTOCK_MIG_DIVERGED",
-      );
-    }
-    // An app source too: a lost renames.json reads exactly this way, and
-    // applying would re-run every renamed file.
-    fail(
-      `source ${q(s.source)} has applied ${s.ahead.join(", ")}, which this checkout does not have, and is missing ${pendingIds} — the database and this checkout have diverged (a renamed file without its renames.json entry reads this way); refusing`,
-      "ERR_ROOTSTOCK_MIG_DIVERGED_SRC",
+  // rootstock's own source only (B2; validateSources() pins it first): an app
+  // source with rows ahead and files pending is the rollback-then-hotfix
+  // deploy, which applies and reports the ahead ids.
+  const [mine] = states;
+  if (mine !== undefined && mine.ahead.length > 0 && mine.pending.length > 0) {
+    failAs(
+      `applyRootstockMigrations: schema "${slice.schema}" has applied ${mine.ahead.join(", ")}, which this package does not ship, and is missing ${mine.pending.map((m) => m.id).join(", ")} — the database and this package have diverged; refusing`,
+      "ERR_ROOTSTOCK_MIG_DIVERGED",
     );
   }
   if (opts.entry === "manual") {
@@ -385,8 +393,6 @@ async function bootstrap(
   const { slice, sources } = run;
   return transactor.begin(async (tx) => {
     await lock(tx, slice);
-    const { exists } = await preflight(tx, slice.schema);
-    if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(slice.schema)}`);
     const [iso] = await tx<{
       level: string;
     }>`select current_setting('transaction_isolation') as level`;
@@ -396,6 +402,8 @@ async function bootstrap(
         "ERR_ROOTSTOCK_MIG_ISOLATION",
       );
     }
+    const { exists } = await preflight(tx, slice.schema);
+    if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(slice.schema)}`);
     await tx.unsafe(`SET LOCAL lock_timeout = '${BOOTSTRAP_LOCK_TIMEOUT}'`);
     const created: string[] = [];
     const upgraded: string[] = [];
@@ -407,12 +415,11 @@ async function bootstrap(
         done = await bootstrapTracker(tx, source, slice);
       } catch (err) {
         if (refusalCode(err) !== undefined) throw err;
-        throw Object.assign(
-          new Error(
-            `rootstock migrate: preparing source ${q(source.name)}'s tracker ${trackerName(source.tracker, slice)} failed (nothing was changed; another migrator holding it reads this way) — ${(err as Error).message}`,
-            { cause: err },
-          ),
-          { code: (err as { code?: unknown }).code },
+        // Uncoded on purpose: a driver error, whose SQLSTATE pgCode() finds on the cause.
+        const waited = pgCode(err) === "55P03" ? "; another migrator is holding it" : "";
+        throw new Error(
+          `rootstock migrate: preparing source ${q(source.name)}'s tracker ${trackerName(source.tracker, slice)} failed, so nothing was changed${waited} — ${reason(err)}`,
+          { cause: err },
         );
       }
       if (done.created) {
@@ -465,7 +472,15 @@ async function applyOne(
     }
     // No parameters: the simple protocol, so a multi-statement chunk runs and
     // a `$1` inside a body is text, as the origin migrators run it.
-    for (const statement of m.statements) await tx.unsafe(statement);
+    try {
+      for (const statement of m.statements) await tx.unsafe(statement);
+    } catch (err) {
+      // Uncoded: the file's own failure, rolled back alone; pgCode() finds its SQLSTATE.
+      throw new Error(
+        `rootstock migrate: ${label(source.name, m.id)} failed and was rolled back; files before it stay applied — ${reason(err)}`,
+        { cause: err },
+      );
+    }
     await recordApplied(tx, source.tracker, slice, m);
     return "applied";
   });
@@ -484,18 +499,24 @@ export async function runMigrations(
   /** The rootstock-only entry point: Stage A's texts, byte-identical. */
   stageA = false,
 ): Promise<ApplyOutcome> {
-  const opts = validate(slice, sources, rawOpts);
+  const opts = validateOptions(slice, rawOpts);
   const hook = opts.onEvent;
   const emit = (e: MigrateEvent): void => {
+    // A hook never changes what a run does, and an async one that rejects
+    // must not become an unhandled rejection mid-deploy.
     try {
-      hook?.(e);
+      const out: unknown = hook?.(e);
+      if (typeof (out as PromiseLike<unknown> | undefined)?.then === "function") {
+        (out as PromiseLike<unknown>).then(undefined, () => undefined);
+      }
     } catch {
-      // A hook never changes what a run does.
+      // ignored, as above
     }
   };
   const texts = stageA ? stageATexts(slice.schema) : SOURCE_TEXTS;
   const run: Run = { slice, sources, opts, texts, emit };
   try {
+    validateSources(slice, sources, opts);
     return await steps(transactor, run);
   } catch (err) {
     const code = refusalCode(err);
@@ -507,7 +528,11 @@ export async function runMigrations(
 async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
   const { opts, emit } = run;
   let schemaCreated = false;
-  let boot: ApplyResult["bootstrap"] = Object.freeze({ created: [], upgraded: [], stamped: 0 });
+  let boot: ApplyResult["bootstrap"] = Object.freeze({
+    created: Object.freeze([]),
+    upgraded: Object.freeze([]),
+    stamped: 0,
+  });
   if (opts.planOnly !== true) {
     const done = await bootstrap(transactor, run);
     schemaCreated = done.schemaCreated;
@@ -553,7 +578,10 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
   const applied: { source: string; id: string; ms: number }[] = [];
   const skipped: { source: string; id: string }[] = [];
   for (const [i, source] of run.sources.entries()) {
-    for (const m of states[i]?.pending ?? []) {
+    const state = states[i];
+    if (state === undefined)
+      throw new Error(`rootstock migrate: no state read for ${q(source.name)}`);
+    for (const m of state.pending) {
       emit({ type: "migrate.applying", source: m.source, id: m.id, kind: m.kind });
       const started = performance.now();
       const outcome = await applyOne(transactor, run, source, m);
@@ -589,7 +617,7 @@ async function verify(transactor: Transactor, run: Run, plan: MigrationPlan): Pr
   if (stillPending.length > 0 || tampered.length > 0) {
     const parts = [
       ...(stillPending.length > 0 ? [`${stillPending.join(", ")} still read as pending`] : []),
-      ...(tampered.length > 0 ? [`${tampered.join(", ")} read as tampered`] : []),
+      ...(tampered.length > 0 ? [`${tampered.join(", ")} still read as tampered`] : []),
     ];
     fail(
       `after applying, ${parts.join(" and ")} — the tracker and the database disagree; do not re-run until this is understood`,

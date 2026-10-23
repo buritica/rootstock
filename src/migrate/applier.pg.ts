@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { Sql, Transactor } from "../db/index.ts";
+import { pgCode, type Sql, type Transactor } from "../db/index.ts";
 import {
   openPooled,
   openSecond,
@@ -7,7 +7,12 @@ import {
   type TestTransactor,
 } from "../db/transactor.pg-support.ts";
 import { sha256Hex } from "../hash/index.ts";
-import { type ApplyOptions, applyMigrations, type MigrateEvent } from "./applier.ts";
+import {
+  type ApplyOptions,
+  type ApplyResult,
+  applyMigrations,
+  type MigrateEvent,
+} from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
 import type { MigrationKind } from "./marker.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
@@ -264,6 +269,8 @@ describe("applyMigrations", () => {
     );
     const row = await one<{ v: number }>(`select "${w.d}".twice(21) as v`);
     expect(row?.v).toBe(42);
+    await sql.unsafe(`insert into "${w.d}".t default values`);
+    expect(await one<{ note: string }>(`select note from "${w.d}".t`)).toEqual({ note: "$1" });
   });
 
   test("entry deploy refuses heavy and unmarked files, naming each and the fix", async () => {
@@ -331,7 +338,7 @@ describe("applyMigrations", () => {
     expect(again.bootstrap.created).toEqual([]);
   });
 
-  test("ahead: deploy applies and reports it, manual refuses it, ahead plus pending has diverged", async () => {
+  test("ahead: deploy reports it, manual refuses it, and a rollback-then-hotfix deploy applies", async () => {
     const w = world();
     await applyMigrations(main.transactor, w.slice, appSources(w), opts());
     const [root, app, auth] = appSources(w);
@@ -359,12 +366,15 @@ describe("applyMigrations", () => {
       },
       auth,
     ];
-    const diverged = await rejected(applyMigrations(main.transactor, w.slice, hotfix, opts()));
-    expect(diverged).toEqual({
-      message:
-        'rootstock migrate: source "app" has applied 1700000000001, which this checkout does not have, and is missing 0002_fix — the database and this checkout have diverged (a renamed file without its renames.json entry reads this way); refusing',
-      code: "ERR_ROOTSTOCK_MIG_DIVERGED_SRC",
-    });
+    // Ahead plus pending in an app source is not diverged (B2): the deploy
+    // applies the hotfix and reports the rolled-back row.
+    const fixed = await applyMigrations(main.transactor, w.slice, hotfix, opts());
+    expect(fixed.applied.map((a) => a.id)).toEqual(["0002_fix"]);
+    expect(fixed.plan.ahead).toEqual([{ source: "app", id: "1700000000001" }]);
+    expect(
+      (await rejected(applyMigrations(main.transactor, w.slice, hotfix, opts({ entry: "manual" }))))
+        .code,
+    ).toBe("ERR_ROOTSTOCK_MIG_AHEAD_SRC");
   });
 
   test("tampered: refused unless the slice accepts exactly that pair", async () => {
@@ -426,6 +436,8 @@ describe("applyMigrations", () => {
     await sql.unsafe(`CREATE TABLE "${w.f}".schema_migrations (filename int PRIMARY KEY)`);
     const err = await rejected(applyMigrations(main.transactor, w.slice, appSources(w), opts()));
     expect(err.code).toBe("ERR_ROOTSTOCK_MIG_TRACKER_SHAPE");
+    expect(err.message).toContain(`${w.f}.schema_migrations`);
+    expect(err.message).toContain("filename integer");
     // The bootstrap is one transaction: the drizzle tracker it made first is gone too.
     const row = await one<{ e: boolean }>("select to_regnamespace($1::text) is not null as e", [
       w.d,
@@ -433,20 +445,26 @@ describe("applyMigrations", () => {
     expect(row?.e).toBe(false);
   });
 
-  test("isolation: a role defaulting to repeatable read is refused, and nothing is created", async () => {
-    const w = world();
-    await sql.unsafe("SET default_transaction_isolation = 'repeatable read'");
-    try {
-      const err = await rejected(applyMigrations(main.transactor, w.slice, appSources(w), opts()));
-      expect(err.code).toBe("ERR_ROOTSTOCK_MIG_ISOLATION");
-    } finally {
-      await sql.unsafe("RESET default_transaction_isolation");
-    }
-    const row = await one<{ e: boolean }>("select to_regnamespace($1::text) is not null as e", [
-      w.slice.schema,
-    ]);
-    expect(row?.e).toBe(false);
-  });
+  for (const level of ["repeatable read", "serializable"]) {
+    test(`isolation: a role defaulting to ${level} is refused, and nothing is created`, async () => {
+      const w = world();
+      await sql.unsafe(`SET default_transaction_isolation = '${level}'`);
+      try {
+        const err = await rejected(
+          applyMigrations(main.transactor, w.slice, appSources(w), opts()),
+        );
+        expect(err.code).toBe("ERR_ROOTSTOCK_MIG_ISOLATION");
+      } finally {
+        await sql.unsafe("RESET default_transaction_isolation");
+      }
+      for (const name of [w.slice.schema, w.d, w.f]) {
+        const row = await one<{ e: boolean }>("select to_regnamespace($1::text) is not null as e", [
+          name,
+        ]);
+        expect(row?.e).toBe(false);
+      }
+    });
+  }
 
   test("verify: a file that removes an earlier file's row fails the run after applying", async () => {
     const w = world();
@@ -469,16 +487,266 @@ describe("applyMigrations", () => {
       code: "ERR_ROOTSTOCK_MIG_VERIFY",
     });
   });
+
+  test("verify: a file that rewrites an earlier file's hash fails the run as tampered", async () => {
+    const w = world();
+    const sources = [
+      rootstockSource(w.slice),
+      drizzleSource(w, [
+        mig("app", "0000_a", "1700000000000", `CREATE TABLE "${w.d}".a (x int)`),
+        mig(
+          "app",
+          "0001_rw",
+          "1700000000001",
+          `UPDATE "${w.d}".__drizzle_migrations SET hash = 'x' WHERE created_at = 1700000000000`,
+        ),
+      ]),
+    ];
+    expect(await rejected(applyMigrations(main.transactor, w.slice, sources, opts()))).toEqual({
+      message:
+        "rootstock migrate: after applying, app/0000_a still read as tampered — the tracker and the database disagree; do not re-run until this is understood",
+      code: "ERR_ROOTSTOCK_MIG_VERIFY",
+    });
+  });
+
+  test("a failing file names itself, keeps its SQLSTATE, and rolls back alone", async () => {
+    const w = world();
+    const sources = [
+      rootstockSource(w.slice),
+      drizzleSource(w, [
+        mig("app", "0000_a", "1700000000000", `CREATE TABLE "${w.d}".a (x int)`),
+        mig(
+          "app",
+          "0001_bad",
+          "1700000000001",
+          `CREATE TABLE "${w.d}".z (x int);\n--> statement-breakpoint\nSELECT 1/0`,
+        ),
+      ]),
+    ];
+    const err = await applyMigrations(main.transactor, w.slice, sources, opts()).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err?.message).toStartWith(
+      "rootstock migrate: app/0001_bad failed and was rolled back; files before it stay applied — ",
+    );
+    expect(pgCode(err)).toBe("22012");
+    expect((await drizzleRows(w)).map((r) => r.created_at)).toEqual(["1700000000000"]);
+  });
+
+  test("an older tracker without hashes is upgraded and stamped, with its events", async () => {
+    const w = world();
+    await sql.unsafe(`CREATE SCHEMA "${w.f}"`);
+    await sql.unsafe(
+      `CREATE TABLE "${w.f}".schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`,
+    );
+    await sql.unsafe(
+      `INSERT INTO "${w.f}".schema_migrations (filename) VALUES ('20260101000000_u.sql')`,
+    );
+    await sql.unsafe(`CREATE TABLE "${w.f}".u (x int)`);
+    const { events, onEvent } = recorder();
+    const result = await applyMigrations(
+      main.transactor,
+      w.slice,
+      appSources(w),
+      opts({ onEvent }),
+    );
+    expect(result.bootstrap).toEqual({
+      created: [`${w.d}.__drizzle_migrations`],
+      upgraded: [`${w.f}.schema_migrations`],
+      stamped: 1,
+    });
+    expect(events.slice(0, 3)).toEqual([
+      { type: "migrate.tracker_created", source: "app", table: `${w.d}.__drizzle_migrations` },
+      { type: "migrate.tracker_upgraded", source: "auth", table: `${w.f}.schema_migrations` },
+      { type: "migrate.hash_stamped", source: "auth", id: "20260101000000_u.sql" },
+    ]);
+    expect(events).toContainEqual({
+      type: "migrate.applying",
+      source: "app",
+      id: "0000_a",
+      kind: "additive",
+    });
+    expect(result.plan.apply.map((a) => a.id)).not.toContain("20260101000000_u.sql");
+  });
+
+  test("planOnly takes no lock: it answers while another session holds the migration lock", async () => {
+    const w = world();
+    const holder = openSecond();
+    try {
+      await holder.transactor.sql.unsafe(
+        "select 1::int as held from pg_advisory_lock(hashtext($1::text)::bigint)",
+        [`rootstock-migrate:${w.slice.schema}`],
+      );
+      const answered = await Promise.race([
+        applyMigrations(main.transactor, w.slice, appSources(w), opts({ planOnly: true })).then(
+          () => "answered",
+        ),
+        new Promise((r) => setTimeout(() => r("blocked"), 3000)),
+      ]);
+      expect(answered).toBe("answered");
+    } finally {
+      await holder.close();
+    }
+  });
+
+  test("refusal order: first match wins (§1.4 step 2)", async () => {
+    const w = world();
+    await applyMigrations(main.transactor, w.slice, appSources(w), opts());
+    const [root, app, auth] = appSources(w);
+    if (root === undefined || app === undefined || auth === undefined) throw new Error("fixture");
+    const code = async (sources: TrackedSource[], o: Partial<ApplyOptions> = {}) =>
+      (await rejected(applyMigrations(main.transactor, w.slice, sources, opts(o)))).code;
+    const edited = mig("app", "0000_a", "1700000000000", `CREATE TABLE "${w.d}".a (x int) -- e`);
+    const heavy = mig("app", "0002_h", "1700000000002", `CREATE TABLE "${w.d}".h (x int)`, "heavy");
+    // ahead (0001_b dropped) + pending heavy, under manual: ahead is refused before heavy.
+    const aheadHeavy = [
+      root,
+      { ...app, migrations: [app.migrations[0] as SourceMigration, heavy] },
+      auth,
+    ];
+    expect(await code(aheadHeavy, { entry: "manual" })).toBe("ERR_ROOTSTOCK_MIG_AHEAD_SRC");
+    // the same under deploy: ahead is reported, heavy refuses.
+    expect(await code(aheadHeavy)).toBe("ERR_ROOTSTOCK_MIG_DEPLOY_HEAVY");
+    // tamper + ahead: tamper first, under either entry.
+    const tamperAhead = [root, { ...app, migrations: [edited] }, auth];
+    expect(await code(tamperAhead, { entry: "manual" })).toBe("ERR_ROOTSTOCK_MIG_TAMPER_SRC");
+    // an unknown row + tamper: the tracker rows first.
+    await sql.unsafe(
+      `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ('h', null)`,
+    );
+    expect(await code(tamperAhead)).toBe("ERR_ROOTSTOCK_MIG_TRACKER_ROWS");
+  });
+});
+
+describe("the per-file re-read (§1.4 step 5): a row that appears after the plan", () => {
+  /**
+   * Bootstraps and plans, then lets `between` write as another applier would
+   * (the backup hook runs after the plan, before the first file).
+   */
+  async function withRowAfterPlan(
+    w: World,
+    between: () => Promise<void>,
+    slice: MigrateSlice = w.slice,
+  ): Promise<{
+    result?: ApplyResult;
+    err?: { message: string; code: unknown };
+    events: MigrateEvent[];
+  }> {
+    const { events, onEvent } = recorder();
+    try {
+      const result = await applyMigrations(
+        main.transactor,
+        slice,
+        appSources(w),
+        opts({ onEvent, backup: { run: between } }),
+      );
+      return { result, events };
+    } catch (e) {
+      return {
+        err: { message: (e as Error).message, code: (e as { code?: unknown }).code },
+        events,
+      };
+    }
+  }
+
+  const fileB = (w: World) => appSources(w)[1]?.migrations[1] as SourceMigration;
+
+  test("same hash: skipped as concurrent, never run twice", async () => {
+    const w = world();
+    const { result, events } = await withRowAfterPlan(w, async () => {
+      await sql.unsafe(
+        `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ($1, 1700000000001)`,
+        [fileB(w).sha256],
+      );
+    });
+    expect(result?.skippedConcurrent).toEqual([{ source: "app", id: "0001_b" }]);
+    expect(events).toContainEqual({
+      type: "migrate.skipped_concurrent",
+      source: "app",
+      id: "0001_b",
+    });
+    const table = await one<{ t: boolean }>(`select to_regclass('"${w.d}".b') is not null as t`);
+    expect(table?.t).toBe(false);
+  });
+
+  test("another hash: refused as tampered, the file does not run", async () => {
+    const w = world();
+    const { err } = await withRowAfterPlan(w, async () => {
+      await sql.unsafe(
+        `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ($1, 1700000000001)`,
+        ["f".repeat(64)],
+      );
+    });
+    expect(err?.code).toBe("ERR_ROOTSTOCK_MIG_TAMPER_SRC");
+    expect(err?.message).toContain(`recorded 0001_b with hash ${"f".repeat(64)}`);
+    const table = await one<{ t: boolean }>(`select to_regclass('"${w.d}".b') is not null as t`);
+    expect(table?.t).toBe(false);
+  });
+
+  test("another hash the slice accepts: skipped", async () => {
+    const w = world();
+    const recorded = "e".repeat(64);
+    const slice = migrateSlice({
+      schema: w.slice.schema,
+      accepted: [{ source: "app", id: "0001_b", recorded, current: fileB(w).sha256, reason: "r" }],
+    });
+    const { result } = await withRowAfterPlan(
+      w,
+      async () => {
+        await sql.unsafe(
+          `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ($1, 1700000000001)`,
+          [recorded],
+        );
+      },
+      slice,
+    );
+    expect(result?.skippedConcurrent).toEqual([{ source: "app", id: "0001_b" }]);
+  });
+
+  test("a NULL hash (an older migrator's row): skipped", async () => {
+    const w = world();
+    const { result } = await withRowAfterPlan(w, async () => {
+      await sql.unsafe(
+        `insert into "${w.f}".schema_migrations (filename) values ('20260101000000_u.sql')`,
+      );
+    });
+    expect(result?.skippedConcurrent).toEqual([{ source: "auth", id: "20260101000000_u.sql" }]);
+  });
+
+  test("two rows for the key: refused as tracker rows", async () => {
+    const w = world();
+    const { err } = await withRowAfterPlan(w, async () => {
+      const h = fileB(w).sha256;
+      await sql.unsafe(
+        `insert into "${w.d}".__drizzle_migrations (hash, created_at) values ($1, 1700000000001), ($1, 1700000000001)`,
+        [h],
+      );
+    });
+    expect(err).toEqual({
+      message:
+        'rootstock migrate: source "app"\'s tracker has duplicate keys 1700000000001 — fix those rows by hand (see the census procedure); re-running will not fix this',
+      code: "ERR_ROOTSTOCK_MIG_TRACKER_ROWS",
+    });
+  });
 });
 
 describe("kill points (O10): each re-run converges", () => {
   async function killed(t: Transactor, w: World, sources: TrackedSource[]): Promise<void> {
-    await applyMigrations(t, w.slice, sources, opts()).then(
+    const err = await applyMigrations(t, w.slice, sources, opts()).then(
       () => {
         throw new Error("expected the run to die");
       },
-      () => undefined,
+      (e: unknown) => e,
     );
+    // A dead connection surfaces from the transaction itself; the stand-in's
+    // division by zero (see dying()) from the file, which names itself.
+    if (main.transactor.id === "bun-sql") {
+      expect((err as Error).message).toContain("Connection closed");
+    } else {
+      expect((err as Error).message).toStartWith("rootstock migrate: app/0001_b failed");
+      expect(pgCode(err)).toBe("22012");
+    }
   }
 
   /**
@@ -535,6 +803,7 @@ describe("kill points (O10): each re-run converges", () => {
 });
 
 describe("concurrency (B1): two appliers, one database", () => {
+  let pooledSkips = 0;
   async function race(a: Transactor, b: Transactor): Promise<string | undefined> {
     const w = world();
     const results = await Promise.all([
@@ -544,6 +813,7 @@ describe("concurrency (B1): two appliers, one database", () => {
     if (typeof results === "string") return results;
     const total = results.reduce((n, r) => n + r.applied.length, 0);
     if (total !== 4) return `applied ${total} times, expected 4`;
+    pooledSkips += results.reduce((n, r) => n + r.skippedConcurrent.length, 0);
     if ((await drizzleRows(w)).length !== 2) return "drizzle rows";
     if ((await folderRows(w)).length !== 1) return "folder rows";
     if ((await rootstockRows(w)) !== 1) return "rootstock rows";
@@ -559,6 +829,8 @@ describe("concurrency (B1): two appliers, one database", () => {
         if (why !== undefined) failures.push(why);
       }
       expect(failures).toEqual([]);
+      // The two overlapped at least once, or the re-read was never exercised here.
+      expect(pooledSkips).toBeGreaterThan(0);
     } finally {
       await pooled.close();
     }

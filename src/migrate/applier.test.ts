@@ -57,10 +57,6 @@ describe("applyMigrations options", () => {
       "applyMigrations: options.backup.run must be a function — got 1",
     ],
     [{ ...ok, fix: "" }, 'applyMigrations: options.fix must be a non-empty command — got ""'],
-    [
-      { ...ok, allowHeavy: true },
-      'applyMigrations: options.allowHeavy is for entry "manual" only — a deploy never applies a heavy migration',
-    ],
     [{ ...ok, planOnly: "yes" }, 'applyMigrations: options.planOnly must be a boolean — got "yes"'],
     [{ ...ok, onEvent: 1 }, "applyMigrations: options.onEvent must be a function — got 1"],
     [{ ...ok, ahead: "allow" }, "applyMigrations: options.ahead is not a known key"],
@@ -73,6 +69,39 @@ describe("applyMigrations options", () => {
     expect((await refusal([root], ok, forged))[0]).toBe(
       "applyMigrations: expected a MigrateSlice built by migrateSlice() — got an object that parser did not return",
     );
+  });
+});
+
+describe("applyMigrations coded refusals before the database", () => {
+  test("allowHeavy with entry deploy is E-MIG-DEPLOY-HEAVY and emits migrate.refused", async () => {
+    const events: unknown[] = [];
+    const opts = { ...ok, allowHeavy: true, onEvent: (e: unknown) => events.push(e) };
+    expect(await refusal([root], opts)).toEqual([
+      'rootstock migrate: options.allowHeavy is for entry "manual" only — a deploy never applies a heavy migration',
+      "ERR_ROOTSTOCK_MIG_DEPLOY_HEAVY",
+    ]);
+    expect(events).toEqual([{ type: "migrate.refused", code: "ERR_ROOTSTOCK_MIG_DEPLOY_HEAVY" }]);
+  });
+
+  test("a source refusal emits migrate.refused", async () => {
+    const events: unknown[] = [];
+    await refusal([app, root], { ...ok, onEvent: (e: unknown) => events.push(e) });
+    expect(events).toEqual([{ type: "migrate.refused", code: "ERR_ROOTSTOCK_MIG_SRC_ORDER" }]);
+  });
+
+  test("an async hook that rejects is not an unhandled rejection", async () => {
+    let unhandled = 0;
+    const count = (): void => {
+      unhandled += 1;
+    };
+    process.on("unhandledRejection", count);
+    try {
+      await refusal([app, root], { ...ok, onEvent: async () => Promise.reject(new Error("hook")) });
+      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      process.off("unhandledRejection", count);
+    }
+    expect(unhandled).toBe(0);
   });
 });
 
@@ -112,8 +141,8 @@ describe("applyMigrations sources", () => {
     [
       "another source's migration",
       [root, { ...app, migrations: root.migrations }],
-      `applyMigrations: sources[1].migrations must all be source "app"'s — got "${root.migrations[0]?.id}" of source "rootstock"`,
-      undefined,
+      `rootstock migrate: sources[1].migrations must all be source "app"'s — got "${root.migrations[0]?.id}" of source "rootstock"`,
+      "ERR_ROOTSTOCK_MIG_SRC",
     ],
   ])("%s", async (_label, sources, message, code) => {
     expect(await refusal(sources, ok)).toEqual([message, code]);

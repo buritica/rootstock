@@ -9,8 +9,8 @@ import postgres from "postgres";
  * This module reaches only the drivers and the environment, never rootstock's
  * own exports, so it compiles before any `db` code exists.
  *
- * Every client is `max: 1`, so all of a client's queries run on one backend
- * and session state is observable. Each call opens an independent client; a
+ * Every client is `max: 1` (except `openPooledClient`'s), so all of a
+ * client's queries run on one backend and session state is observable. Each call opens an independent client; a
  * test closes everything it opens.
  */
 export const TEST_TRANSACTOR_KINDS = ["bun-sql", "postgres-js", "drizzle"] as const;
