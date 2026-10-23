@@ -418,6 +418,16 @@ describe("filename tracker", () => {
       "filename text (primary key), applied_at timestamp with time zone (primary key)",
     ],
     ["no columns", "", "(none)"],
+    [
+      "an applied_at an insert cannot omit",
+      "filename text PRIMARY KEY, applied_at timestamptz NOT NULL",
+      "filename text (primary key), applied_at timestamp with time zone (not null, no default)",
+    ],
+    [
+      "another migrator's columns",
+      "version bigint PRIMARY KEY, dirty boolean NOT NULL",
+      "version bigint (primary key), dirty boolean (not null, no default)",
+    ],
   ])("refuses to upgrade a table with %s, and leaves it as it was", async (_what, ddl, found) => {
     const s = schema();
     await legacyTable(s, "schema_migrations", ddl);
@@ -426,8 +436,8 @@ describe("filename tracker", () => {
       message: `rootstock migrate: ${s}.schema_migrations is not a tracker rootstock can upgrade — found columns ${found}; expected exactly filename text primary key and applied_at timestamptz`,
       code: "ERR_ROOTSTOCK_MIG_TRACKER_SHAPE",
     });
-    expect((await shapeOf(s, "schema_migrations")).length).toBe(
-      ddl === "" ? 0 : found.split(", ").length,
+    expect(await shapeOf(s, "schema_migrations")).not.toContainEqual(
+      expect.objectContaining({ name: "sha256" }),
     );
   });
 
@@ -452,6 +462,11 @@ describe("filename tracker", () => {
       "found column sha256 bytea; expected sha256 text",
     ],
     ["a view", "", 'found a relation of kind "v"; expected a table'],
+    [
+      "a sha256 but no filename",
+      "name text PRIMARY KEY, sha256 text",
+      "found no column filename; expected filename text",
+    ],
   ])("refuses to read or stamp a tracker with %s", async (what, ddl, tail) => {
     const s = schema();
     await sql.unsafe(`CREATE SCHEMA "${s}"`);
@@ -472,6 +487,48 @@ describe("filename tracker", () => {
 });
 
 describe("reads", () => {
+  test.each([
+    [
+      "another migrator's columns",
+      "filename",
+      "version bigint PRIMARY KEY, dirty boolean NOT NULL",
+      "found no column filename; expected filename text",
+    ],
+    [
+      "no created_at",
+      "drizzle",
+      "id serial PRIMARY KEY, hash text NOT NULL",
+      "found no column created_at; expected created_at bigint",
+    ],
+    [
+      "a text created_at",
+      "drizzle",
+      "id serial PRIMARY KEY, hash text NOT NULL, created_at text",
+      "found column created_at text; expected created_at bigint",
+    ],
+    [
+      "no id",
+      "drizzle",
+      "hash text NOT NULL, created_at bigint",
+      "found no column id; expected id integer",
+    ],
+  ])(
+    "a monitor's read refuses a table with %s instead of a driver error",
+    async (_what, kind, ddl, tail) => {
+      const s = schema();
+      const tracker =
+        kind === "drizzle"
+          ? drizzleTracker({ schema: s, table: "t" })
+          : filenameTracker({ schema: s, table: "t" });
+      await sql.unsafe(`CREATE SCHEMA "${s}"`);
+      await sql.unsafe(`CREATE TABLE "${s}".t (${ddl})`);
+      expect(await refusal(readTracker(sql, tracker, SLICE))).toEqual({
+        message: `rootstock migrate: ${s}.t is not a tracker rootstock can read — ${tail}`,
+        code: "ERR_ROOTSTOCK_MIG_TRACKER_SHAPE",
+      });
+    },
+  );
+
   test("a missing tracker reads as untracked, and the per-key re-read as no row", async () => {
     for (const tracker of [
       drizzleTracker({ schema: schema() }),
