@@ -71,11 +71,8 @@ function planLines(plan: MigrationPlan): string[] {
 
 function resultLines(result: ApplyResult): string[] {
   const { bootstrap, plan } = result;
-  const lines = [
-    result.applied.length === 0
-      ? "applied: nothing"
-      : `applied: ${result.applied.map((a) => `${a.source}/${a.id} (${a.ms} ms)`).join(", ")}`,
-  ];
+  // Each file was already printed as it was applied.
+  const lines = [`done: ${result.applied.length} applied`];
   if (result.skippedConcurrent.length > 0)
     lines.push(`skipped, another applier ran them: ${ids(result.skippedConcurrent)}`);
   if (bootstrap.created.length > 0) lines.push(`trackers created: ${bootstrap.created.join(", ")}`);
@@ -159,10 +156,19 @@ export async function migrateCli(
     result = await applyMigrations(deps.transactor, deps.slice, deps.sources, {
       ...opts,
       ...(command.allowHeavy ? { allowHeavy: true } : {}),
+      // Each file commits on its own, so the log says so as it happens: a run
+      // killed or refused after some files still shows which went in.
+      onEvent: (e) => {
+        if (e.type === "migrate.applying")
+          out(`applying ${e.source}/${e.id} (${e.kind ?? "unmarked"})`);
+        else if (e.type === "migrate.applied") out(`applied ${e.source}/${e.id} (${e.ms} ms)`);
+        deps.onEvent?.(e);
+      },
     });
   } catch (err) {
-    if (refusalCode(err) === undefined) throw err;
+    // Redacted once here: a rethrown error's own text and stack are the driver's.
     out(reason(err));
+    if (refusalCode(err) === undefined) throw err;
     return 1;
   }
   for (const line of resultLines(result)) out(line);

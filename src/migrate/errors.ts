@@ -10,7 +10,9 @@ export function reason(err: unknown): string {
   const said = stderr instanceof Uint8Array ? new TextDecoder().decode(stderr) : stderr;
   if (typeof said === "string" && said.trim() !== "") text = `${text}: ${said.trim()}`;
   // Never print credentials a remote URL may carry.
-  return text.replace(/\/\/[^/@\s]+@/g, "//***@");
+  // Greedy to the last `@` before the host, so an unencoded `@` in a password
+  // does not leave its tail; and libpq's keyword form too.
+  return text.replace(/\/\/[^/\s]*@/g, "//***@").replace(/(password\s*=\s*)\S+/gi, "$1***");
 }
 
 /**

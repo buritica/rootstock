@@ -94,18 +94,22 @@ describe("migrateCli", () => {
     events.length = 0;
     const apply = await run(["apply", "--deploy"], w);
     expect(apply.code).toBe(0);
-    expect(apply.lines).toHaveLength(2);
-    expect(apply.lines[0]).toMatch(
-      /^applied: rootstock\/[^ ]+ \(\d+ ms\), app\/0000_a \(\d+ ms\)$/,
-    );
-    expect(apply.lines[1]).toBe(`trackers created: ${w.d}.__drizzle_migrations`);
+    expect(apply.lines).toHaveLength(6);
+    expect(apply.lines[0]).toMatch(/^applying rootstock\/[^ ]+ \(additive\)$/);
+    expect(apply.lines[1]).toMatch(/^applied rootstock\/[^ ]+ \(\d+ ms\)$/);
+    expect(apply.lines.slice(2, 3)).toEqual(["applying app/0000_a (additive)"]);
+    expect(apply.lines[3]).toMatch(/^applied app\/0000_a \(\d+ ms\)$/);
+    expect(apply.lines.slice(4)).toEqual([
+      "done: 2 applied",
+      `trackers created: ${w.d}.__drizzle_migrations`,
+    ]);
     expect(events.map((e) => e.type)).toContain("migrate.done");
 
     expect(await run(["status"], w)).toEqual({
       code: 0,
       lines: ["rootstock: ok (1 applied)", "app: ok (1 applied)"],
     });
-    expect(await run(["apply", "--manual"], w)).toEqual({ code: 0, lines: ["applied: nothing"] });
+    expect(await run(["apply", "--manual"], w)).toEqual({ code: 0, lines: ["done: 0 applied"] });
   });
 
   test("a refusal: plan 1 and apply 1, each printing it; status 1", async () => {
@@ -169,9 +173,21 @@ describe("migrateCli", () => {
   test("apply rethrows a failure that is not a refusal: the process crashes with its stack", async () => {
     const w = world();
     const bad = [mig("app", "0000_bad", "1700000000000", "SELECT 1/0")];
-    await expect(run(["apply", "--deploy"], w, bad)).rejects.toThrow(
-      "rootstock migrate: app/0000_bad failed and was rolled back",
-    );
+    const lines: string[] = [];
+    await expect(
+      migrateCli(["apply", "--deploy"], {
+        transactor: main.transactor,
+        slice: w.slice,
+        sources: sources(w, bad),
+        backup: { skip: "test" },
+        fix: "f",
+        out: (l) => lines.push(l),
+      }),
+    ).rejects.toThrow("rootstock migrate: app/0000_bad failed and was rolled back");
+    // The rootstock file committed before the failure, and the log says so.
+    expect(lines[1]).toMatch(/^applied rootstock\//);
+    expect(lines.at(-2)).toBe("applying app/0000_bad (additive)");
+    expect(lines.at(-1)).toStartWith("rootstock migrate: app/0000_bad failed and was rolled back");
     // plan never runs a file, so the same checkout plans green.
     expect((await run(["plan", "--deploy"], w, bad)).code).toBe(0);
   });

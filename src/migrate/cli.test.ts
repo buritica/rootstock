@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MIGRATE_USAGE, type MigrateCliDeps, migrateCli } from "./cli.ts";
+import { reason } from "./errors.ts";
 import { migrateSlice } from "./slice.ts";
 import { drizzleTracker } from "./tracked.ts";
 
@@ -73,5 +74,19 @@ describe("migrateCli deps and status refusals", () => {
     expect(lines).toEqual([
       'status could not answer — rootstock migrate: the first source must be rootstockSource(slice) — got "app"',
     ]);
+  });
+});
+
+describe("reason redacts credentials", () => {
+  test.each([
+    ["connect to postgres://u:p@ss@dbhost/x failed", "connect to postgres://***@dbhost/x failed"],
+    ["host=db password=s3cr3t dbname=x", "host=db password=*** dbname=x"],
+    ["no secret here", "no secret here"],
+  ])("%s", (text, want) => {
+    expect(reason(new Error(text))).toBe(want);
+  });
+
+  test("an AggregateError with no message names its parts", () => {
+    expect(reason(new AggregateError([new Error("a"), new Error("b")], ""))).toBe("a; b");
   });
 });
