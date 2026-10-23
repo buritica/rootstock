@@ -82,8 +82,10 @@ describe("drizzleJournal", () => {
     const theirs = readMigrationFiles({ migrationsFolder: dir });
     expect(ours.map((m) => m.sha256)).toEqual(theirs.map((m) => m.hash));
     expect(ours.map((m) => m.key)).toEqual(theirs.map((m) => String(m.folderMillis)));
+    // Same chunks, except that we drop whitespace-only ones and a leading BOM,
+    // which drizzle sends and Postgres rejects; neither changes the hash.
     expect(ours.map((m) => m.statements)).toEqual(
-      theirs.map((m) => m.sql.filter((s) => s.trim() !== "")),
+      theirs.map((m) => m.sql.map((s) => s.replace(/^\uFEFF/, "")).filter((s) => s.trim() !== "")),
     );
   });
 
@@ -300,9 +302,15 @@ describe("edges the review found", () => {
     }
   });
 
+  test("refuses a file: URL on another host", () => {
+    expect(() => drizzleJournal(new URL("file://elsewhere/m/"), OPTS)).toThrow(
+      /must be a local file: URL/,
+    );
+  });
+
   test("refuses a URL that is not file:", () => {
     expect(() => drizzleJournal(new URL("https://example.invalid/m/"), OPTS)).toThrow(
-      /must be a file: URL/,
+      /must be a local file: URL/,
     );
   });
 
@@ -346,7 +354,9 @@ describe("edges the review found", () => {
       "meta/_journal.json": journal([{ tag: "a", when: 1 }]),
       "a.sql": new Uint8Array([0xef, 0xbb, 0xbf, ...enc(H)]),
     });
-    expect(drizzleJournal(dir, OPTS)[0]?.kind).toBe("heavy");
+    const [m] = drizzleJournal(dir, OPTS);
+    expect(m?.kind).toBe("heavy");
+    expect(m?.statements[0]?.startsWith("-- app-migration")).toBe(true);
   });
 });
 

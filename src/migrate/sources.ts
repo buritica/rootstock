@@ -57,7 +57,8 @@ const DRIZZLE_BREAKPOINT = "--> statement-breakpoint";
 // drizzle reads with fs's utf8, which keeps a byte-order mark, and hashes that
 // text, so the journal reader decodes the same way to reproduce its hash.
 const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
-// The SQL-folder origin reads with Bun.file().text(), which drops it.
+// The SQL-folder origins differ (Bun.file().text() drops it, fs's utf8 keeps
+// it); dropping is the one that runs, since Postgres rejects a leading U+FEFF.
 const DROP_BOM = new TextDecoder("utf-8");
 
 function fail(message: string): never {
@@ -91,13 +92,15 @@ function open(folder: string | URL, opts: SourceOptions): Opened {
   }
   let dir: URL;
   if (folder instanceof URL) {
-    if (folder.protocol !== "file:") {
-      fail(`a source folder must be a file: URL — got ${q(folder.href)}`);
+    if (folder.protocol !== "file:" || (folder.host !== "" && folder.host !== "localhost")) {
+      fail(`a source folder must be a local file: URL — got ${q(folder.href)}`);
     }
     dir = new URL(folder.href);
   } else {
     if (typeof folder !== "string" || !isAbsolute(folder)) {
-      fail(`a source folder must be an absolute path or a file: URL — got ${q(folder)}`);
+      fail(
+        `a source folder must be an absolute path or a file: URL, e.g. new URL("../drizzle/", import.meta.url) — got ${q(folder)}`,
+      );
     }
     dir = pathToFileURL(folder);
   }
@@ -202,7 +205,12 @@ export function drizzleJournal(
       key: String(r.when),
       sha256: sha256Hex(text),
       text,
-      statements: text.split(DRIZZLE_BREAKPOINT).filter((s) => s.trim() !== ""),
+      // Hashed with any byte-order mark, as drizzle hashes; run without it,
+      // since Postgres rejects a statement that starts with U+FEFF.
+      statements: text
+        .replace(/^\uFEFF/, "")
+        .split(DRIZZLE_BREAKPOINT)
+        .filter((s) => s.trim() !== ""),
     };
   });
   return build(opened, drafts);
