@@ -28,11 +28,9 @@ describe("assertThrowawayDb", () => {
   });
 
   test("refuses a remote host, naming host and database, with the contract's text and code", () => {
-    const r = refusal(() =>
-      assertThrowawayDb("postgres://u:secret@db.example.test:5432/app", DENY),
-    );
+    const r = refusal(() => assertThrowawayDb("postgres://u:secret@remotehost:5432/app", DENY));
     expect(r.message).toBe(
-      'rootstock migrate: refusing to touch "db.example.test"/"app" — host "db.example.test" is not in allowHosts (localhost, 127.0.0.1, ::1); tests run only against a throwaway local database',
+      'rootstock migrate: refusing to touch "remotehost"/"app" — host "remotehost" is not in allowHosts (localhost, 127.0.0.1, ::1); tests run only against a throwaway local database',
     );
     expect(r.code).toBe("ERR_ROOTSTOCK_MIG_NOT_THROWAWAY");
     expect(r.message).not.toContain("secret");
@@ -46,8 +44,8 @@ describe("assertThrowawayDb", () => {
 
   test("a host, hostaddr or dbname parameter overrides the URL, as libpq reads it", () => {
     expect(() =>
-      assertThrowawayDb("postgres://u@localhost/app_test?host=db.example.test", DENY),
-    ).toThrow(/host "db\.example\.test" is not in allowHosts/);
+      assertThrowawayDb("postgres://u@localhost/app_test?host=remotehost", DENY),
+    ).toThrow(/host "remotehost" is not in allowHosts/);
     expect(() =>
       assertThrowawayDb("postgres://u@localhost/app_test?hostaddr=10.0.0.5", DENY),
     ).toThrow(/host "10\.0\.0\.5"/);
@@ -58,8 +56,8 @@ describe("assertThrowawayDb", () => {
 
   test("one remote host in a list is enough to refuse", () => {
     expect(() =>
-      assertThrowawayDb("postgres://u@localhost/app_test?host=localhost,db.example.test", DENY),
-    ).toThrow(/host "db\.example\.test"/);
+      assertThrowawayDb("postgres://u@localhost/app_test?host=localhost,remotehost", DENY),
+    ).toThrow(/host "remotehost"/);
   });
 
   test("an empty database name is the user's, as libpq defaults it", () => {
@@ -92,10 +90,10 @@ describe("assertThrowawayDb", () => {
       ...DENY,
       unsafeAllow: { reason: "shared CI database", log: (m: string) => lines.push(m) },
     };
-    assertThrowawayDb("postgres://u:secret@db.example.test/app_prod", opts);
+    assertThrowawayDb("postgres://u:secret@remotehost/app_prod", opts);
     assertThrowawayDb("postgres://u@localhost/app_test", opts);
     expect(lines).toEqual([
-      'rootstock migrate: assertThrowawayDb skipped for "db.example.test"/"app_prod" — shared CI database',
+      'rootstock migrate: assertThrowawayDb skipped for "remotehost"/"app_prod" — shared CI database',
       'rootstock migrate: assertThrowawayDb skipped for "localhost"/"app_test" — shared CI database',
     ]);
   });

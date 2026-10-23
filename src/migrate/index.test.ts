@@ -4,8 +4,10 @@ test("migrate exports exactly the frozen surface", async () => {
   expect(Object.keys(await import("./index.ts")).sort()).toEqual([
     "applyRootstockMigrations",
     "assertThrowawayDb",
+    "checkMigrationOrder",
     "drizzleJournal",
     "drizzleJournalFrom",
+    "gitMainReader",
     "migrateSlice",
     "rootstockMigrationStatus",
     "rootstockMigrations",

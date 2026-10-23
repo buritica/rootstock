@@ -26,10 +26,12 @@ describe("migrateSlice", () => {
     expect(migrateSlice({ ahead: "refuse" }) as unknown).toEqual({
       schema: "rootstock",
       ahead: "refuse",
+      accepted: [],
     });
     expect(migrateSlice({ schema: "rs_t_ab12", ahead: "allow" }) as unknown).toEqual({
       schema: "rs_t_ab12",
       ahead: "allow",
+      accepted: [],
     });
   });
 
@@ -97,5 +99,63 @@ describe("unbranded-slice-refused", () => {
     expect(await rejection(applyRootstockMigrations(transactor, forged))).toBe(
       "applyRootstockMigrations: expected a MigrateSlice built by migrateSlice() — got an object that parser did not return",
     );
+  });
+});
+
+describe("migrateSlice accepted", () => {
+  const R = "a".repeat(64);
+  const C = "b".repeat(64);
+  const ok = {
+    source: "app",
+    id: "0001_x.sql",
+    recorded: R,
+    current: C,
+    reason: "edited before hashes",
+  };
+
+  test("keeps valid entries, frozen", () => {
+    const slice = migrateSlice({ ahead: "refuse", accepted: [ok] });
+    expect(slice.accepted as unknown).toEqual([ok]);
+    expect(Object.isFrozen(slice.accepted)).toBe(true);
+    expect(Object.isFrozen(slice.accepted[0])).toBe(true);
+  });
+
+  test.each([
+    [{ accepted: {} }, "migrateSlice: accepted must be an array — got {}"],
+    [{ accepted: [1] }, "migrateSlice: accepted[0] must be an object — got 1"],
+    [{ accepted: [{ ...ok, extra: 1 }] }, "migrateSlice: accepted[0].extra is not a known key"],
+    [{ accepted: [{ ...ok, reason: undefined }] }, "migrateSlice: accepted[0].reason is required"],
+    [
+      { accepted: [{ ...ok, source: "App" }] },
+      'migrateSlice: accepted[0].source must be a source name matching [a-z][a-z0-9-]* — got "App"',
+    ],
+    [
+      { accepted: [{ ...ok, id: "" }] },
+      'migrateSlice: accepted[0].id must be a non-empty string — got ""',
+    ],
+    [
+      { accepted: [{ ...ok, recorded: R.toUpperCase() }] },
+      "migrateSlice: accepted[0].recorded must be 64 lowercase hex characters",
+    ],
+    [
+      { accepted: [{ ...ok, current: "b" }] },
+      'migrateSlice: accepted[0].current must be 64 lowercase hex characters — got "b"',
+    ],
+    [
+      { accepted: [{ ...ok, current: R }] },
+      "migrateSlice: accepted[0].current must be different from recorded",
+    ],
+    [
+      { accepted: [{ ...ok, reason: "  " }] },
+      'migrateSlice: accepted[0].reason must be a non-empty string — got "  "',
+    ],
+    [
+      { accepted: [ok, { ...ok, reason: "again" }] },
+      "migrateSlice: accepted[1] repeats app/0001_x.sql",
+    ],
+  ])("refuses %j", (extra, message) => {
+    expect(
+      thrown(() => migrateSlice({ ahead: "refuse", ...extra } as MigrateSliceInput)),
+    ).toStartWith(message);
   });
 });

@@ -4,7 +4,18 @@ export {
   type RootstockMigration,
   rootstockMigrations,
 } from "./migrations.ts";
-export { type MigrateSlice, type MigrateSliceInput, migrateSlice } from "./slice.ts";
+export {
+  checkMigrationOrder,
+  type GitMainFolder,
+  gitMainReader,
+  type OrderFinding,
+} from "./order.ts";
+export {
+  type AcceptedHash,
+  type MigrateSlice,
+  type MigrateSliceInput,
+  migrateSlice,
+} from "./slice.ts";
 export {
   drizzleJournal,
   drizzleJournalFrom,
@@ -19,3 +30,4 @@ export {
 } from "./sources.ts";
 export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";
 export { assertThrowawayDb, type ThrowawayOptions } from "./throwaway.ts";
+export type { TrackedSource, Tracker } from "./tracked.ts";
