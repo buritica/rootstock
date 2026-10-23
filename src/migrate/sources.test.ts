@@ -43,25 +43,25 @@ function journal(entries: readonly { tag: string; when: number }[]): string {
   });
 }
 
-const MARK = {} as const;
 const OPTS = { name: "app" } as const;
 const A =
   "-- rootstock-migration: additive\nCREATE TABLE a (id int);\n--> statement-breakpoint\nCREATE INDEX a_i ON a (id);\n";
 const H = "-- rootstock-migration: heavy\nCREATE INDEX b_i ON b (id);\n";
 const OLD = "CREATE TABLE b (id int);\n--> statement-breakpoint\n";
 
+const DRIZZLE_JOURNAL = journal([
+  { tag: "0000_old", when: 1000 },
+  { tag: "0001_a", when: 2000 },
+  { tag: "20261020000000_h", when: 3000 },
+]);
+const DRIZZLE_FILES: Record<string, string> = {
+  "0000_old.sql": OLD,
+  "0001_a.sql": A,
+  "20261020000000_h.sql": H,
+};
+
 function drizzleFolder(extra: Record<string, string | Uint8Array> = {}) {
-  return folder({
-    "meta/_journal.json": journal([
-      { tag: "0000_old", when: 1000 },
-      { tag: "0001_a", when: 2000 },
-      { tag: "20261020000000_h", when: 3000 },
-    ]),
-    "0000_old.sql": OLD,
-    "0001_a.sql": A,
-    "20261020000000_h.sql": H,
-    ...extra,
-  });
+  return folder({ "meta/_journal.json": DRIZZLE_JOURNAL, ...DRIZZLE_FILES, ...extra });
 }
 
 describe("drizzleJournal", () => {
@@ -147,11 +147,7 @@ describe("drizzleJournal", () => {
     ],
     [
       "empty journal",
-      () =>
-        drizzleJournal(folder({ "meta/_journal.json": journal([]) }), {
-          name: "app",
-          marker: MARK,
-        }),
+      () => drizzleJournal(folder({ "meta/_journal.json": journal([]) }), OPTS),
       /has no entries/,
     ],
     [
@@ -190,29 +186,20 @@ describe("drizzleJournal", () => {
             ]),
             "a.sql": OLD,
           }),
-          {
-            name: "app",
-            marker: MARK,
-          },
+          OPTS,
         ),
       /"a" repeats a tag or a when/,
     ],
     [
       "path-shaped tag",
       () =>
-        drizzleJournal(folder({ "meta/_journal.json": journal([{ tag: "../a", when: 1 }]) }), {
-          name: "app",
-          marker: MARK,
-        }),
+        drizzleJournal(folder({ "meta/_journal.json": journal([{ tag: "../a", when: 1 }]) }), OPTS),
       /journal entry is malformed/,
     ],
     [
       "missing file",
       () =>
-        drizzleJournal(folder({ "meta/_journal.json": journal([{ tag: "a", when: 1 }]) }), {
-          name: "app",
-          marker: MARK,
-        }),
+        drizzleJournal(folder({ "meta/_journal.json": journal([{ tag: "a", when: 1 }]) }), OPTS),
       /"a" has no readable file a\.sql/,
     ],
     [
@@ -231,7 +218,7 @@ describe("drizzleJournal", () => {
           name: "app",
           marker: { legacy: { prefix: "App(", through: "0000_old" } },
         }),
-      /marker prefix must match/,
+      /source "app": marker legacy\.prefix must match/,
     ],
     [
       "unknown legacy.through",
@@ -245,7 +232,7 @@ describe("drizzleJournal", () => {
     ["relative folder", () => drizzleJournal("drizzle", OPTS), /absolute path or a file: URL/],
     [
       "empty name",
-      () => drizzleJournal(drizzleFolder(), { name: " ", marker: MARK }),
+      () => drizzleJournal(drizzleFolder(), { name: " " }),
       /source name must match \[a-z\]\[a-z0-9-\]\*/,
     ],
   ];
@@ -281,15 +268,13 @@ describe("sqlFolder", () => {
   });
 
   test("refuses a folder with no .sql file", () => {
-    expect(() => sqlFolder(folder({ "a.txt": "x" }), { name: "domain", marker: MARK })).toThrow(
+    expect(() => sqlFolder(folder({ "a.txt": "x" }), { name: "domain" })).toThrow(
       /holds no \.sql file/,
     );
   });
 
   test("refuses a folder it cannot list", () => {
-    expect(() => sqlFolder(join(ROOT, "missing"), { name: "domain", marker: MARK })).toThrow(
-      /cannot list/,
-    );
+    expect(() => sqlFolder(join(ROOT, "missing"), { name: "domain" })).toThrow(/cannot list/);
   });
 });
 
@@ -458,19 +443,15 @@ describe("in-memory readers", () => {
   };
 
   test("drizzleJournalFrom reads exactly what drizzleJournal reads", () => {
-    const files = { "0000_old.sql": OLD, "0001_a.sql": A, "20261020000000_h.sql": H };
-    const text = journal([
-      { tag: "0000_old", when: 1000 },
-      { tag: "0001_a", when: 2000 },
-      { tag: "20261020000000_h", when: 3000 },
-    ]);
-    expect(drizzleJournalFrom(text, read(files), OPTS)).toEqual(
+    expect(drizzleJournalFrom(DRIZZLE_JOURNAL, read(DRIZZLE_FILES), OPTS)).toEqual(
       drizzleJournal(drizzleFolder(), OPTS),
     );
   });
 
   test("drizzleJournalFrom refuses text that is not JSON", () => {
-    expect(() => drizzleJournalFrom("{", read({}), OPTS)).toThrow(/the journal is not JSON/);
+    expect(() => drizzleJournalFrom("{", read({}), OPTS)).toThrow(
+      /meta\/_journal\.json is not JSON/,
+    );
   });
 
   test("sqlFolderFrom reads exactly what sqlFolder reads", () => {
@@ -546,6 +527,24 @@ describe("renames.json", () => {
       },
       /which is still in the folder/,
     ],
+    [
+      "two old names mapped to one new name",
+      {
+        "renames.json": renames({
+          "0000_a.sql": "20260101000000_a.sql",
+          "0001_a.sql": "20260101000000_a.sql",
+        }),
+      },
+      /maps two names to/,
+    ],
+    [
+      "an old name equal to another file's current name",
+      {
+        "20260102000000_b.sql": OLD,
+        "renames.json": renames({ "20260102000000_b.sql": "20260101000000_a.sql" }),
+      },
+      /which is still in the folder/,
+    ],
   ];
   for (const [what, extra, message] of refusals) {
     test(`refuses: ${what}`, () => {
@@ -554,26 +553,6 @@ describe("renames.json", () => {
       );
     });
   }
-
-  test("refuses two old names mapped to one new name", () => {
-    const files: Record<string, string> = {
-      "20260101000000_a.sql": A,
-      "renames.json": renames({
-        "0000_a.sql": "20260101000000_a.sql",
-        "0001_a.sql": "20260101000000_a.sql",
-      }),
-    };
-    expect(() => sqlFolder(folder(files), OPTS)).toThrow(/maps two names to/);
-  });
-
-  test("refuses an old name equal to a later file's current name", () => {
-    const files: Record<string, string> = {
-      "20260101000000_a.sql": A,
-      "20260102000000_b.sql": OLD,
-      "renames.json": renames({ "20260102000000_b.sql": "20260101000000_a.sql" }),
-    };
-    expect(() => sqlFolder(folder(files), OPTS)).toThrow(/still in the folder/);
-  });
 });
 
 describe("timestampRenames", () => {
@@ -600,7 +579,7 @@ describe("timestampRenames", () => {
         { id: "0000_a", at: at("2026-01-02T00:00:00Z") },
         { id: "0001_b", at: at("2026-01-01T00:00:00Z") },
       ]),
-    ).toThrow(/before the file ahead of it/);
+    ).toThrow(/would sort before the name ahead of it/);
   });
 
   test("refuses a bump that runs into a kept timestamped name", () => {
@@ -610,13 +589,16 @@ describe("timestampRenames", () => {
         { id: "0001_b", at: at("2026-01-01T00:00:00Z") },
         { id: "20260101000001_kept", at: at("2026-01-01T00:00:01Z") },
       ]),
-    ).toThrow(/does not sort after the name before it/);
+    ).toThrow(/would sort before the name ahead of it/);
   });
 
   test("refuses a name that is neither numbered nor timestamped, and an invalid date", () => {
     expect(() => timestampRenames([{ id: "init", at: at("2026-01-01T00:00:00Z") }])).toThrow(
-      /neither numbered nor timestamped/,
+      /neither numbered nor a valid YYYYMMDDHHMMSS_ name/,
     );
+    expect(() =>
+      timestampRenames([{ id: "20261399000000_bad_month", at: at("2026-01-01T00:00:00Z") }]),
+    ).toThrow(/neither numbered nor a valid YYYYMMDDHHMMSS_ name/);
     expect(() => timestampRenames([{ id: "0000_a", at: new Date(Number.NaN) }])).toThrow(
       /needs a valid date/,
     );
