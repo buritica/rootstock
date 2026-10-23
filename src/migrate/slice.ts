@@ -97,7 +97,8 @@ function parseAccepted(raw: unknown): readonly AcceptedHash[] {
         throw refuse.invalid(`${at}.reason`, "a non-empty string", reason);
       }
       const pair = JSON.stringify([source, id]);
-      if (seen.has(pair)) throw new Error(`migrateSlice: ${at} repeats ${source}/${id}`);
+      if (seen.has(pair))
+        throw refuse.invalid(at, "a (source, id) pair not listed earlier", [source, id]);
       seen.add(pair);
       return Object.freeze({ source, id, recorded, current, reason } as AcceptedHash);
     }),

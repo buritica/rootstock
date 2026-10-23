@@ -1,4 +1,5 @@
 import { q } from "../internal/slice.ts";
+import { fail } from "./errors.ts";
 
 export type MigrationKind = "additive" | "heavy";
 
@@ -14,15 +15,10 @@ const LINE_BREAK = /\r\n|\n|\r|\u2028|\u2029/;
  * a prefix that is not [a-z][a-z0-9-]*.
  */
 export function markerPattern(...prefixes: readonly string[]): RegExp {
-  const refuse = (message: string): never => {
-    throw Object.assign(new Error(`rootstock migrate: ${message}`), {
-      code: "ERR_ROOTSTOCK_MIG_SRC",
-    });
-  };
-  if (prefixes.length === 0) refuse("markerPattern needs a prefix");
+  if (prefixes.length === 0) fail("markerPattern needs a prefix");
   for (const prefix of prefixes) {
     if (!NAME_RULE.test(prefix))
-      refuse(`marker prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`);
+      fail(`marker prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`);
   }
   return new RegExp(`^--\\s*(?:${prefixes.join("|")})-migration:\\s*(additive|heavy)\\s*$`);
 }

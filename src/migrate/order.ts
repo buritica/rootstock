@@ -1,8 +1,8 @@
 import { q } from "../internal/slice.ts";
+import { fail, failIo } from "./errors.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
-import type { MarkerRule, SourceMigration } from "./sources.ts";
-import { drizzleJournalFrom, sqlFolderFrom } from "./sources.ts";
-import { ROOTSTOCK_SOURCE, type TrackedSource } from "./tracked.ts";
+import { drizzleJournalAt, type SourceMigration, secondOf, sqlFolderAt } from "./sources.ts";
+import type { TrackedSource } from "./tracked.ts";
 
 export interface OrderFinding {
   source: string;
@@ -18,41 +18,20 @@ export interface OrderFinding {
     | "accepted-current-mismatch";
 }
 
-const STAMPED_ID = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_[a-z0-9_]+/;
-const DAY_MS = 86_400_000;
+/** The name rule for a migration added after D49; its time is checked by `secondOf`. */
+const STAMPED_NAME = /^\d{14}_[a-z0-9_]+/;
+const DAY_S = 86_400;
 
-/** The second a `YYYYMMDDHHMMSS_` id names, in ms, or undefined when it is not a real UTC time. */
-function stampMs(id: string): number | undefined {
-  const m = STAMPED_ID.exec(id);
-  if (m === null) return undefined;
-  const [y, mo, d, h, mi, s] = m.slice(1).map(Number) as [
-    number,
-    number,
-    number,
-    number,
-    number,
-    number,
-  ];
-  const ms = Date.UTC(y, mo - 1, d, h, mi, s);
-  const back = new Date(ms);
-  const same =
-    back.getUTCFullYear() === y &&
-    back.getUTCMonth() === mo - 1 &&
-    back.getUTCDate() === d &&
-    back.getUTCHours() === h &&
-    back.getUTCMinutes() === mi &&
-    back.getUTCSeconds() === s;
-  return same ? ms : undefined;
-}
-
-/** Keys compare as integers when both are digits (a drizzle `when`), else by code unit (a filename). */
-function compareKeys(a: string, b: string): number {
-  if (/^\d+$/.test(a) && /^\d+$/.test(b)) {
-    const x = BigInt(a);
-    const y = BigInt(b);
-    return x < y ? -1 : x > y ? 1 : 0;
+/** A drizzle key is its `when`, compared as an integer; any other key is a filename. */
+function keyOrder(source: TrackedSource): (a: string, b: string) => number {
+  if (source.tracker.kind === "drizzle") {
+    return (a, b) => {
+      const x = BigInt(a);
+      const y = BigInt(b);
+      return x < y ? -1 : x > y ? 1 : 0;
+    };
   }
-  return a < b ? -1 : a > b ? 1 : 0;
+  return (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 }
 
 /**
@@ -68,8 +47,8 @@ function compareKeys(a: string, b: string): number {
  * - Every `accepted` entry of a source checked here must name one of its
  *   migrations, whose hash must equal the entry's `current`.
  *
- * rootstock's own source is skipped: its files live in the package, not on
- * main. A `readMain` failure rejects the check; it never reads as no findings.
+ * rootstock's own source (tracker kind "rootstock") is skipped: its files
+ * live in the package, not on main. Sources are read from main in parallel. A `readMain` failure rejects the check; it never reads as no findings.
  */
 export async function checkMigrationOrder(
   slice: MigrateSlice,
@@ -79,32 +58,38 @@ export async function checkMigrationOrder(
 ): Promise<readonly OrderFinding[]> {
   assertMigrateSlice("checkMigrationOrder", slice);
   const nowMs = now().getTime();
-  if (Number.isNaN(nowMs))
+  if (Number.isNaN(nowMs)) {
     throw new TypeError("checkMigrationOrder: now() returned an invalid Date");
-  const findings: OrderFinding[] = [];
-  for (const source of sources) {
-    if (source.name === ROOTSTOCK_SOURCE) continue;
-    const main = await readMain(source.name);
-    findings.push(...compare(source, main, nowMs));
-    const byId = new Map(source.migrations.map((m) => [m.id, m]));
-    for (const entry of slice.accepted) {
-      if (entry.source !== source.name) continue;
-      const file = byId.get(entry.id);
-      if (file === undefined) {
-        findings.push({ source: source.name, id: entry.id, problem: "accepted-unknown-id" });
-      } else if (file.sha256 !== entry.current) {
-        findings.push({ source: source.name, id: entry.id, problem: "accepted-current-mismatch" });
-      }
-    }
   }
+  const apps = sources.filter((s) => s.tracker.kind !== "rootstock");
+  const mains = await Promise.all(apps.map((s) => readMain(s.name)));
+  const findings = apps.flatMap((source, i) => [
+    ...compare(source, mains[i] as readonly SourceMigration[], Math.floor(nowMs / 1000)),
+    ...checkAccepted(source, slice.accepted),
+  ]);
   return Object.freeze(findings.map((f) => Object.freeze(f)));
+}
+
+function checkAccepted(source: TrackedSource, accepted: MigrateSlice["accepted"]): OrderFinding[] {
+  const byId = new Map(source.migrations.map((m) => [m.id, m]));
+  return accepted.flatMap((entry): OrderFinding[] => {
+    if (entry.source !== source.name) return [];
+    const file = byId.get(entry.id);
+    if (file === undefined)
+      return [{ source: source.name, id: entry.id, problem: "accepted-unknown-id" }];
+    if (file.sha256 !== entry.current) {
+      return [{ source: source.name, id: entry.id, problem: "accepted-current-mismatch" }];
+    }
+    return [];
+  });
 }
 
 function compare(
   source: TrackedSource,
   main: readonly SourceMigration[],
-  nowMs: number,
+  nowS: number,
 ): OrderFinding[] {
+  const compareKeys = keyOrder(source);
   const out: OrderFinding[] = [];
   const add = (id: string, problem: OrderFinding["problem"]) =>
     out.push({ source: source.name, id, problem });
@@ -121,9 +106,9 @@ function compare(
       if (onMain.sha256 !== m.sha256) add(m.id, "edited-on-main");
       continue;
     }
-    const at = stampMs(m.id);
+    const at = STAMPED_NAME.test(m.id) ? secondOf(m.id) : undefined;
     if (at === undefined) add(m.id, "name");
-    else if (at > nowMs + DAY_MS) add(m.id, "future-stamp");
+    else if (at > nowS + DAY_S) add(m.id, "future-stamp");
     const sameKey = mainByKey.get(m.key);
     if (sameKey !== undefined) {
       // A rename keeps key and hash; a new name over a main key with new text is an edit.
@@ -140,18 +125,9 @@ export interface GitMainFolder {
   /** The folder's path from the repository root, e.g. "drizzle" or "migrations/auth". */
   path: string;
   layout: "drizzle" | "sql";
-  /** Accepted for symmetry with the working-tree reader; main is read without it (see gitMainReader). */
-  marker?: MarkerRule;
 }
 
-const textOf = new TextDecoder("utf-8", { fatal: false });
-
-function gitError(message: string, cause: unknown): never {
-  const why = cause instanceof Error ? cause.message : String(cause);
-  throw Object.assign(new Error(`rootstock migrate: ${message} — ${why}`, { cause }), {
-    code: "ERR_ROOTSTOCK_MIG_IO",
-  });
-}
+const text = new TextDecoder();
 
 /**
  * A `readMain` for `checkMigrationOrder` that reads each source's folder on a
@@ -163,12 +139,12 @@ function gitError(message: string, cause: unknown): never {
  * - The folder is listed with `git ls-tree -z` and only its regular files are
  *   read (a subtree is skipped, a symlink refused), each with `git cat-file
  *   blob`, as bytes, so nothing converts them.
- * - The files parse through `drizzleJournalFrom` / `sqlFolderFrom`, so main
- *   hashes exactly as the working tree does. Main is read without the marker
+ * - The files parse through the same readers as the working tree's, so main
+ *   hashes exactly as the working tree does. Main is read without a marker
  *   rule: the check uses only main's ids, keys and hashes, and a rename PR's
  *   baseline names a file main does not have yet.
  *
- * Every failure rejects, naming the source and the ref.
+ * Every failure rejects, naming the source and `<ref>:<path>/`.
  */
 export function gitMainReader(deps: {
   run: (args: readonly string[]) => Promise<Uint8Array>;
@@ -196,119 +172,67 @@ export function gitMainReader(deps: {
     );
   }
   let fetched: Promise<void> | undefined;
-  const fetchOnce = (): Promise<void> => {
-    fetched ??= (async () => {
-      const [, name, branch] = remote as RegExpExecArray;
-      try {
-        const shallow = textOf.decode(await run(["rev-parse", "--is-shallow-repository"])).trim();
-        await run([
-          "fetch",
-          ...(shallow === "true" ? ["--depth=1"] : []),
-          "--no-tags",
-          name as string,
-          `+refs/heads/${branch}:refs/remotes/${name}/${branch}`,
-        ]);
-      } catch (err) {
-        gitError(`cannot fetch ${ref}`, err);
-      }
-    })();
-    return fetched;
+  const fetchOnce = async (name: string, branch: string): Promise<void> => {
+    try {
+      const shallow = text.decode(await run(["rev-parse", "--is-shallow-repository"])).trim();
+      await run([
+        "fetch",
+        ...(shallow === "true" ? ["--depth=1"] : []),
+        "--no-tags",
+        name,
+        `+refs/heads/${branch}:refs/remotes/${name}/${branch}`,
+      ]);
+    } catch (err) {
+      failIo(`cannot fetch ${ref}`, err);
+    }
   };
 
   return async (source) => {
     const folder = Object.hasOwn(folders, source) ? folders[source] : undefined;
-    if (folder === undefined) {
-      throw Object.assign(
-        new Error(`rootstock migrate: gitMainReader has no folder for source ${q(source)}`),
-        {
-          code: "ERR_ROOTSTOCK_MIG_SRC",
-        },
-      );
+    if (folder === undefined) fail(`gitMainReader has no folder for source ${q(source)}`);
+    if (remote !== null && fetch === "always") {
+      fetched ??= fetchOnce(remote[1] as string, remote[2] as string);
+      await fetched;
     }
-    if (fetch === "always") await fetchOnce();
-    const dir = folder.path.replace(/^\.\//, "").replace(/\/+$/, "");
-    const where = `${ref}:${dir}`;
+    const where = `${ref}:${folder.path.replace(/^\.\//, "").replace(/\/+$/, "")}/`;
     const git = async (args: readonly string[], what: string): Promise<Uint8Array> => {
       try {
         return await run(args);
       } catch (err) {
-        gitError(`source ${q(source)}: cannot ${what} ${where}`, err);
+        failIo(`source ${q(source)}: cannot ${what}`, err);
       }
     };
-    const files = new Map<string, Uint8Array>();
-    const read = async (name: string) => {
-      files.set(name, await git(["cat-file", "blob", `${where}/${name}`], `read ${name} in`));
+    const blob = (name: string) =>
+      git(["cat-file", "blob", `${where}${name}`], `read ${where}${name}`);
+    const names = listBlobs(source, where, await git(["ls-tree", "-z", where], `list ${where}`));
+    const wanted = names.filter(
+      (n) => n.endsWith(".sql") || (folder.layout === "sql" && n === "renames.json"),
+    );
+    const bodies = await Promise.all(wanted.map(blob));
+    const files = new Map(wanted.map((n, i) => [n, bodies[i] as Uint8Array]));
+    const readFile = (name: string): Uint8Array => {
+      const bytes = files.get(name);
+      if (bytes === undefined) throw new Error(`no file ${name}`);
+      return bytes;
     };
-    const blobs = listBlobs(source, where, await git(["ls-tree", "-z", where], "list"));
     const opts = { name: source };
-    try {
-      if (folder.layout === "drizzle") {
-        const metaEntries = listBlobs(
-          source,
-          `${where}/meta`,
-          await git(["ls-tree", "-z", `${where}/meta`], "list meta in"),
-        );
-        if (!metaEntries.includes("_journal.json")) {
-          throw Object.assign(
-            new Error(
-              `rootstock migrate: source ${q(source)}: ${where}/meta/_journal.json is missing`,
-            ),
-            {
-              code: "ERR_ROOTSTOCK_MIG_SRC",
-            },
-          );
-        }
-        await Promise.all(blobs.filter((n) => n.endsWith(".sql")).map(read));
-        const journal = await git(
-          ["cat-file", "blob", `${where}/meta/_journal.json`],
-          "read meta/_journal.json in",
-        );
-        return drizzleJournalFrom(
-          new TextDecoder("utf-8", { ignoreBOM: true }).decode(journal),
-          fromMap(files),
-          opts,
-        );
-      }
-      await Promise.all(blobs.filter((n) => n.endsWith(".sql") || n === "renames.json").map(read));
-      return sqlFolderFrom(blobs, fromMap(files), opts);
-    } catch (err) {
-      const e = err as { code?: unknown; message?: unknown };
-      if (
-        typeof e.code === "string" &&
-        e.code.startsWith("ERR_ROOTSTOCK_MIG_") &&
-        typeof e.message === "string"
-      ) {
-        // Name the ref: the same text from the working tree would send the reader to the wrong tree.
-        e.message = `${e.message} (reading ${where})`;
-      }
-      throw err;
-    }
-  };
-}
-
-function fromMap(files: ReadonlyMap<string, Uint8Array>) {
-  return (name: string): Uint8Array => {
-    const bytes = files.get(name);
-    if (bytes === undefined) throw new Error(`no file ${name}`);
-    return bytes;
+    if (folder.layout === "sql") return sqlFolderAt(where, names, readFile, opts);
+    return drizzleJournalAt(where, await blob("meta/_journal.json"), readFile, opts);
   };
 }
 
 /** The names of the regular files in `ls-tree -z` output; a symlink is refused, a subtree skipped. */
 function listBlobs(source: string, where: string, out: Uint8Array): string[] {
   const names: string[] = [];
-  for (const record of textOf.decode(out).split("\0")) {
+  for (const record of text.decode(out).split("\0")) {
     if (record === "") continue;
     const tab = record.indexOf("\t");
     const [mode, type] = record.slice(0, tab).split(" ");
     const name = record.slice(tab + 1);
     if (type !== "blob") continue;
     if (mode === "120000") {
-      throw Object.assign(
-        new Error(
-          `rootstock migrate: source ${q(source)}: ${where}/${name} is a symlink on the ref — the order check cannot read through it`,
-        ),
-        { code: "ERR_ROOTSTOCK_MIG_SRC" },
+      fail(
+        `source ${q(source)}: ${where}${name} is a symlink on the ref — the order check cannot read through it`,
       );
     }
     names.push(name);

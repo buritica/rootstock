@@ -12,6 +12,3 @@ export interface TrackedSource {
   readonly migrations: readonly SourceMigration[];
   readonly tracker: Tracker;
 }
-
-/** The name rootstock's own source always carries. */
-export const ROOTSTOCK_SOURCE = "rootstock";

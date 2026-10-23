@@ -1,4 +1,7 @@
 import { isRecord, q } from "../internal/slice.ts";
+import { fail } from "./errors.ts";
+
+const CODE = "ERR_ROOTSTOCK_MIG_NOT_THROWAWAY";
 
 const SOCKET_STANDIN = "rootstock-socket.invalid";
 const LOCAL_HOSTS = ["localhost", "127.0.0.1", "::1"] as const;
@@ -13,18 +16,14 @@ export interface ThrowawayOptions {
 }
 
 function refuse(host: string, db: string, why: string): never {
-  throw Object.assign(
-    new Error(
-      `rootstock migrate: refusing to touch ${q(host)}/${q(db)} — ${why}; tests run only against a throwaway local database`,
-    ),
-    { code: "ERR_ROOTSTOCK_MIG_NOT_THROWAWAY" },
+  fail(
+    `refusing to touch ${q(host)}/${q(db)} — ${why}; tests run only against a throwaway local database`,
+    CODE,
   );
 }
 
 function badOption(message: string): never {
-  throw Object.assign(new Error(`rootstock migrate: assertThrowawayDb: ${message}`), {
-    code: "ERR_ROOTSTOCK_MIG_NOT_THROWAWAY",
-  });
+  fail(`assertThrowawayDb: ${message}`, CODE);
 }
 
 function decode(part: string): string | undefined {
@@ -43,8 +42,10 @@ const isSocket = (host: string): boolean => host === "" || host.startsWith("/");
  * host it would connect to is in `allowHosts` or a Unix socket, and its
  * database name is not in `denyNames`. Reads the URL the way libpq does: a
  * `host`, `hostaddr` or `dbname` query parameter overrides the URL's own, an
- * empty database name defaults to the user's, and a comma-separated host list
- * is checked host by host. A URL that does not parse is refused. Pure: no I/O,
+ * empty database name defaults to the user's, and a comma-separated `host`
+ * parameter is checked host by host. A URL that does not parse is refused,
+ * which includes a host list in the authority (`h1:5432,h2:5432`): pass it as
+ * `?host=h1,h2` instead. Pure: no I/O,
  * and no message ever carries the URL's password.
  */
 export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {

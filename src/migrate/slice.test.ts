@@ -151,7 +151,7 @@ describe("migrateSlice accepted", () => {
     ],
     [
       { accepted: [ok, { ...ok, reason: "again" }] },
-      "migrateSlice: accepted[1] repeats app/0001_x.sql",
+      'migrateSlice: accepted[1] must be a (source, id) pair not listed earlier — got ["app","0001_x.sql"]',
     ],
   ])("refuses %j", (extra, message) => {
     expect(

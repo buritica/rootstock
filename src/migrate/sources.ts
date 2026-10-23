@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sha256Hex } from "../hash/index.ts";
 import { isRecord, q } from "../internal/slice.ts";
+import { fail, failIo, reason } from "./errors.ts";
 import { type MigrationKind, markerPattern, matchMarker, NAME_RULE } from "./marker.ts";
 
 /**
@@ -79,21 +80,6 @@ const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 // it); dropping is the one that runs, since Postgres rejects a leading U+FEFF.
 const DROP_BOM = new TextDecoder("utf-8");
 
-/**
- * Every reader refusal carries a code, so a caller never branches on text:
- * ERR_ROOTSTOCK_MIG_IO when a file or folder could not be read (the cause is
- * kept, and re-running may help), ERR_ROOTSTOCK_MIG_SRC when what was read or
- * passed is wrong (a commit or a config change is the fix).
- */
-function fail(message: string, code = "ERR_ROOTSTOCK_MIG_SRC", cause?: unknown): never {
-  const err = new Error(`rootstock migrate: ${message}`, cause === undefined ? {} : { cause });
-  throw Object.assign(err, { code });
-}
-
-function failIo(message: string, cause: unknown): never {
-  fail(`${message} — ${reason(cause)}`, "ERR_ROOTSTOCK_MIG_IO", cause);
-}
-
 /** Refuses an own key `allowed` does not name, so a stale option shape is never silently read as empty. */
 function onlyKeys(
   source: unknown,
@@ -111,10 +97,6 @@ function onlyKeys(
       );
     }
   }
-}
-
-function reason(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 interface Opened {
@@ -264,6 +246,20 @@ export function drizzleJournalFrom(
   return journalFrom(open(opts), journalText, readFile);
 }
 
+/**
+ * `drizzleJournalFrom` for a reader of another tree: decodes the journal as
+ * the folder reader does (a byte-order mark kept) and names `where` (ending in
+ * `/`) in every refusal. Internal: the index does not export it.
+ */
+export function drizzleJournalAt(
+  where: string,
+  journal: Uint8Array,
+  readFile: ReadFile,
+  opts: SourceOptions,
+): readonly SourceMigration[] {
+  return journalFrom(open(opts, where), KEEP_BOM.decode(journal), readFile);
+}
+
 function journalFrom(
   opened: Opened,
   journalText: string,
@@ -406,8 +402,9 @@ function readRenames(
  * `names` must be regular files only (a reader of a git tree drops subtrees).
  * Refuses: a repeated name, a name ending `.sql` in another case (it would
  * never run), a folder with no `.sql` file, a file it cannot read, and a
- * `renames.json` that is not a JSON object of `.sql` names, repeats a key, maps to a name not in the folder, maps from a name still in it, or
- * maps two names to one.
+ * `renames.json` that is not a JSON object of `.sql` names, repeats a key,
+ * maps to a name not in the folder, maps from a name still in it, or maps two
+ * names to one.
  */
 export function sqlFolderFrom(
   names: readonly string[],
@@ -415,6 +412,16 @@ export function sqlFolderFrom(
   opts: SourceOptions,
 ): readonly SourceMigration[] {
   return folderFrom(open(opts), names, readFile);
+}
+
+/** `sqlFolderFrom` naming `where` (ending in `/`) in every refusal. Internal. */
+export function sqlFolderAt(
+  where: string,
+  names: readonly string[],
+  readFile: ReadFile,
+  opts: SourceOptions,
+): readonly SourceMigration[] {
+  return folderFrom(open(opts, where), names, readFile);
 }
 
 function folderFrom(
@@ -500,7 +507,7 @@ function stampOf(second: number): string | undefined {
 }
 
 /** The UTC second a `YYYYMMDDHHMMSS_` name stands for, or undefined when it is not one. */
-function secondOf(id: string): number | undefined {
+export function secondOf(id: string): number | undefined {
   const m = STAMPED.exec(id);
   if (m === null) return undefined;
   const [y, mo, d, h, mi, se] = m.slice(1).map(Number) as [

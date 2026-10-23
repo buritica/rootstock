@@ -36,7 +36,10 @@ function drizzle(entries: readonly [string, number, string][]): readonly SourceM
 const tracked = (migrations: readonly SourceMigration[]): TrackedSource => ({
   name: "app",
   migrations,
-  tracker: { kind: "filename", schema: "public", table: "schema_migrations" },
+  // A drizzle reader's ids carry no .sql; its keys compare as integers.
+  tracker: migrations.some((m) => m.id.endsWith(".sql"))
+    ? { kind: "filename", schema: "public", table: "schema_migrations" }
+    : { kind: "drizzle", schema: "drizzle", table: "__drizzle_migrations" },
 });
 
 const check = (
@@ -206,7 +209,7 @@ function fakeGit(
     if (cmd === "rev-parse") return enc.encode(opts.shallow ? "true\n" : "false\n");
     if (cmd === "fetch") return new Uint8Array();
     if (cmd === "ls-tree") {
-      const dir = (args[2] as string).replace(/^[^:]+:/, "");
+      const dir = (args[2] as string).replace(/^[^:]+:/, "").replace(/\/$/, "");
       const children = new Map<string, string>();
       for (const path of Object.keys(tree)) {
         if (!path.startsWith(`${dir}/`)) continue;
@@ -261,7 +264,7 @@ describe("gitMainReader", () => {
     expect((await read("app")).map((m) => m.key)).toEqual(["0000_a.sql"]);
   });
 
-  test("reads a drizzle folder, ignoring the marker rule", async () => {
+  test("reads a drizzle folder", async () => {
     const entries: [string, number, string][] = [
       ["20261001000000_a", 1000, A],
       ["20261002000000_b", 2000, BARE],
@@ -274,7 +277,7 @@ describe("gitMainReader", () => {
     const read = gitMainReader({
       run,
       fetch: "never",
-      folders: { app: { path: "drz", layout: "drizzle", marker: { baseline: "not-on-main" } } },
+      folders: { app: { path: "drz", layout: "drizzle" } },
     });
     expect(await read("app")).toEqual(drizzle(entries));
   });
@@ -341,7 +344,7 @@ describe("gitMainReader", () => {
       fetch: "never",
       folders: { app: { path: "nowhere", layout: "sql" } },
     });
-    await expect(read("app")).rejects.toThrow('source "app": cannot list origin/main:nowhere');
+    await expect(read("app")).rejects.toThrow('source "app": cannot list origin/main:nowhere/');
   });
 
   test("a reader refusal on main names the ref", async () => {
@@ -351,9 +354,7 @@ describe("gitMainReader", () => {
       fetch: "never",
       folders: { app: { path: "m", layout: "sql" } },
     });
-    await expect(read("app")).rejects.toThrow(
-      /holds no \.sql file — wrong folder\? \(reading origin\/main:m\)/,
-    );
+    await expect(read("app")).rejects.toThrow("origin/main:m/ holds no .sql file — wrong folder?");
   });
 
   test("a symlink on the ref is refused", async () => {
