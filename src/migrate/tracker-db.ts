@@ -39,8 +39,6 @@ export interface TrackerBootstrap {
   readonly table: string;
   readonly created: boolean;
   readonly upgraded: boolean;
-  /** Ids whose NULL hash was stamped. */
-  readonly stamped: readonly string[];
 }
 
 const HASH_CHECK = "CHECK (sha256 ~ '^[0-9a-f]{64}$')";
@@ -277,10 +275,10 @@ async function assertUpgradable(tx: TxSql, t: Resolved): Promise<void> {
 /**
  * Makes a source's tracker ready to apply against, in the caller's bootstrap
  * transaction (contract §1.4 step 1): creates a missing table (and schema),
- * adds `sha256` to a hash-less filename tracker behind the shape guard, and
- * stamps each NULL hash whose file is in `source` with that file's hash. It
- * emits nothing: a later throw rolls the whole transaction back, so the caller
- * reports the result only after commit. rootstock's own tracker is left to
+ * and adds `sha256` to a hash-less filename tracker behind the shape guard.
+ * Stamping NULL hashes is `stampHashes`, a later step, so a run that is then
+ * refused stamps nothing. It emits nothing: a later throw rolls the whole
+ * transaction back, so the caller reports the result only after commit. rootstock's own tracker is left to
  * rootstock's first migration, as in 0.3.0. Running it again on a ready
  * tracker does nothing. Ownership is compared exactly (the contract's rule),
  * so a table owned by a role the current user merely belongs to is refused.
@@ -297,7 +295,6 @@ export async function bootstrapTracker(
       table: t.name,
       created: false,
       upgraded: false,
-      stamped: Object.freeze([]),
     });
   }
   const { schemaExists, tracked, hashColumn } = await catalog(tx, t, true);
@@ -312,24 +309,34 @@ export async function bootstrapTracker(
     await tx.unsafe(`ALTER TABLE ${t.sql} ADD COLUMN sha256 text ${HASH_CHECK}`);
     upgraded = true;
   }
-  const stamped: string[] = [];
-  if (tracker.kind === "filename" && !created && source.migrations.length > 0) {
-    // One statement whatever the count; a row already stamped is never
-    // rewritten. The pairs travel as one text parameter cast to json, since
-    // not every transactor binds arrays, and a json-typed parameter is
-    // re-encoded by bun-sql and postgres-js into a JSON string scalar.
-    const done = await tx.unsafe<{ key: string }>(
-      `UPDATE ${t.sql} AS t SET sha256 = v.hash
-         FROM json_to_recordset($1::text::json) AS v(key text, hash text)
-        WHERE t.filename = v.key AND t.sha256 IS NULL
-        RETURNING t.filename AS key`,
-      [JSON.stringify(source.migrations.map((m) => ({ key: m.key, hash: m.sha256 })))],
-    );
-    const keys = new Set(done.map((r) => r.key));
-    for (const m of source.migrations) {
-      if (!keys.has(m.key)) continue;
-      stamped.push(m.id);
-    }
-  }
-  return Object.freeze({ table: t.name, created, upgraded, stamped: Object.freeze(stamped) });
+  return Object.freeze({ table: t.name, created, upgraded });
+}
+
+/**
+ * Stamps each NULL hash of a filename tracker whose file is in `source` with
+ * that file's hash, and returns the stamped ids (contract D42). The caller runs
+ * it under the lock, only once the run is known not to be refused, so a refused
+ * run (a stale checkout, say) never writes a hash. A row already stamped is
+ * never rewritten. Other kinds store a hash with every row and return [].
+ */
+export async function stampHashes(
+  tx: TxSql,
+  source: TrackedSource,
+  slice: MigrateSlice,
+): Promise<readonly string[]> {
+  if (source.tracker.kind !== "filename" || source.migrations.length === 0)
+    return Object.freeze([]);
+  const t = resolve(source.tracker, slice);
+  // One statement whatever the count. The pairs travel as one text parameter
+  // cast to json, since not every transactor binds arrays, and a json-typed
+  // parameter is re-encoded by bun-sql and postgres-js into a JSON string scalar.
+  const done = await tx.unsafe<{ key: string }>(
+    `UPDATE ${t.sql} AS t SET sha256 = v.hash
+       FROM json_to_recordset($1::text::json) AS v(key text, hash text)
+      WHERE t.filename = v.key AND t.sha256 IS NULL
+      RETURNING t.filename AS key`,
+    [JSON.stringify(source.migrations.map((m) => ({ key: m.key, hash: m.sha256 })))],
+  );
+  const keys = new Set(done.map((r) => r.key));
+  return Object.freeze(source.migrations.filter((m) => keys.has(m.key)).map((m) => m.id));
 }

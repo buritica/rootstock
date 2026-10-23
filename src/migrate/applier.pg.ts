@@ -556,11 +556,18 @@ describe("applyMigrations", () => {
       upgraded: [`${w.f}.schema_migrations`],
       stamped: 1,
     });
-    expect(events.slice(0, 3)).toEqual([
-      { type: "migrate.tracker_created", source: "app", table: `${w.d}.__drizzle_migrations` },
-      { type: "migrate.tracker_upgraded", source: "auth", table: `${w.f}.schema_migrations` },
-      { type: "migrate.hash_stamped", source: "auth", id: "20260101000000_u.sql" },
+    // The stamp follows the plan: only a run that is not refused writes it.
+    expect(events.slice(0, 4).map((e) => e.type)).toEqual([
+      "migrate.tracker_created",
+      "migrate.tracker_upgraded",
+      "migrate.plan",
+      "migrate.hash_stamped",
     ]);
+    expect(events[3]).toEqual({
+      type: "migrate.hash_stamped",
+      source: "auth",
+      id: "20260101000000_u.sql",
+    });
     expect(events).toContainEqual({
       type: "migrate.applying",
       source: "app",
@@ -568,6 +575,50 @@ describe("applyMigrations", () => {
       kind: "additive",
     });
     expect(result.plan.apply.map((a) => a.id)).not.toContain("20260101000000_u.sql");
+  });
+
+  test("a refused run stamps no hash, and planOnly stamps none either", async () => {
+    const w = world();
+    const [root, app, auth] = appSources(w);
+    if (root === undefined || app === undefined || auth === undefined) throw new Error("fixture");
+    await sql.unsafe(`CREATE SCHEMA "${w.f}"`);
+    await sql.unsafe(
+      `CREATE TABLE "${w.f}".schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`,
+    );
+    await sql.unsafe(
+      `INSERT INTO "${w.f}".schema_migrations (filename) VALUES ('20260101000000_u.sql'), ('20250101000000_gone.sql')`,
+    );
+    const hashes = async () =>
+      (
+        await sql.unsafe<{ sha256: string | null }>(
+          `select sha256 from "${w.f}".schema_migrations order by filename`,
+        )
+      ).map((r) => r.sha256);
+    // A manual run from a checkout that lacks a recorded file: refused as ahead.
+    const { events, onEvent } = recorder();
+    const err = await rejected(
+      applyMigrations(
+        main.transactor,
+        w.slice,
+        [root, app, auth],
+        opts({ entry: "manual", onEvent }),
+      ),
+    );
+    expect(err.code).toBe("ERR_ROOTSTOCK_MIG_AHEAD_SRC");
+    expect(events.map((e) => e.type)).not.toContain("migrate.hash_stamped");
+    expect(await hashes()).toEqual([null, null]);
+    const planned = await applyMigrations(
+      main.transactor,
+      w.slice,
+      [root, app, auth],
+      opts({ planOnly: true }),
+    );
+    expect(planned.bootstrap.stamped).toBe(0);
+    expect(await hashes()).toEqual([null, null]);
+    // The deploy that is not refused stamps the file it has, and only that one.
+    const done = await applyMigrations(main.transactor, w.slice, [root, app, auth], opts());
+    expect(done.bootstrap.stamped).toBe(1);
+    expect(await hashes()).toEqual([null, auth.migrations[0]?.sha256 ?? ""]);
   });
 
   test("planOnly takes no lock: it answers while another session holds the migration lock", async () => {

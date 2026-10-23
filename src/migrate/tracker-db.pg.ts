@@ -12,7 +12,13 @@ import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-sup
 import { migrateSlice } from "./slice.ts";
 import { drizzleJournalFrom, type SourceMigration, sqlFolderFrom } from "./sources.ts";
 import { drizzleTracker, filenameTracker, type TrackedSource, type Tracker } from "./tracked.ts";
-import { bootstrapTracker, readTracker, recordApplied, trackerRowsFor } from "./tracker-db.ts";
+import {
+  bootstrapTracker,
+  readTracker,
+  recordApplied,
+  stampHashes,
+  trackerRowsFor,
+} from "./tracker-db.ts";
 
 // The tracker SQL against a real Postgres, once per transactor kind. Every case
 // works in schemas of its own (`rs_k_<hex>`) and drops them when it is done.
@@ -67,8 +73,12 @@ function source(tracker: Tracker, migrations: readonly SourceMigration[]): Track
   return { name: "app", migrations, tracker };
 }
 
-function bootstrap(src: TrackedSource): ReturnType<typeof bootstrapTracker> {
-  return tx.begin((t) => bootstrapTracker(t, src, SLICE));
+/** Bootstrap, then the stamp, as the applier runs them (two steps, one transaction here). */
+function bootstrap(src: TrackedSource) {
+  return tx.begin(async (t) => {
+    const done = await bootstrapTracker(t, src, SLICE);
+    return { ...done, stamped: await stampHashes(t, src, SLICE) };
+  });
 }
 
 const LEGACY_DDL = "filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now()";
@@ -553,8 +563,8 @@ describe("reads", () => {
       table: `${slice.schema}.schema_migrations`,
       created: false,
       upgraded: false,
-      stamped: [],
     });
+    expect(await tx.begin((t) => stampHashes(t, src, slice))).toEqual([]);
     expect((await readTracker(sql, { kind: "rootstock" }, slice)).schemaExists).toBe(false);
     await sql.unsafe(`CREATE SCHEMA "${slice.schema}"`);
     await sql.unsafe(

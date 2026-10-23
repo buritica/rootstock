@@ -10,6 +10,7 @@ import {
   bootstrapTracker,
   readTracker,
   recordApplied,
+  stampHashes,
   trackerName,
   trackerRowsFor,
 } from "./tracker-db.ts";
@@ -200,8 +201,22 @@ function validateOptions(slice: MigrateSlice, opts: unknown): ApplyOptions {
   }) as ApplyOptions;
 }
 
-/** The refusals that carry a code, so the caller's `migrate.refused` sees them too. */
+/**
+ * Every refusal here carries a code, so the caller's `migrate.refused` sees it:
+ * a shape refusal (not an array, a bad name, a bad tracker) keeps its parser
+ * text and gains ERR_ROOTSTOCK_MIG_SRC.
+ */
 function validateSources(slice: MigrateSlice, sources: unknown, opts: ApplyOptions): void {
+  try {
+    checkSources(slice, sources, opts);
+  } catch (err) {
+    if (err instanceof Error && refusalCode(err) === undefined)
+      Object.assign(err, { code: "ERR_ROOTSTOCK_MIG_SRC" });
+    throw err;
+  }
+}
+
+function checkSources(slice: MigrateSlice, sources: unknown, opts: ApplyOptions): void {
   if (opts.allowHeavy === true && opts.entry === "deploy") {
     fail(
       'options.allowHeavy is for entry "manual" only — a deploy never applies a heavy migration',
@@ -408,7 +423,6 @@ async function bootstrap(
     const created: string[] = [];
     const upgraded: string[] = [];
     const events: MigrateEvent[] = [];
-    let stamped = 0;
     for (const source of sources) {
       let done: Awaited<ReturnType<typeof bootstrapTracker>>;
       try {
@@ -430,20 +444,48 @@ async function bootstrap(
         upgraded.push(done.table);
         events.push({ type: "migrate.tracker_upgraded", source: source.name, table: done.table });
       }
-      for (const id of done.stamped)
-        events.push({ type: "migrate.hash_stamped", source: source.name, id });
-      stamped += done.stamped.length;
     }
     return {
       schemaCreated: !exists,
       result: Object.freeze({
         created: Object.freeze(created),
         upgraded: Object.freeze(upgraded),
-        stamped,
+        stamped: 0,
       }),
       events,
     };
   });
+}
+
+/**
+ * D42's one-time stamp, under the lock, once the run is known not to be
+ * refused: a refused run (a manual run from a stale checkout, say) must not
+ * write its files' hashes into rows it then leaves alone. Events go out after
+ * commit.
+ */
+async function stamp(transactor: Transactor, run: Run): Promise<number> {
+  const { slice, sources, emit } = run;
+  const done = await transactor.begin(async (tx) => {
+    await lock(tx, slice);
+    await tx.unsafe(`SET LOCAL lock_timeout = '${BOOTSTRAP_LOCK_TIMEOUT}'`);
+    const out: { source: string; id: string }[] = [];
+    for (const source of sources) {
+      let ids: readonly string[];
+      try {
+        ids = await stampHashes(tx, source, slice);
+      } catch (err) {
+        const waited = pgCode(err) === "55P03" ? "; another migrator is holding it" : "";
+        throw new Error(
+          `rootstock migrate: stamping source ${q(source.name)}'s hashes in ${trackerName(source.tracker, slice)} failed, so nothing was changed${waited} — ${reason(err)}`,
+          { cause: err },
+        );
+      }
+      for (const id of ids) out.push({ source: source.name, id });
+    }
+    return out;
+  });
+  for (const d of done) emit({ type: "migrate.hash_stamped", ...d });
+  return done.length;
 }
 
 /** Step 5 for one file: its own transaction, under the lock, re-reading its row first. */
@@ -559,6 +601,9 @@ async function steps(transactor: Transactor, run: Run): Promise<ApplyOutcome> {
     Object.freeze({ plan, applied, skippedConcurrent, bootstrap: boot, schemaCreated });
   if (opts.planOnly === true) return result(Object.freeze([]), Object.freeze([]));
 
+  const stamped = await stamp(transactor, run);
+  if (stamped > 0) boot = Object.freeze({ ...boot, stamped });
+
   if (plan.apply.length > 0) {
     if ("run" in opts.backup) {
       try {
@@ -613,6 +658,8 @@ async function verify(transactor: Transactor, run: Run, plan: MigrationPlan): Pr
   const stillPending = after
     .flatMap((s) => s.pending.map((m) => label(m.source, m.id)))
     .filter((x) => planned.has(x));
+  // Every file, not only the planned ones: a planned file can rewrite an
+  // earlier run's row, and that must fail this run, not the next one.
   const tampered = after.flatMap((s) => s.tampered.map((t) => label(s.source, t.id)));
   if (stillPending.length > 0 || tampered.length > 0) {
     const parts = [

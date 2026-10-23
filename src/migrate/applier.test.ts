@@ -107,7 +107,12 @@ describe("applyMigrations coded refusals before the database", () => {
 
 describe("applyMigrations sources", () => {
   test.each([
-    ["none", [], "applyMigrations: sources must be a non-empty array — got []", undefined],
+    [
+      "none",
+      [],
+      "applyMigrations: sources must be a non-empty array — got []",
+      "ERR_ROOTSTOCK_MIG_SRC",
+    ],
     [
       "rootstock not first",
       [app, root],
@@ -136,7 +141,7 @@ describe("applyMigrations sources", () => {
       "a bad name",
       [root, { ...app, name: "App" }],
       'applyMigrations: sources[1].name must be a name matching [a-z][a-z0-9-]* — got "App"',
-      undefined,
+      "ERR_ROOTSTOCK_MIG_SRC",
     ],
     [
       "another source's migration",
