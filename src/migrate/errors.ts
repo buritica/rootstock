@@ -1,6 +1,10 @@
 /** The text of a thrown value, for a refusal that names its cause. */
 export function reason(err: unknown): string {
   let text = err instanceof Error ? err.message : String(err);
+  // A dual-stack connect failure is an AggregateError with an empty message.
+  if (text === "" && err instanceof AggregateError)
+    text = err.errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; ");
+  if (text === "") text = String((err as { code?: unknown } | null)?.code ?? "unknown error");
   // A shell error (Bun.$) keeps git's own words in stderr, not in its message.
   const stderr = (err as { stderr?: unknown } | null)?.stderr;
   const said = stderr instanceof Uint8Array ? new TextDecoder().decode(stderr) : stderr;

@@ -70,6 +70,7 @@ function planLines(plan: MigrationPlan): string[] {
 }
 
 function resultLines(result: ApplyResult): string[] {
+  const { bootstrap, plan } = result;
   const lines = [
     result.applied.length === 0
       ? "applied: nothing"
@@ -77,8 +78,20 @@ function resultLines(result: ApplyResult): string[] {
   ];
   if (result.skippedConcurrent.length > 0)
     lines.push(`skipped, another applier ran them: ${ids(result.skippedConcurrent)}`);
-  if (result.plan.ahead.length > 0) lines.push(`ahead: ${ids(result.plan.ahead)}`);
+  if (bootstrap.created.length > 0) lines.push(`trackers created: ${bootstrap.created.join(", ")}`);
+  if (bootstrap.upgraded.length > 0)
+    lines.push(`trackers upgraded: ${bootstrap.upgraded.join(", ")}`);
+  if (bootstrap.stamped > 0) lines.push(`hashes stamped: ${bootstrap.stamped}`);
+  if (plan.ahead.length > 0) lines.push(`ahead: ${ids(plan.ahead)}`);
+  for (const a of plan.accepted) lines.push(`accepted: ${a.source}/${a.id} (${a.reason})`);
   return lines;
+}
+
+/** Fails fast on a caller bug, before any I/O: these are not exit codes. */
+function checkDeps(deps: MigrateCliDeps): void {
+  if (typeof deps?.out !== "function") throw new Error("migrateCli: deps.out must be a function");
+  if (typeof deps.fix !== "string" || deps.fix.trim() === "")
+    throw new Error("migrateCli: deps.fix must be the repo's real manual-apply command");
 }
 
 /**
@@ -86,31 +99,39 @@ function resultLines(result: ApplyResult): string[] {
  * - `status`: 0 green, 1 red, 2 when it could not answer. Any throw is 2,
  *   coded or not: a refusal from status (bad sources, a tracker it cannot
  *   read) is a broken setup, not drift, and must not send on-call to migrate.
- * - `plan`: writes nothing; 0, 1 on a migrate refusal, 2 on anything else.
+ * - `plan`: writes nothing; 0, 1 on a migrate refusal (printed instead of the
+ *   plan, which a refused run never computes), 2 on anything else.
  * - `apply`: 0, 1 on a migrate refusal; any other error is rethrown, so the
- *   process crashes non-zero with its stack.
- * - An unknown argument prints usage and exits 2.
+ *   process crashes non-zero with its stack. Under `process.exit(await ...)`
+ *   that crash also exits 1: a caller that must tell the two apart catches it.
+ * - An unknown argument prints usage and exits 2. A leading `--` is ignored.
+ *
+ * An app with two databases calls this once per database, prefixes `out` with
+ * the database's name, and exits with the larger code; an apply that throws on
+ * the first database never reaches the second.
  */
 export async function migrateCli(
   argv: readonly string[],
   deps: MigrateCliDeps,
 ): Promise<0 | 1 | 2> {
+  checkDeps(deps);
   const { out } = deps;
-  const command = parse(argv);
+  const command = parse(argv[0] === "--" ? argv.slice(1) : argv);
   if (command === undefined) {
     out(MIGRATE_USAGE);
     return 2;
   }
   if (command.kind === "status") {
+    let status: Awaited<ReturnType<typeof migrationStatus>>;
     try {
-      const status = await migrationStatus(deps.transactor.sql, deps.slice, deps.sources);
-      for (const line of renderMigrationStatus(status, { fix: deps.fix }).trimEnd().split("\n"))
-        out(line);
-      return status.red ? 1 : 0;
+      status = await migrationStatus(deps.transactor.sql, deps.slice, deps.sources);
     } catch (err) {
       out(`status could not answer — ${reason(err)}`);
       return 2;
     }
+    for (const line of renderMigrationStatus(status, { fix: deps.fix }).trimEnd().split("\n"))
+      out(line);
+    return status.red ? 1 : 0;
   }
   const opts = {
     entry: command.entry,
@@ -119,28 +140,31 @@ export async function migrateCli(
     ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
   };
   if (command.kind === "plan") {
+    let result: ApplyResult;
     try {
-      const result = await applyMigrations(deps.transactor, deps.slice, deps.sources, {
+      result = await applyMigrations(deps.transactor, deps.slice, deps.sources, {
         ...opts,
         planOnly: true,
       });
-      for (const line of planLines(result.plan)) out(line);
-      return 0;
     } catch (err) {
-      out(reason(err));
-      return refusalCode(err) === undefined ? 2 : 1;
+      const coded = refusalCode(err) !== undefined;
+      out(coded ? reason(err) : `plan could not answer — ${reason(err)}`);
+      return coded ? 1 : 2;
     }
+    for (const line of planLines(result.plan)) out(line);
+    return 0;
   }
+  let result: ApplyResult;
   try {
-    const result = await applyMigrations(deps.transactor, deps.slice, deps.sources, {
+    result = await applyMigrations(deps.transactor, deps.slice, deps.sources, {
       ...opts,
       ...(command.allowHeavy ? { allowHeavy: true } : {}),
     });
-    for (const line of resultLines(result)) out(line);
-    return 0;
   } catch (err) {
     if (refusalCode(err) === undefined) throw err;
     out(reason(err));
     return 1;
   }
+  for (const line of resultLines(result)) out(line);
+  return 0;
 }

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MIGRATE_USAGE, type MigrateCliDeps, migrateCli } from "./cli.ts";
+import { migrateSlice } from "./slice.ts";
+import { drizzleTracker } from "./tracked.ts";
 
 // Every case here exits before touching the transactor, which throws if used.
 const untouched = new Proxy(
@@ -40,5 +42,36 @@ describe("migrateCli usage", () => {
     const lines: string[] = [];
     expect(await migrateCli(argv, deps(lines))).toBe(2);
     expect(lines).toEqual([MIGRATE_USAGE]);
+  });
+});
+
+describe("migrateCli deps and status refusals", () => {
+  test("a caller bug throws before any I/O", async () => {
+    await expect(migrateCli(["status"], { ...deps([]), fix: " " })).rejects.toThrow(
+      "migrateCli: deps.fix must be",
+    );
+    await expect(migrateCli(["status"], { ...deps([]), out: undefined as never })).rejects.toThrow(
+      "migrateCli: deps.out must be a function",
+    );
+  });
+
+  test("a leading -- is ignored", async () => {
+    const lines: string[] = [];
+    expect(await migrateCli(["--", "statsu"], deps(lines))).toBe(2);
+    expect(lines).toEqual([MIGRATE_USAGE]);
+  });
+
+  test("status turns a coded refusal (bad sources) into 2, could not answer", async () => {
+    const lines: string[] = [];
+    const code = await migrateCli(["status"], {
+      ...deps(lines),
+      transactor: { sql: {} } as never,
+      slice: migrateSlice({}),
+      sources: [{ name: "app", tracker: drizzleTracker(), migrations: [] }],
+    });
+    expect(code).toBe(2);
+    expect(lines).toEqual([
+      'status could not answer — rootstock migrate: the first source must be rootstockSource(slice) — got "app"',
+    ]);
   });
 });

@@ -5,6 +5,7 @@ import {
   openTestTransactor,
   type TestTransactor,
 } from "../db/transactor.pg-support.ts";
+import type { MigrateEvent } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
 import { migrateCli } from "./cli.ts";
 import { mig, schemaFactory } from "./fixtures.pg-support.ts";
@@ -50,6 +51,7 @@ async function run(
 ): Promise<{ code: 0 | 1 | 2; lines: string[] }> {
   const lines: string[] = [];
   const code = await migrateCli(argv, {
+    onEvent: (e) => events.push(e),
     transactor,
     slice: w.slice,
     sources: sources(w, files),
@@ -59,6 +61,9 @@ async function run(
   });
   return { code, lines };
 }
+
+/** Every event any run emitted, in order: proves onEvent passes through. */
+const events: MigrateEvent[] = [];
 
 beforeAll(() => {
   main = openTestTransactor();
@@ -86,9 +91,15 @@ describe("migrateCli", () => {
     });
     expect((await run(["status"], w)).code).toBe(1);
 
+    events.length = 0;
     const apply = await run(["apply", "--deploy"], w);
     expect(apply.code).toBe(0);
-    expect(apply.lines[0]).toStartWith("applied: rootstock/");
+    expect(apply.lines).toHaveLength(2);
+    expect(apply.lines[0]).toMatch(
+      /^applied: rootstock\/[^ ]+ \(\d+ ms\), app\/0000_a \(\d+ ms\)$/,
+    );
+    expect(apply.lines[1]).toBe(`trackers created: ${w.d}.__drizzle_migrations`);
+    expect(events.map((e) => e.type)).toContain("migrate.done");
 
     expect(await run(["status"], w)).toEqual({
       code: 0,
@@ -103,12 +114,22 @@ describe("migrateCli", () => {
       mig("app", "0000_h", "1700000000000", `CREATE TABLE "${w.d}".h (x int)`, "heavy"),
     ];
     const plan = await run(["plan", "--deploy"], w, heavy);
-    expect(plan.code).toBe(1);
-    expect(plan.lines[0]).toContain("app/0000_h");
+    expect(plan).toEqual({
+      code: 1,
+      lines: [
+        "rootstock migrate: deploy refuses pending migration(s) that are heavy or unmarked: app/0000_h (heavy) — apply them by hand (bun run migrate apply --manual), then redeploy",
+      ],
+    });
     const apply = await run(["apply", "--deploy"], w, heavy);
     expect(apply.code).toBe(1);
     expect(apply.lines).toEqual(plan.lines);
-    const manual = await run(["apply", "--manual", "--allow-heavy"], w, heavy);
+    expect(await run(["apply", "--manual"], w, heavy)).toEqual({
+      code: 1,
+      lines: [
+        "rootstock migrate: pending migration(s) marked heavy or unmarked: app/0000_h — re-run with --allow-heavy to apply them deliberately",
+      ],
+    });
+    const manual = await run(["apply", "--allow-heavy", "--manual"], w, heavy);
     expect(manual.code).toBe(0);
     // A rolled-back checkout: ahead. A deploy plan reports it, a manual one refuses.
     const back = await run(["plan"], w, []);
@@ -135,7 +156,9 @@ describe("migrateCli", () => {
       const status = await run(["status"], w, undefined, denied.transactor);
       expect(status.code).toBe(2);
       expect(status.lines[0]).toStartWith("status could not answer — ");
-      expect((await run(["plan", "--deploy"], w, undefined, denied.transactor)).code).toBe(2);
+      const plan = await run(["plan", "--deploy"], w, undefined, denied.transactor);
+      expect(plan.code).toBe(2);
+      expect(plan.lines[0]).toStartWith("plan could not answer — ");
       // The applier's preflight names the missing grant: a refusal, so 1.
       expect((await run(["apply", "--deploy"], w, undefined, denied.transactor)).code).toBe(1);
     } finally {
