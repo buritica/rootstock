@@ -25,8 +25,11 @@ const unfrozen = {
     ({
       profiles: Object.fromEntries(Object.entries(input.profiles).map(([k, p]) => [k, { ...p }])),
     }) as unknown as ClientSlice,
-  migrateSlice: (input: MigrateInput) =>
-    ({ schema: input.schema ?? "rootstock", ahead: input.ahead }) as unknown as MigrateSlice,
+  migrateSlice: (input: MigrateInput = {}) =>
+    ({
+      schema: input.schema ?? "rootstock",
+      accepted: input.accepted ?? [],
+    }) as unknown as MigrateSlice,
   concurrencySlice: (input: ConcurrencyInput) =>
     ({
       widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
@@ -62,7 +65,7 @@ const exampleInput: RootstockConfigInput = {
       },
     },
   },
-  migrate: { ahead: "refuse" },
+  migrate: {},
   concurrency: {
     widths: {
       fetch: { default: 4, max: 4 },
@@ -119,7 +122,7 @@ const EXAMPLE_PRINT = `{
   ],
   "lock": "absent",
   "migrate": {
-    "ahead": "refuse",
+    "accepted": [],
     "schema": "rootstock"
   },
   "queue": "absent",
@@ -209,17 +212,24 @@ describe("print", () => {
     expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
   });
 
-  test("print carries ahead as configured", () => {
+  test("print carries accepted as configured", () => {
+    const accepted = [
+      {
+        source: "app",
+        id: "0001_x.sql",
+        recorded: "a".repeat(64),
+        current: "b".repeat(64),
+        reason: "r",
+      },
+    ];
     const view = JSON.parse(
-      printRootstockConfig(
-        define({ ...exampleInput, migrate: { ...exampleInput.migrate, ahead: "allow" } }),
-      ),
+      printRootstockConfig(define({ ...exampleInput, migrate: { accepted } })),
     );
-    expect(view.migrate.ahead).toBe("allow");
+    expect(view.migrate.accepted).toEqual(accepted);
   });
 
   test("unbranded-slice-refused", () => {
-    const slice = migrateSlice({ ahead: "refuse" });
+    const slice = migrateSlice({});
     // biome-ignore lint/suspicious/noExplicitAny: a real slice, but not a config
     expect(messageOf(() => printRootstockConfig(slice as any))).toBe(UNBRANDED);
   });
@@ -228,7 +238,7 @@ describe("print", () => {
 describe("define", () => {
   test("calls-parsers-in-order-and-propagates-their-errors", () => {
     const calls: string[] = [];
-    const boom = new Error("migrateSlice: ahead is required");
+    const boom = new Error("migrateSlice: ahead is not a known key");
     const spy: SliceParsers = {
       clientSlice: (i) => {
         calls.push("client");

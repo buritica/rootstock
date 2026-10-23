@@ -1,55 +1,58 @@
-import { quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
+import type { Transactor } from "../db/index.ts";
+import { runMigrations } from "./applier.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
-import { statusOf } from "./status.ts";
+import type { SourceMigration } from "./sources.ts";
+import type { TrackedSource } from "./tracked.ts";
 
 export interface ApplyReport {
   readonly schema: string;
+  /** The bootstrap of this run created the schema. */
   readonly schemaCreated: boolean;
   readonly applied: readonly string[];
+  /** Files that needed nothing, including those another applier ran first. */
   readonly alreadyApplied: number;
-  /** Non-empty only under ahead: "allow". */
+  /**
+   * @deprecated Always empty since 0.5.0: a manual apply refuses a database
+   * that is ahead.
+   */
   readonly ahead: readonly string[];
 }
 
-/**
- * Refuses unless the transaction's role can use and create in the schema, or
- * can create the schema when it is missing. The privileges are checked before
- * anything touches the schema, because Postgres's own errors for a missing
- * privilege name the wrong thing.
- */
-async function preflight(tx: TxSql, schema: string): Promise<{ exists: boolean }> {
-  const [who] = await tx<{ user: string; exists: boolean; dbCreate: boolean }>`
-    select current_user::text as "user",
-           to_regnamespace(${schema}::text) is not null as "exists",
-           has_database_privilege(current_database(), 'CREATE') as "dbCreate"`;
-  if (who === undefined)
-    throw new Error("applyRootstockMigrations: the preflight query returned no row");
-  const { user } = who;
-  if (!who.exists) {
-    if (who.dbCreate) return { exists: false };
-    throw new Error(
-      `applyRootstockMigrations: schema "${schema}" does not exist and role ${JSON.stringify(user)} cannot create it (no CREATE on this database) — have a superuser or a member of that role run CREATE SCHEMA "${schema}" AUTHORIZATION "${user}", then re-run`,
-    );
-  }
-  const [can] = await tx<{ usage: boolean; create: boolean }>`
-    select has_schema_privilege(${schema}::text, 'USAGE') as "usage",
-           has_schema_privilege(${schema}::text, 'CREATE') as "create"`;
-  if (can === undefined)
-    throw new Error("applyRootstockMigrations: the privilege query returned no row");
-  const missing = [...(can.usage ? [] : ["USAGE"]), ...(can.create ? [] : ["CREATE"])];
-  if (missing.length > 0) {
-    throw new Error(
-      `applyRootstockMigrations: role ${JSON.stringify(user)} lacks ${missing.join(" and ")} on schema "${schema}" — run GRANT ${missing.join(", ")} ON SCHEMA "${schema}" TO "${user}" as its owner, then re-run`,
-    );
-  }
-  return { exists: true };
+function asSource(list: readonly RootstockMigration[]): TrackedSource {
+  return Object.freeze({
+    name: "rootstock",
+    tracker: Object.freeze({ kind: "rootstock" as const }),
+    migrations: Object.freeze(
+      list.map(
+        (m): SourceMigration =>
+          Object.freeze({
+            source: "rootstock",
+            id: m.filename,
+            key: m.filename,
+            sha256: m.sha256,
+            kind: m.kind,
+            baselined: false,
+            statements: m.statements,
+          }),
+      ),
+    ),
+  });
 }
 
 /**
- * Applies `list` to the slice's schema in one transaction, under a lock keyed
- * on the schema. Any throw rolls everything back, the schema's creation
- * included, so running it again is always the recovery.
+ * rootstock's own migrations as the first source of every run (contract
+ * §1.1). Its tracker is `<slice.schema>.schema_migrations`.
+ */
+export function rootstockSource(slice: MigrateSlice): TrackedSource {
+  assertMigrateSlice("rootstockSource", slice);
+  return asSource(rootstockMigrations());
+}
+
+/**
+ * Applies `list` as the rootstock source alone, with Stage A's texts. Each
+ * file commits on its own since 0.5.0 (the bootstrap creates the schema
+ * first), so a failure leaves earlier files applied and a re-run continues.
  */
 export async function applyMigrationList(
   transactor: Transactor,
@@ -58,61 +61,35 @@ export async function applyMigrationList(
   opts?: { allowHeavy?: boolean },
 ): Promise<ApplyReport> {
   assertMigrateSlice("applyRootstockMigrations", slice);
-  const { schema } = slice;
-  return transactor.begin(async (tx) => {
-    // Selected FROM the call so no driver has to decode a void column. The
-    // lock serializes appliers only under READ COMMITTED: at a stricter
-    // isolation the snapshot predates the wait, so a second concurrent apply
-    // fails on CREATE SCHEMA or CREATE TABLE (42P06, 42P07), and a re-run
-    // then finds it applied.
-    await tx`select 1::int as locked from pg_advisory_xact_lock(hashtext(${`rootstock-migrate:${schema}`}::text)::bigint)`;
-    const { exists } = await preflight(tx, schema);
-    if (!exists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
-    const status = await statusOf(tx, slice, list);
-    const [tamper] = status.tampered;
-    if (tamper !== undefined) {
-      throw new Error(
-        `applyRootstockMigrations: ${schema}.schema_migrations records ${tamper.filename} with sha256 ${tamper.recorded}, but this package ships ${tamper.shipped} — an applied migration changed after it ran; refusing, and re-running will not fix this`,
-      );
-    }
-    const pendingNames = status.pending.map((m) => m.filename);
-    if (status.ahead.length > 0 && pendingNames.length > 0) {
-      throw new Error(
-        `applyRootstockMigrations: schema "${schema}" has applied ${status.ahead.join(", ")}, which this package does not ship, and is missing ${pendingNames.join(", ")} — the database and this package have diverged; refusing`,
-      );
-    }
-    if (status.ahead.length > 0 && slice.ahead === "refuse") {
-      throw new Error(
-        `applyRootstockMigrations: schema "${schema}" has applied ${status.ahead.join(", ")}, which this package does not ship — the database is ahead of this rootstock version; upgrade rootstock, or set ahead: "allow" in the migrate slice`,
-      );
-    }
-    const heavy = status.pending.filter((m) => m.kind === "heavy").map((m) => m.filename);
-    if (heavy.length > 0 && opts?.allowHeavy !== true) {
-      throw new Error(
-        `applyRootstockMigrations: pending migration(s) marked heavy: ${heavy.join(", ")} — apply them deliberately with { allowHeavy: true }, then re-run`,
-      );
-    }
-    if (status.pending.length > 0) {
-      await tx.unsafe(`SET LOCAL search_path TO ${quoteIdentifier(schema)}`);
-      for (const m of status.pending) {
-        for (const statement of m.statements) await tx.unsafe(statement);
-        await tx.unsafe(
-          `INSERT INTO ${quoteIdentifier(schema)}.schema_migrations (filename, sha256) VALUES ($1, $2)`,
-          [m.filename, m.sha256],
-        );
-      }
-    }
-    return Object.freeze({
-      schema,
-      schemaCreated: !exists,
-      applied: Object.freeze(pendingNames),
-      alreadyApplied: status.applied.length - status.ahead.length,
-      ahead: Object.freeze([...status.ahead]),
-    });
+  const outcome = await runMigrations(
+    transactor,
+    slice,
+    [asSource(list)],
+    {
+      entry: "manual",
+      backup: { skip: "applyRootstockMigrations: caller's responsibility" },
+      fix: "applyRootstockMigrations(transactor, slice, { allowHeavy: true })",
+      ...(opts?.allowHeavy === true ? { allowHeavy: true } : {}),
+    },
+    true,
+  );
+  const planned = new Set(outcome.plan.apply.map((a) => a.id));
+  return Object.freeze({
+    schema: slice.schema,
+    schemaCreated: outcome.schemaCreated,
+    applied: Object.freeze(outcome.applied.map((a) => a.id)),
+    alreadyApplied:
+      list.filter((m) => !planned.has(m.filename)).length + outcome.skippedConcurrent.length,
+    ahead: Object.freeze([]),
   });
 }
 
-/** Applies every shipped rootstock migration the slice's schema has not applied. */
+/**
+ * Applies every shipped rootstock migration the slice's schema has not applied.
+ * Since 0.5.0 each file commits on its own (a failure leaves earlier files
+ * applied, and the created schema stays), and a database with rows this
+ * package does not ship always refuses.
+ */
 export function applyRootstockMigrations(
   transactor: Transactor,
   slice: MigrateSlice,

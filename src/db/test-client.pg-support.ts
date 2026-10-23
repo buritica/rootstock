@@ -9,8 +9,8 @@ import postgres from "postgres";
  * This module reaches only the drivers and the environment, never rootstock's
  * own exports, so it compiles before any `db` code exists.
  *
- * Every client is `max: 1`, so all of a client's queries run on one backend
- * and session state is observable. Each call opens an independent client; a
+ * Every client is `max: 1` (except `openPooledClient`'s), so all of a
+ * client's queries run on one backend and session state is observable. Each call opens an independent client; a
  * test closes everything it opens.
  */
 export const TEST_TRANSACTOR_KINDS = ["bun-sql", "postgres-js", "drizzle"] as const;
@@ -44,20 +44,20 @@ function testTransactorKind(): TestTransactorKind {
   return known;
 }
 
-function open(): TestClient {
+function open(max = 1): TestClient {
   const url = required("ROOTSTOCK_TEST_DATABASE_URL");
   const kind = testTransactorKind();
   switch (kind) {
     case "bun-sql": {
-      const client = new SQL({ url, max: 1 });
+      const client = new SQL({ url, max });
       return { kind, client, close: () => client.close() };
     }
     case "postgres-js": {
-      const client = postgres(url, { max: 1, onnotice: () => {} });
+      const client = postgres(url, { max, onnotice: () => {} });
       return { kind, client, close: () => client.end() };
     }
     case "drizzle": {
-      const client = drizzle(postgres(url, { max: 1, onnotice: () => {} }));
+      const client = drizzle(postgres(url, { max, onnotice: () => {} }));
       return { kind, client, close: () => client.$client.end() };
     }
   }
@@ -74,4 +74,12 @@ export function openTestClient(): TestClient {
  */
 export function openSecondClient(): TestClient {
   return open();
+}
+
+/**
+ * A client whose pool holds `max` backends, for the cases that must show a
+ * guarantee holds when a transactor's transactions land on different backends.
+ */
+export function openPooledClient(max: number): TestClient {
+  return open(max);
 }

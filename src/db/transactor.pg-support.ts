@@ -5,7 +5,12 @@ import {
   postgresJsTransactor,
   type Transactor,
 } from "./index.ts";
-import { openSecondClient, openTestClient, type TestClient } from "./test-client.pg-support.ts";
+import {
+  openPooledClient,
+  openSecondClient,
+  openTestClient,
+  type TestClient,
+} from "./test-client.pg-support.ts";
 
 /**
  * The matrix's transactors: the test clients (`test-client.pg-support.ts`), each behind the factory for
@@ -33,4 +38,8 @@ export function openTestTransactor(): TestTransactor {
 
 export function openSecond(): TestTransactor {
   return wrap(openSecondClient());
+}
+
+export function openPooled(max: number): TestTransactor {
+  return wrap(openPooledClient(max));
 }

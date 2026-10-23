@@ -148,7 +148,15 @@ describe("pure subpaths (every clock, timer and I/O is injected)", () => {
 // Non-test files of these subpaths may import only what is listed. A prefix
 // entry ending in "/" admits any specifier starting with it.
 const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
-  "src/migrate/": ["./", "../db/index.ts", "../hash/index.ts", "../internal/slice.ts", "node:fs"],
+  "src/migrate/": [
+    "./",
+    "../db/index.ts",
+    "../hash/index.ts",
+    "../internal/slice.ts",
+    "node:fs",
+    "node:path",
+    "node:url",
+  ],
   "src/config/": [
     "./",
     "../db/index.ts",

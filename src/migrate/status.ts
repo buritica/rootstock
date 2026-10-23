@@ -1,6 +1,135 @@
-import { quoteIdentifier, type Sql } from "../db/index.ts";
+import type { Sql } from "../db/index.ts";
+import { rootstockSource } from "./apply.ts";
 import { type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
+import { hasStale, readStates, type SourceState, sourceState } from "./state.ts";
+import type { TrackedSource } from "./tracked.ts";
+import { readTracker } from "./tracker-db.ts";
+import { validateSources } from "./validate.ts";
+
+/** One source compared with its tracker (contract §1.3). */
+export type SourceStatus = SourceState;
+
+export interface MigrationStatus {
+  readonly sources: readonly SourceStatus[];
+  /** Any pending file. */
+  readonly behind: boolean;
+  /** Any row with no file. */
+  readonly ahead: boolean;
+  /** Any changed file no acceptance covers. */
+  readonly tampered: boolean;
+  /** Any unknown or duplicate row, or any stale acceptance. */
+  readonly trackerRot: boolean;
+  /** behind || ahead || tampered || trackerRot. The drift check pages on it (D46/D48). */
+  readonly red: boolean;
+}
+
+/**
+ * Read-only, lock-free status of every source (contract §1.3): one snapshot
+ * per source, so a concurrent apply can make two sources disagree in time.
+ * Build `sources` once at boot; each call costs two queries per source, in
+ * order, with no timeout of its own, so give a probe its own small pool and a
+ * statement_timeout. The role needs USAGE on each tracker's schema, or this
+ * rejects with the driver's 42501, uncoded.
+ *
+ * During a deploy, status is red for a while by design: behind while the
+ * applier runs, ahead on an old instance after it. A readiness probe gates on
+ * `behind || tampered`, never on `red`; a drift job re-reads before paging.
+ */
+export async function migrationStatus(
+  sql: Sql,
+  slice: MigrateSlice,
+  sources: readonly TrackedSource[],
+): Promise<MigrationStatus> {
+  assertMigrateSlice("migrationStatus", slice);
+  validateSources("migrationStatus", slice, sources);
+  return summarizeStatus(await readStates(sql, slice, sources));
+}
+
+/** The red flags of a set of source states (contract §1.3), pure. */
+export function summarizeStatus(states: readonly SourceStatus[]): MigrationStatus {
+  const behind = states.some((s) => s.pending.length > 0);
+  const ahead = states.some((s) => s.ahead.length > 0);
+  const tampered = states.some((s) => s.tampered.length > 0);
+  const trackerRot = states.some(
+    (s) => s.unknown.length > 0 || s.duplicate.length > 0 || hasStale(s),
+  );
+  return Object.freeze({
+    sources: Object.freeze([...states]),
+    behind,
+    ahead,
+    tampered,
+    trackerRot,
+    red: behind || ahead || tampered || trackerRot,
+  });
+}
+
+const hex8 = (h: string): string => h.slice(0, 8);
+
+/** `source/id`, comma-separated: how every migrate line names files. */
+export const ids = (list: readonly { source: string; id: string }[]): string =>
+  list.map((a) => `${a.source}/${a.id}`).join(", ");
+
+function sourceLine(s: SourceStatus): string {
+  const ok =
+    s.pending.length +
+      s.ahead.length +
+      s.tampered.length +
+      s.unknown.length +
+      s.duplicate.length ===
+      0 && !hasStale(s);
+  // Contract §1.3's order.
+  const parts = [
+    ok ? `ok (${s.applied.length} applied)` : "",
+    s.pending.length > 0 ? `behind: ${s.pending.map((m) => m.id).join(", ")}` : "",
+    s.ahead.length > 0 ? `ahead: ${s.ahead.join(", ")}` : "",
+    s.tampered.length > 0
+      ? `TAMPERED: ${s.tampered.map((t) => `${t.id} recorded ${hex8(t.recorded)} now ${hex8(t.current)}`).join(", ")}`
+      : "",
+    s.accepted.length > 0
+      ? `accepted: ${s.accepted.map((a) => `${a.id} (${a.reason})${a.stale ? " STALE" : ""}`).join(", ")}`
+      : "",
+    s.unknown.length > 0 ? `unknown rows: ${s.unknown.map((u) => u.rowId).join(", ")}` : "",
+    s.duplicate.length > 0 ? `duplicate keys: ${s.duplicate.join(", ")}` : "",
+    s.outOfOrder.length > 0 ? `out of order: ${s.outOfOrder.join(", ")}` : "",
+    s.unhashed.length > 0 ? `hashes not yet stamped: ${s.unhashed.length}` : "",
+  ];
+  return `${s.source}: ${parts.filter((p) => p !== "").join("; ")}`;
+}
+
+/**
+ * One line per source, then the remedy for each red condition that has one.
+ * When the database is ahead, the remedy is a deploy, never the migrate
+ * command (contract §6 Q4), so the two are separate lines.
+ */
+export function renderMigrationStatus(status: MigrationStatus, opts: { fix: string }): string {
+  if (typeof opts?.fix !== "string" || opts.fix.trim() === "") {
+    throw new Error(
+      `renderMigrationStatus: opts.fix must be a non-empty command — got ${JSON.stringify(opts?.fix)}`,
+    );
+  }
+  const lines = status.sources.map(sourceLine);
+  if (status.behind) {
+    // The migrate command refuses while anything else is red but a stale
+    // acceptance (§1.4 step 2), so it is offered only when it can run.
+    const blocked =
+      status.ahead ||
+      status.tampered ||
+      status.sources.some((s) => s.unknown.length > 0 || s.duplicate.length > 0);
+    lines.push(
+      blocked
+        ? `fix: resolve the lines above first; ${opts.fix} refuses until then`
+        : `fix: ${opts.fix}`,
+    );
+  }
+  if (status.ahead) {
+    const ahead = status.sources.flatMap((s) => s.ahead.map((id) => ({ source: s.source, id })));
+    lines.push(
+      `ahead: fix forward with a deploy that carries ${ids(ahead)}; do not run the migrate command`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
 
 export interface RootstockMigrationStatus {
   readonly schema: string;
@@ -14,65 +143,40 @@ export interface RootstockMigrationStatus {
   /** Applied and not shipped. */
   readonly ahead: readonly string[];
   readonly tampered: readonly { filename: string; recorded: string; shipped: string }[];
-  /** pending, ahead (only when the slice refuses ahead) or tampered is non-empty. */
+  /** pending, ahead or tampered is non-empty (ahead always counts since 0.5.0). */
   readonly red: boolean;
 }
 
 /**
- * Compares what `sql` reports applied in the slice's schema with `list`. A
- * migration is pending when its filename is absent, never by comparison with
- * the newest applied name, so one that sorts before an applied one still runs.
- */
-export async function statusOf(
-  sql: Sql,
-  slice: MigrateSlice,
-  list: readonly RootstockMigration[],
-): Promise<RootstockMigrationStatus> {
-  const { schema } = slice;
-  const table = `${quoteIdentifier(schema)}.schema_migrations`;
-  const [found] = await sql<{ schemaExists: boolean; tracked: boolean }>`
-    select to_regnamespace(${schema}::text) is not null as "schemaExists",
-           to_regclass(${table}::text) is not null as "tracked"`;
-  if (found === undefined) throw new Error("rootstock migrate: the catalog query returned no row");
-  const { schemaExists, tracked } = found;
-  const rows = tracked
-    ? await sql.unsafe<{ filename: string; sha256: string }>(
-        `select filename, sha256 from ${table} order by filename collate "C"`,
-      )
-    : [];
-  const recorded = new Map(rows.map((r) => [r.filename, r.sha256]));
-  const shipped = new Set(list.map((m) => m.filename));
-  const pending: RootstockMigration[] = [];
-  const tampered: RootstockMigrationStatus["tampered"][number][] = [];
-  for (const m of [...list].sort((a, b) => (a.filename < b.filename ? -1 : 1))) {
-    const sha = recorded.get(m.filename);
-    if (sha === undefined) pending.push(m);
-    else if (sha !== m.sha256) {
-      tampered.push(Object.freeze({ filename: m.filename, recorded: sha, shipped: m.sha256 }));
-    }
-  }
-  const ahead = rows.map((r) => r.filename).filter((f) => !shipped.has(f));
-  return Object.freeze({
-    schema,
-    schemaExists,
-    tracked,
-    applied: Object.freeze(rows.map((r) => r.filename)),
-    pending: Object.freeze(pending),
-    ahead: Object.freeze(ahead),
-    tampered: Object.freeze(tampered),
-    red:
-      pending.length > 0 || tampered.length > 0 || (ahead.length > 0 && slice.ahead === "refuse"),
-  });
-}
-
-/**
- * Read-only, lock-free status of the shipped migrations in the slice's schema.
- * The role needs USAGE on that schema, or this rejects with the driver's 42501.
+ * Read-only, lock-free status of the shipped migrations in the slice's schema,
+ * in 0.3.0's shape, read through the same engine as `migrationStatus`. The
+ * role needs USAGE on that schema, or this rejects with the driver's 42501.
  */
 export async function rootstockMigrationStatus(
   sql: Sql,
   slice: MigrateSlice,
 ): Promise<RootstockMigrationStatus> {
   assertMigrateSlice("rootstockMigrationStatus", slice);
-  return statusOf(sql, slice, rootstockMigrations());
+  const source = rootstockSource(slice);
+  const read = await readTracker(sql, source.tracker, slice);
+  const s = sourceState(source, read, slice.accepted);
+  const ids = new Set(s.pending.map((m) => m.id));
+  const pending = rootstockMigrations().filter((m) => ids.has(m.filename));
+  return Object.freeze({
+    schema: slice.schema,
+    schemaExists: read.schemaExists,
+    tracked: read.tracked,
+    applied: Object.freeze(read.rows.flatMap((r) => (r.key === null ? [] : [r.key]))),
+    pending: Object.freeze(pending),
+    ahead: s.ahead,
+    tampered: Object.freeze(
+      s.tampered.map((t) =>
+        Object.freeze({ filename: t.id, recorded: t.recorded, shipped: t.current }),
+      ),
+    ),
+    // 0.3.0's rule plus ahead (D48). Unknown and duplicate rows cannot occur
+    // under the filename primary key, and a stale acceptance never hides a
+    // tamper, so migrationStatus's tracker-rot flag is left out on purpose.
+    red: s.pending.length > 0 || s.tampered.length > 0 || s.ahead.length > 0,
+  });
 }
