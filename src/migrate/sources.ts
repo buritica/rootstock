@@ -221,6 +221,9 @@ function readOrFail(readFile: ReadFile, name: string, what: string): Uint8Array 
   try {
     return readFile(name);
   } catch (err) {
+    // A reader's own coded refusal (a file a git tree lacks) is a fact, not I/O.
+    const code = (err as { code?: unknown } | null)?.code;
+    if (typeof code === "string" && code.startsWith("ERR_ROOTSTOCK_MIG_")) throw err;
     failIo(what, err);
   }
 }

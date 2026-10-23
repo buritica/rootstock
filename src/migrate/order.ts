@@ -1,4 +1,4 @@
-import { q } from "../internal/slice.ts";
+import { isRecord, q } from "../internal/slice.ts";
 import { fail, failIo } from "./errors.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import { drizzleJournalAt, type SourceMigration, secondOf, sqlFolderAt } from "./sources.ts";
@@ -23,8 +23,18 @@ const STAMPED_NAME = /^\d{14}_[a-z0-9_]+/;
 const DAY_S = 86_400;
 
 /** A drizzle key is its `when`, compared as an integer; any other key is a filename. */
-function keyOrder(source: TrackedSource): (a: string, b: string) => number {
+function keyOrder(
+  source: TrackedSource,
+  main: readonly SourceMigration[],
+): (a: string, b: string) => number {
   if (source.tracker.kind === "drizzle") {
+    for (const m of [...source.migrations, ...main]) {
+      if (!/^\d+$/.test(m.key)) {
+        fail(
+          `source ${q(source.name)}: ${q(m.id)} has key ${q(m.key)}, but a drizzle key is a when`,
+        );
+      }
+    }
     return (a, b) => {
       const x = BigInt(a);
       const y = BigInt(b);
@@ -41,14 +51,19 @@ function keyOrder(source: TrackedSource): (a: string, b: string) => number {
  * - An id not on main must be named `YYYYMMDDHHMMSS_…` with a real UTC time at
  *   most a day after `now()`, sort after main's newest key, and carry a marker
  *   unless baselined. An id not on main whose key and hash are on main is a
- *   rename and is checked for its name only.
+ *   rename: only its name and stamp are checked.
  * - An id on both sides must keep its key and its hash. A new id that keeps a
  *   main key with another hash is an edit of that file.
- * - Every `accepted` entry of a source checked here must name one of its
- *   migrations, whose hash must equal the entry's `current`.
+ * - Every `accepted` entry must name a migration of a source passed here
+ *   (pass every source the slice's list names), whose hash must equal the
+ *   entry's `current`.
  *
- * rootstock's own source (tracker kind "rootstock") is skipped: its files
- * live in the package, not on main. Sources are read from main in parallel. A `readMain` failure rejects the check; it never reads as no findings.
+ * rootstock's own source (named "rootstock", tracker kind "rootstock") is not
+ * read from main: its files live in the package. Sources are read from main
+ * in parallel. A `readMain` failure rejects the check; it never reads as no
+ * findings. Refuses (ERR_ROOTSTOCK_MIG_SRC) a repeated source name, a source
+ * whose name and tracker disagree about being rootstock's, a migration whose
+ * `source` is not its source's name, and a `readMain` result that is not an array.
  */
 export async function checkMigrationOrder(
   slice: MigrateSlice,
@@ -58,27 +73,58 @@ export async function checkMigrationOrder(
 ): Promise<readonly OrderFinding[]> {
   assertMigrateSlice("checkMigrationOrder", slice);
   const nowMs = now().getTime();
-  if (Number.isNaN(nowMs)) {
-    throw new TypeError("checkMigrationOrder: now() returned an invalid Date");
-  }
+  if (Number.isNaN(nowMs)) fail("checkMigrationOrder: now() returned an invalid Date");
+  checkSources(sources);
   const apps = sources.filter((s) => s.tracker.kind !== "rootstock");
   const mains = await Promise.all(apps.map((s) => readMain(s.name)));
-  const findings = apps.flatMap((source, i) => [
-    ...compare(source, mains[i] as readonly SourceMigration[], Math.floor(nowMs / 1000)),
-    ...checkAccepted(source, slice.accepted),
-  ]);
+  const findings = apps.flatMap((source, i) => {
+    const main = mains[i];
+    if (!Array.isArray(main)) {
+      fail(`checkMigrationOrder: readMain(${q(source.name)}) did not resolve to an array`);
+    }
+    return compare(source, main, Math.floor(nowMs / 1000));
+  });
+  findings.push(...checkAccepted(sources, slice.accepted));
   return Object.freeze(findings.map((f) => Object.freeze(f)));
 }
 
-function checkAccepted(source: TrackedSource, accepted: MigrateSlice["accepted"]): OrderFinding[] {
-  const byId = new Map(source.migrations.map((m) => [m.id, m]));
+function checkSources(sources: readonly TrackedSource[]): void {
+  if (!Array.isArray(sources as unknown))
+    fail(`checkMigrationOrder: sources must be an array — got ${q(sources)}`);
+  const names = new Set<string>();
+  for (const source of sources) {
+    if (names.has(source.name))
+      fail(`checkMigrationOrder: source ${q(source.name)} is listed twice`);
+    names.add(source.name);
+    if ((source.name === "rootstock") !== (source.tracker.kind === "rootstock")) {
+      fail(
+        `checkMigrationOrder: source ${q(source.name)} has tracker kind ${q(source.tracker.kind)} — only rootstock's own source is named "rootstock" and tracked as rootstock`,
+      );
+    }
+    const stray = source.migrations.find((m) => m.source !== source.name);
+    if (stray !== undefined) {
+      fail(
+        `checkMigrationOrder: source ${q(source.name)} holds ${q(stray.id)} from source ${q(stray.source)}`,
+      );
+    }
+  }
+}
+
+/** Every entry, rootstock's own source included; an entry for a source not passed names no migration. */
+function checkAccepted(
+  sources: readonly TrackedSource[],
+  accepted: MigrateSlice["accepted"],
+): OrderFinding[] {
+  const byId = new Map(
+    sources.flatMap((s) => s.migrations.map((m) => [JSON.stringify([s.name, m.id]), m] as const)),
+  );
   return accepted.flatMap((entry): OrderFinding[] => {
-    if (entry.source !== source.name) return [];
-    const file = byId.get(entry.id);
-    if (file === undefined)
-      return [{ source: source.name, id: entry.id, problem: "accepted-unknown-id" }];
+    const file = byId.get(JSON.stringify([entry.source, entry.id]));
+    if (file === undefined) {
+      return [{ source: entry.source, id: entry.id, problem: "accepted-unknown-id" }];
+    }
     if (file.sha256 !== entry.current) {
-      return [{ source: source.name, id: entry.id, problem: "accepted-current-mismatch" }];
+      return [{ source: entry.source, id: entry.id, problem: "accepted-current-mismatch" }];
     }
     return [];
   });
@@ -89,7 +135,7 @@ function compare(
   main: readonly SourceMigration[],
   nowS: number,
 ): OrderFinding[] {
-  const compareKeys = keyOrder(source);
+  const compareKeys = keyOrder(source, main);
   const out: OrderFinding[] = [];
   const add = (id: string, problem: OrderFinding["problem"]) =>
     out.push({ source: source.name, id, problem });
@@ -144,7 +190,10 @@ const text = new TextDecoder();
  *   rule: the check uses only main's ids, keys and hashes, and a rename PR's
  *   baseline names a file main does not have yet.
  *
- * Every failure rejects, naming the source and `<ref>:<path>/`.
+ * Every failure rejects: a fetch failure names the ref, a read failure the
+ * source and `<ref>:<path>/`. `run` must reject when git exits non-zero.
+ * Bad arguments throw ERR_ROOTSTOCK_MIG_SRC. A folder path is relative to the
+ * repository root and may not be empty, `.`, absolute or contain `..`.
  */
 export function gitMainReader(deps: {
   run: (args: readonly string[]) => Promise<Uint8Array>;
@@ -154,22 +203,21 @@ export function gitMainReader(deps: {
 }): (source: string) => Promise<readonly SourceMigration[]> {
   const { run, fetch, folders } = deps;
   const ref = deps.ref ?? "origin/main";
-  if (typeof run !== "function") throw new TypeError("gitMainReader: run must be a function");
+  if (typeof run !== "function") fail("gitMainReader: run must be a function");
   if (fetch !== "always" && fetch !== "never") {
-    throw new TypeError(`gitMainReader: fetch must be "always" or "never" — got ${q(fetch)}`);
+    fail(`gitMainReader: fetch must be "always" or "never" — got ${q(fetch)}`);
   }
   if (
     typeof ref !== "string" ||
     !/^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref) ||
     ref.includes("..")
   ) {
-    throw new TypeError(`gitMainReader: ref must be a plain ref name — got ${q(ref)}`);
+    fail(`gitMainReader: ref must be a plain ref name — got ${q(ref)}`);
   }
-  const remote = /^([A-Za-z0-9._-]+)\/(.+)$/.exec(ref);
+  if (!isRecord(folders)) fail(`gitMainReader: folders must be an object — got ${q(folders)}`);
+  const remote = ref.startsWith("refs/") ? null : /^([A-Za-z0-9._-]+)\/(.+)$/.exec(ref);
   if (fetch === "always" && remote === null) {
-    throw new TypeError(
-      `gitMainReader: fetch "always" needs a <remote>/<branch> ref — got ${q(ref)}`,
-    );
+    fail(`gitMainReader: fetch "always" needs a <remote>/<branch> ref — got ${q(ref)}`);
   }
   let fetched: Promise<void> | undefined;
   const fetchOnce = async (name: string, branch: string): Promise<void> => {
@@ -194,7 +242,21 @@ export function gitMainReader(deps: {
       fetched ??= fetchOnce(remote[1] as string, remote[2] as string);
       await fetched;
     }
-    const where = `${ref}:${folder.path.replace(/^\.\//, "").replace(/\/+$/, "")}/`;
+    const path =
+      typeof folder.path === "string"
+        ? folder.path.replace(/^(\.\/)+/, "").replace(/\/+$/, "")
+        : "";
+    if (path === "" || path === "." || path.startsWith("/") || path.split("/").includes("..")) {
+      fail(
+        `gitMainReader: source ${q(source)}: folder path must be relative to the repository root — got ${q(folder.path)}`,
+      );
+    }
+    if (folder.layout !== "drizzle" && folder.layout !== "sql") {
+      fail(
+        `gitMainReader: source ${q(source)}: layout must be "drizzle" or "sql" — got ${q(folder.layout)}`,
+      );
+    }
+    const where = `${ref}:${path}/`;
     const git = async (args: readonly string[], what: string): Promise<Uint8Array> => {
       try {
         return await run(args);
@@ -212,7 +274,7 @@ export function gitMainReader(deps: {
     const files = new Map(wanted.map((n, i) => [n, bodies[i] as Uint8Array]));
     const readFile = (name: string): Uint8Array => {
       const bytes = files.get(name);
-      if (bytes === undefined) throw new Error(`no file ${name}`);
+      if (bytes === undefined) fail(`source ${q(source)}: ${where}${name} is not on the ref`);
       return bytes;
     };
     const opts = { name: source };

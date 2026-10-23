@@ -56,7 +56,15 @@ describe("checkMigrationOrder", () => {
   });
 
   const cases: [string, Record<string, string>, OrderFinding["problem"], string][] = [
-    ["a numbered name", { "99999999999999x_c.sql": C }, "name", "99999999999999x_c.sql"],
+    ["a bad month", { "20269901000000_c.sql": C }, "name", "20269901000000_c.sql"],
+    ["an upper-case suffix", { "20261003000000_C.sql": C }, "name", "20261003000000_C.sql"],
+    ["an empty suffix", { "20261003000000_.sql": C }, "name", "20261003000000_.sql"],
+    [
+      "a second past the day",
+      { "20261024000001_c.sql": C },
+      "future-stamp",
+      "20261024000001_c.sql",
+    ],
     ["an impossible time", { "20261399000000_c.sql": C }, "name", "20261399000000_c.sql"],
     ["a stamp two days out", { "20261025000000_c.sql": C }, "future-stamp", "20261025000000_c.sql"],
     [
@@ -75,8 +83,61 @@ describe("checkMigrationOrder", () => {
     });
   }
 
-  test("a stamp within a day of now is fine", async () => {
-    expect(await check(sql({ ...MAIN, "20261023230000_c.sql": C }), sql(MAIN))).toEqual([]);
+  test("a stamp up to exactly a day after now is fine", async () => {
+    expect(await check(sql({ ...MAIN, "20261024000000_c.sql": C }), sql(MAIN))).toEqual([]);
+  });
+
+  test("a rename to a bad name is still a bad name", async () => {
+    const before = { "0000_a.sql": A };
+    const renamed = sql({
+      "0001_a.sql": A,
+      "renames.json": JSON.stringify({ "0000_a.sql": "0001_a.sql" }),
+    });
+    expect(await check(renamed, sql(before))).toEqual([
+      { source: "app", id: "0001_a.sql", problem: "name" },
+    ]);
+  });
+
+  test("refuses sources it cannot trust, with the source code", async () => {
+    const run = (sources: readonly TrackedSource[]) =>
+      checkMigrationOrder(SLICE, sources, async () => sql(MAIN), NOW).catch((e) => e);
+    const app = tracked(sql(MAIN));
+    const disguised = { ...app, tracker: { kind: "rootstock" } } as TrackedSource;
+    const misnamed = { ...app, name: "rootstock" };
+    const foreign = { ...app, name: "other" };
+    for (const [sources, message] of [
+      [[app, app], /"app" is listed twice/],
+      [[disguised], /"app" has tracker kind "rootstock"/],
+      [[misnamed], /"rootstock" has tracker kind "filename"/],
+      [[foreign], /source "other" holds "20261001000000_a\.sql" from source "app"/],
+    ] as const) {
+      const err = await run(sources);
+      expect(err.message).toMatch(message);
+      expect(err.code).toBe("ERR_ROOTSTOCK_MIG_SRC");
+    }
+  });
+
+  test("a drizzle key that is not a when is refused, not thrown raw", async () => {
+    const drz = {
+      ...tracked(sql(MAIN)),
+      tracker: { kind: "drizzle", schema: "d", table: "t" },
+    } as TrackedSource;
+    await expect(checkMigrationOrder(SLICE, [drz], async () => [], NOW)).rejects.toThrow(
+      /has key "20261001000000_a\.sql", but a drizzle key is a when/,
+    );
+  });
+
+  test("an invalid now() and a non-array readMain are refused with a code", async () => {
+    const bad = await checkMigrationOrder(
+      SLICE,
+      [],
+      async () => [],
+      () => new Date("x"),
+    ).catch((e) => e);
+    expect(bad.code).toBe("ERR_ROOTSTOCK_MIG_SRC");
+    await expect(
+      checkMigrationOrder(SLICE, [tracked(sql(MAIN))], async () => undefined as never, NOW),
+    ).rejects.toThrow(/did not resolve to an array/);
   });
 
   test("an unmarked file at or before the baseline is fine", async () => {
@@ -153,6 +214,7 @@ describe("checkMigrationOrder", () => {
     expect(await check(branch, sql(MAIN), slice)).toEqual([
       { source: "app", id: "20261002000000_b.sql", problem: "accepted-current-mismatch" },
       { source: "app", id: "nope.sql", problem: "accepted-unknown-id" },
+      { source: "elsewhere", id: "x.sql", problem: "accepted-unknown-id" },
     ]);
   });
 
@@ -280,6 +342,83 @@ describe("gitMainReader", () => {
       folders: { app: { path: "drz", layout: "drizzle" } },
     });
     expect(await read("app")).toEqual(drizzle(entries));
+  });
+
+  test("the fetch runs before anything is read", async () => {
+    const { run, calls } = fakeGit(SQL_TREE);
+    await gitMainReader({
+      run,
+      fetch: "always",
+      folders: { app: { path: "db/mig", layout: "sql" } },
+    })("app");
+    expect(calls.slice(0, 3).map((c) => c[0])).toEqual(["rev-parse", "fetch", "ls-tree"]);
+  });
+
+  test("a throwing run makes checkMigrationOrder reject", async () => {
+    const { run } = fakeGit(SQL_TREE, { fail: "ls-tree" });
+    const read = gitMainReader({
+      run,
+      fetch: "never",
+      folders: { app: { path: "db/mig", layout: "sql" } },
+    });
+    const err = await checkMigrationOrder(SLICE, [tracked(sql(MAIN))], read, NOW).catch((e) => e);
+    expect(err.code).toBe("ERR_ROOTSTOCK_MIG_IO");
+    expect(err.message).toBe(
+      'rootstock migrate: source "app": cannot list origin/main:db/mig/ — git ls-tree failed',
+    );
+  });
+
+  test("a file the journal names but the ref lacks is a fact, not I/O", async () => {
+    const { run } = fakeGit({
+      "drz/meta/_journal.json": journal([["20261001000000_a", 1000]]),
+      "drz/x.sql": A,
+    });
+    const read = gitMainReader({
+      run,
+      fetch: "never",
+      folders: { app: { path: "drz", layout: "drizzle" } },
+    });
+    const err = await read("app").catch((e) => e);
+    expect(err.code).toBe("ERR_ROOTSTOCK_MIG_SRC");
+    expect(err.message).toMatch(/origin\/main:drz\/20261001000000_a\.sql is not on the ref/);
+  });
+
+  test("a subtree named .sql is skipped; a ./ path is read from the root", async () => {
+    const { run } = fakeGit({ ...SQL_TREE, "db/mig/x.sql/inner.sql": C });
+    const read = gitMainReader({
+      run,
+      fetch: "never",
+      folders: { app: { path: "./db/mig/", layout: "sql" } },
+    });
+    expect(await read("app")).toEqual(sql(MAIN));
+  });
+
+  test("a bad folder path, layout or ref is refused with the source code", async () => {
+    const { run } = fakeGit(SQL_TREE);
+    for (const path of ["", ".", "/abs", "a/../b"]) {
+      const err = await gitMainReader({
+        run,
+        fetch: "never",
+        folders: { app: { path, layout: "sql" } },
+      })("app").catch((e) => e);
+      expect(err.message).toMatch(/folder path must be relative/);
+    }
+    await expect(
+      gitMainReader({
+        run,
+        fetch: "never",
+        folders: { app: { path: "m", layout: "flat" as never } },
+      })("app"),
+    ).rejects.toThrow(/layout must be/);
+    await expect(gitMainReader({ run, fetch: "never", folders: {} })("toString")).rejects.toThrow(
+      /no folder for source "toString"/,
+    );
+    for (const ref of ["a..b", "refs/remotes/origin/main"]) {
+      expect(() => gitMainReader({ run, fetch: "always", ref, folders: {} })).toThrow(/ref/);
+    }
+    expect(() => gitMainReader({ run, fetch: "never", folders: null as never })).toThrow(
+      /folders must be an object/,
+    );
   });
 
   test("a full-history checkout fetches without --depth, once per reader", async () => {

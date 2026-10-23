@@ -23,7 +23,8 @@ function refuse(host: string, db: string, why: string): never {
 }
 
 function badOption(message: string): never {
-  fail(`assertThrowawayDb: ${message}`, CODE);
+  // A bad argument is a config error, not a verdict on the database.
+  fail(`assertThrowawayDb: ${message}`);
 }
 
 function decode(part: string): string | undefined {
@@ -34,19 +35,23 @@ function decode(part: string): string | undefined {
   }
 }
 
-/** A libpq host is a Unix socket when it is empty or an absolute path. */
-const isSocket = (host: string): boolean => host === "" || host.startsWith("/");
+/** A Unix socket is named by an absolute path. An empty host is not one: a driver fills it from PGHOST. */
+const isSocket = (host: string): boolean => host.startsWith("/");
 
 /**
  * Refuses (E-MIG-NOT-THROWAWAY) unless `url` names a throwaway database: every
- * host it would connect to is in `allowHosts` or a Unix socket, and its
- * database name is not in `denyNames`. Reads the URL the way libpq does: a
- * `host`, `hostaddr` or `dbname` query parameter overrides the URL's own, an
- * empty database name defaults to the user's, and a comma-separated `host`
- * parameter is checked host by host. A URL that does not parse is refused,
- * which includes a host list in the authority (`h1:5432,h2:5432`): pass it as
- * `?host=h1,h2` instead. Pure: no I/O,
- * and no message ever carries the URL's password.
+ * host it could reach is in `allowHosts` or a Unix socket path, and every
+ * database name it could open is outside `denyNames`.
+ *
+ * The URL is read for every driver at once, so nothing it could mean slips
+ * past: the authority's host AND each `host` / `hostaddr` query value (libpq
+ * reads the parameters, postgres.js and Bun.SQL the authority), each item of a
+ * comma-separated list, and the path's database AND each `dbname` value.
+ * Refused outright, because a driver would fill the gap from the environment:
+ * a URL that names no host (PGHOST) or no database (PGDATABASE, or the user),
+ * and a `service` parameter (a service file). A URL that does not parse is
+ * refused too. Pure: no I/O, and no message carries the URL's password.
+ * `unsafeAllow` skips every check, an unparseable URL included, and logs it.
  */
 export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {
   if (!isRecord(opts)) badOption(`options must be an object — got ${q(opts)}`);
@@ -71,29 +76,47 @@ export function assertThrowawayDb(url: string, opts: ThrowawayOptions): void {
   }
 
   const target = parse(url);
+  const shownHosts = target === undefined ? "?" : target.hosts.join(",");
+  const shownDbs = target === undefined ? "?" : target.dbs.join(",");
   if (unsafeAllow !== undefined) {
     unsafeAllow.log(
-      `rootstock migrate: assertThrowawayDb skipped for ${q(target?.hosts.join(",") ?? "?")}/${q(target?.db ?? "?")} — ${unsafeAllow.reason}`,
+      `rootstock migrate: assertThrowawayDb skipped for ${q(shownHosts)}/${q(shownDbs)} — ${unsafeAllow.reason}`,
     );
     return;
   }
-  if (target === undefined)
+  if (target === undefined) {
     refuse("?", "?", "the URL is not a postgres:// or postgresql:// URL that parses");
-  const { hosts, db } = target;
-  const shown = hosts.join(",");
+  }
+  const { hosts, dbs, service } = target;
+  if (service) refuse(shownHosts, shownDbs, "a service parameter names its host in a file");
+  if (hosts.length === 0)
+    refuse(shownHosts, shownDbs, "the URL names no host, so a driver would use PGHOST");
+  if (dbs.length === 0) {
+    refuse(
+      shownHosts,
+      shownDbs,
+      "the URL names no database, so a driver would use PGDATABASE or the user",
+    );
+  }
   const allowed = new Set(allowHosts.map((h) => h.toLowerCase()));
   const stray = hosts.find((h) => !isSocket(h) && !allowed.has(h.toLowerCase()));
   if (stray !== undefined) {
-    refuse(shown, db, `host ${q(stray)} is not in allowHosts (${[...allowed].join(", ")})`);
+    refuse(
+      shownHosts,
+      shownDbs,
+      `host ${q(stray)} is not in allowHosts (${[...allowed].join(", ")})`,
+    );
   }
   const deny = new Set(denyNames.map((n) => n.toLowerCase()));
-  if (deny.has(db.toLowerCase())) refuse(shown, db, `the database name ${q(db)} is in denyNames`);
+  const denied = dbs.find((db) => deny.has(db.toLowerCase()));
+  if (denied !== undefined)
+    refuse(shownHosts, shownDbs, `the database name ${q(denied)} is in denyNames`);
 }
 
-function parse(url: string): { hosts: string[]; db: string } | undefined {
+function parse(url: string): { hosts: string[]; dbs: string[]; service: boolean } | undefined {
   if (typeof url !== "string") return undefined;
-  // libpq accepts credentials before an empty host (`postgres://u@/db`, a
-  // socket); WHATWG URL does not, so parse that shape with a reserved stand-in.
+  // libpq accepts credentials before an empty host (`postgres://u@/db?host=/sock`);
+  // WHATWG URL does not, so parse that shape with a reserved stand-in.
   const socketShape = /^(postgres(?:ql)?:\/\/[^/?#]*@)(?=[/?#]|$)/;
   let parsed: URL;
   try {
@@ -103,19 +126,14 @@ function parse(url: string): { hosts: string[]; db: string } | undefined {
   }
   if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") return undefined;
   const params = parsed.searchParams;
-  // libpq: hostaddr is where it connects, host names it; check both when given.
-  const fromParams = [params.get("host"), params.get("hostaddr")].filter(
-    (v): v is string => v !== null,
-  );
-  const urlHost = parsed.hostname === SOCKET_STANDIN ? "" : decode(parsed.hostname);
-  const rawHosts = fromParams.length > 0 ? fromParams : [urlHost];
-  if (rawHosts.some((h) => h === undefined)) return undefined;
-  const hosts = (rawHosts as string[])
-    .flatMap((h) => h.split(","))
-    .map((h) => h.trim().replace(/^\[(.*)\]$/, "$1"));
+  const authority = parsed.hostname === SOCKET_STANDIN ? "" : decode(parsed.hostname);
   const path = decode(parsed.pathname.replace(/^\//, ""));
-  const user = decode(parsed.username) ?? "";
-  if (path === undefined) return undefined;
-  const db = params.get("dbname") ?? (path === "" ? (params.get("user") ?? user) : path);
-  return { hosts, db };
+  if (authority === undefined || path === undefined) return undefined;
+  // Every value of a repeated key counts: libpq keeps the last, the URL API the first.
+  const hosts = [authority, ...params.getAll("host"), ...params.getAll("hostaddr")]
+    .flatMap((h) => h.split(","))
+    .map((h) => h.trim().replace(/^\[(.*)\]$/, "$1"))
+    .filter((h) => h !== "");
+  const dbs = [path, ...params.getAll("dbname")].filter((d) => d !== "");
+  return { hosts, dbs, service: params.has("service") };
 }

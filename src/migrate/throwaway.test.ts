@@ -18,9 +18,8 @@ describe("assertThrowawayDb", () => {
     "postgresql://u@127.0.0.1/app_test",
     "postgres://u@[::1]:5432/app_test",
     "postgres://u@LOCALHOST/app_test",
-    "postgres:///app_test",
     "postgres://u@/app_test?host=/var/run/postgresql",
-    "postgres://u:p@/app_test",
+    "postgres://u:p@/app_test?host=%2Ftmp",
     "postgres://u@%2Fvar%2Frun%2Fpostgresql/app_test",
     "postgres://u@localhost/app_test?host=localhost,127.0.0.1",
   ])("allows %s", (url) => {
@@ -60,10 +59,61 @@ describe("assertThrowawayDb", () => {
     ).toThrow(/host "remotehost"/);
   });
 
-  test("an empty database name is the user's, as libpq defaults it", () => {
-    expect(() => assertThrowawayDb("postgres://app_prod@localhost", DENY)).toThrow(
-      /"app_prod" is in denyNames/,
+  test.each([
+    ["no host (PGHOST)", "postgres:///app_test", /names no host, so a driver would use PGHOST/],
+    ["an empty host parameter", "postgres:///app_test?host=", /names no host/],
+    ["no database (PGDATABASE)", "postgres://app_prod@localhost", /names no database/],
+    ["a service parameter", "postgres://u@localhost/app_test?service=prod", /a service parameter/],
+  ])("refuses %s, which a driver would fill from outside the URL", (_what, url, message) => {
+    expect(() => assertThrowawayDb(url, DENY)).toThrow(message);
+  });
+
+  test.each([
+    // postgres.js and Bun.SQL connect to the authority and ignore the parameters.
+    ["?host=localhost", "postgres://u@remotehost/app_test?host=localhost"],
+    ["?hostaddr=127.0.0.1", "postgres://u@remotehost/app_test?hostaddr=127.0.0.1"],
+    ["an empty ?host=", "postgres://u@remotehost/app_test?host="],
+    ["a socket ?host=", "postgres://u@remotehost/app_test?host=%2Ftmp"],
+    // libpq connects to hostaddr when both are given.
+    ["host and hostaddr", "postgres://u@localhost/app_test?host=localhost&hostaddr=10.0.0.5"],
+    // libpq keeps the last of a repeated key.
+    ["a repeated host", "postgres://u@localhost/app_test?host=localhost&host=remotehost"],
+    ["an authority host list", "postgres://u@localhost,remotehost/app_test"],
+  ])("a parameter never hides the authority, nor a list a host: %s", (_what, url) => {
+    expect(() => assertThrowawayDb(url, DENY)).toThrow(/is not in allowHosts/);
+  });
+
+  test("every database name counts: the path's and each dbname", () => {
+    expect(() =>
+      assertThrowawayDb("postgres://u@localhost/app_prod?dbname=app_test", DENY),
+    ).toThrow(/"app_prod" is in denyNames/);
+    expect(() =>
+      assertThrowawayDb("postgres://u@localhost/app_test?dbname=x&dbname=app_prod", DENY),
+    ).toThrow(/"app_prod" is in denyNames/);
+  });
+
+  test("the option lists compare case-insensitively too", () => {
+    expect(() =>
+      assertThrowawayDb("postgres://u@pg/app_test", { ...DENY, allowHosts: ["PG"] }),
+    ).not.toThrow();
+    expect(() =>
+      assertThrowawayDb("postgres://u@localhost/app_prod", { denyNames: ["APP_PROD"] }),
+    ).toThrow(/is in denyNames/);
+  });
+
+  test("a bad option is a config refusal, not a verdict on the database", () => {
+    expect(refusal(() => assertThrowawayDb("postgres:///x", {} as never)).code).toBe(
+      "ERR_ROOTSTOCK_MIG_SRC",
     );
+  });
+
+  test("unsafeAllow skips even an unparseable URL, and says so", () => {
+    const lines: string[] = [];
+    assertThrowawayDb("not a url", {
+      denyNames: [],
+      unsafeAllow: { reason: "r", log: (m) => lines.push(m) },
+    });
+    expect(lines).toEqual(['rootstock migrate: assertThrowawayDb skipped for "?"/"?" — r']);
   });
 
   test("allowHosts replaces the default", () => {
