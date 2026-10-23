@@ -4,6 +4,7 @@ import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-sup
 import { sha256Hex } from "../hash/index.ts";
 import { applyMigrations } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
+import { mig, schemaFactory } from "./fixtures.pg-support.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { migrationStatus, renderMigrationStatus } from "./status.ts";
@@ -14,13 +15,7 @@ import { drizzleTracker, filenameTracker, type TrackedSource } from "./tracked.t
 
 let main: TestTransactor;
 let sql: Sql;
-const made: string[] = [];
-
-function schema(): string {
-  const s = `rs_s_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-  made.push(s);
-  return s;
-}
+const { schema, dropAll } = schemaFactory("rs_s");
 
 interface World {
   slice: MigrateSlice;
@@ -30,18 +25,6 @@ interface World {
 
 function world(accepted: MigrateSlice["accepted"] = []): World {
   return { slice: migrateSlice({ schema: schema(), accepted }), d: schema(), f: schema() };
-}
-
-function mig(source: string, id: string, key: string, text: string): SourceMigration {
-  return Object.freeze({
-    source,
-    id,
-    key,
-    sha256: sha256Hex(text),
-    kind: "additive",
-    baselined: false,
-    statements: Object.freeze([text]),
-  });
 }
 
 const textA = (w: World): string => `CREATE TABLE "${w.d}".a (x int)`;
@@ -77,9 +60,7 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-  if (made.length > 0) {
-    await sql.unsafe(`DROP SCHEMA IF EXISTS ${made.map((s) => `"${s}"`).join(", ")} CASCADE`);
-  }
+  await dropAll(sql);
   await main.close();
 });
 

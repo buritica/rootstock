@@ -9,7 +9,7 @@ import {
 } from "./applier.ts";
 import { reason, refusalCode } from "./errors.ts";
 import type { MigrateSlice } from "./slice.ts";
-import { migrationStatus, renderMigrationStatus } from "./status.ts";
+import { ids, migrationStatus, renderMigrationStatus } from "./status.ts";
 import type { TrackedSource } from "./tracked.ts";
 
 export interface MigrateCliDeps {
@@ -32,22 +32,29 @@ type Command =
   | { readonly kind: "plan"; readonly entry: Entry }
   | { readonly kind: "apply"; readonly entry: Entry; readonly allowHeavy: boolean };
 
-function parse(argv: readonly string[]): Command | undefined {
-  const [verb, ...flags] = argv;
-  const only = (...allowed: string[]): boolean =>
-    flags.every((f) => allowed.includes(f)) && new Set(flags).size === flags.length;
-  if (verb === "status" && flags.length === 0) return { kind: "status" };
-  if (verb === "plan" && only("--deploy"))
-    return { kind: "plan", entry: flags.includes("--deploy") ? "deploy" : "manual" };
-  if (verb === "apply" && flags.length === 1 && flags[0] === "--deploy")
-    return { kind: "apply", entry: "deploy", allowHeavy: false };
-  if (verb === "apply" && flags[0] === "--manual" && only("--manual", "--allow-heavy"))
-    return { kind: "apply", entry: "manual", allowHeavy: flags.includes("--allow-heavy") };
-  return undefined;
-}
+const FLAGS: Readonly<Record<string, readonly string[]>> = {
+  status: [],
+  plan: ["--deploy"],
+  apply: ["--deploy", "--manual", "--allow-heavy"],
+};
 
-const ids = (list: readonly { source: string; id: string }[]): string =>
-  list.map((a) => `${a.source}/${a.id}`).join(", ");
+function parse(argv: readonly string[]): Command | undefined {
+  const [verb = "", ...flags] = argv;
+  const allowed = Object.hasOwn(FLAGS, verb) ? FLAGS[verb] : undefined;
+  if (allowed === undefined || new Set(flags).size !== flags.length) return undefined;
+  if (!flags.every((f) => allowed.includes(f))) return undefined;
+  const has = (f: string): boolean => flags.includes(f);
+  if (verb === "status") return { kind: "status" };
+  if (verb === "plan") return { kind: "plan", entry: has("--deploy") ? "deploy" : "manual" };
+  // apply: exactly one entry; --allow-heavy is manual's only.
+  if (has("--deploy") === has("--manual") || (has("--allow-heavy") && !has("--manual")))
+    return undefined;
+  return {
+    kind: "apply",
+    entry: has("--deploy") ? "deploy" : "manual",
+    allowHeavy: has("--allow-heavy"),
+  };
+}
 
 function planLines(plan: MigrationPlan): string[] {
   const lines = [

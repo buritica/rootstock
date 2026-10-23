@@ -30,6 +30,7 @@ describe("migrateCli usage", () => {
     [["apply", "--deploy", "--allow-heavy"]],
     [["apply", "--allow-heavy"]],
     [["apply", "--manual", "--manual"]],
+    [["apply", "--allow-heavy", "--deploy"]],
     [["plan", "--manual"]],
     [["plan", "--deploy", "--deploy"]],
     [["status", "--deploy"]],

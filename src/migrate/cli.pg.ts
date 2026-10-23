@@ -5,9 +5,9 @@ import {
   openTestTransactor,
   type TestTransactor,
 } from "../db/transactor.pg-support.ts";
-import { sha256Hex } from "../hash/index.ts";
 import { rootstockSource } from "./apply.ts";
 import { migrateCli } from "./cli.ts";
+import { mig, schemaFactory } from "./fixtures.pg-support.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { drizzleTracker, type TrackedSource } from "./tracked.ts";
@@ -18,13 +18,7 @@ import { drizzleTracker, type TrackedSource } from "./tracked.ts";
 
 let main: TestTransactor;
 let sql: Sql;
-const made: string[] = [];
-
-function schema(): string {
-  const s = `rs_c_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-  made.push(s);
-  return s;
-}
+const { schema, dropAll } = schemaFactory("rs_c");
 
 interface World {
   slice: MigrateSlice;
@@ -35,25 +29,15 @@ function world(): World {
   return { slice: migrateSlice({ schema: schema() }), d: schema() };
 }
 
-function mig(id: string, key: string, text: string, kind: "additive" | "heavy" = "additive") {
-  return Object.freeze({
-    source: "app",
-    id,
-    key,
-    sha256: sha256Hex(text),
-    kind,
-    baselined: false,
-    statements: Object.freeze([text]),
-  }) as SourceMigration;
-}
-
 function sources(w: World, files?: SourceMigration[]): TrackedSource[] {
   return [
     rootstockSource(w.slice),
     {
       name: "app",
       tracker: drizzleTracker({ schema: w.d }),
-      migrations: files ?? [mig("0000_a", "1700000000000", `CREATE TABLE "${w.d}".a (x int)`)],
+      migrations: files ?? [
+        mig("app", "0000_a", "1700000000000", `CREATE TABLE "${w.d}".a (x int)`),
+      ],
     },
   ];
 }
@@ -82,9 +66,7 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-  if (made.length > 0) {
-    await sql.unsafe(`DROP SCHEMA IF EXISTS ${made.map((s) => `"${s}"`).join(", ")} CASCADE`);
-  }
+  await dropAll(sql);
   await main.close();
 });
 
@@ -117,7 +99,9 @@ describe("migrateCli", () => {
 
   test("a refusal: plan 1 and apply 1, each printing it; status 1", async () => {
     const w = world();
-    const heavy = [mig("0000_h", "1700000000000", `CREATE TABLE "${w.d}".h (x int)`, "heavy")];
+    const heavy = [
+      mig("app", "0000_h", "1700000000000", `CREATE TABLE "${w.d}".h (x int)`, "heavy"),
+    ];
     const plan = await run(["plan", "--deploy"], w, heavy);
     expect(plan.code).toBe(1);
     expect(plan.lines[0]).toContain("app/0000_h");
@@ -161,7 +145,7 @@ describe("migrateCli", () => {
 
   test("apply rethrows a failure that is not a refusal: the process crashes with its stack", async () => {
     const w = world();
-    const bad = [mig("0000_bad", "1700000000000", "SELECT 1/0")];
+    const bad = [mig("app", "0000_bad", "1700000000000", "SELECT 1/0")];
     await expect(run(["apply", "--deploy"], w, bad)).rejects.toThrow(
       "rootstock migrate: app/0000_bad failed and was rolled back",
     );

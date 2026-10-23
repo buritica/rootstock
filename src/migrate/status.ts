@@ -66,6 +66,10 @@ export function summarizeStatus(states: readonly SourceStatus[]): MigrationStatu
 
 const hex8 = (h: string): string => h.slice(0, 8);
 
+/** `source/id`, comma-separated: how every migrate line names files. */
+export const ids = (list: readonly { source: string; id: string }[]): string =>
+  list.map((a) => `${a.source}/${a.id}`).join(", ");
+
 function sourceLine(s: SourceStatus): string {
   const ok =
     s.pending.length +
@@ -119,9 +123,9 @@ export function renderMigrationStatus(status: MigrationStatus, opts: { fix: stri
     );
   }
   if (status.ahead) {
-    const ids = status.sources.flatMap((s) => s.ahead.map((id) => `${s.source}/${id}`));
+    const ahead = status.sources.flatMap((s) => s.ahead.map((id) => ({ source: s.source, id })));
     lines.push(
-      `ahead: fix forward with a deploy that carries ${ids.join(", ")}; do not run the migrate command`,
+      `ahead: fix forward with a deploy that carries ${ids(ahead)}; do not run the migrate command`,
     );
   }
   return `${lines.join("\n")}\n`;
