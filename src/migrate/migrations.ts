@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { sha256Hex } from "../hash/index.ts";
 import { MANIFEST } from "./manifest.ts";
+import { MARKER_WINDOW_LINES, type MigrationKind, markerPattern, matchMarker } from "./marker.ts";
 
-export type MigrationKind = "additive" | "heavy";
+export type { MigrationKind } from "./marker.ts";
 
 export interface RootstockMigration {
   readonly filename: string;
@@ -12,16 +13,14 @@ export interface RootstockMigration {
   readonly statements: readonly string[];
 }
 
-const MARKER = /^--\s*rootstock-migration:\s*(additive|heavy)\s*$/m;
-const MARKER_WINDOW_LINES = 40;
+const MARKER = markerPattern("rootstock");
 const BREAKPOINT = /^--> statement-breakpoint$/m;
 
 /** Hashes, classifies and splits one migration file's bytes. */
 export function parseMigration(filename: string, bytes: Uint8Array): RootstockMigration {
   const text = new TextDecoder().decode(bytes);
-  const head = text.split("\n").slice(0, MARKER_WINDOW_LINES).join("\n");
-  const kind = MARKER.exec(head)?.[1] as MigrationKind | undefined;
-  if (kind === undefined) {
+  const kind = matchMarker(text, MARKER);
+  if (kind === null) {
     throw new Error(
       `rootstockMigrations: ${filename} has no "-- rootstock-migration: additive|heavy" line in its first ${MARKER_WINDOW_LINES} lines`,
     );

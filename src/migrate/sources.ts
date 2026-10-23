@@ -1,7 +1,7 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { sha256Hex } from "../hash/index.ts";
 import { q } from "./identifier.ts";
-import type { MigrationKind } from "./migrations.ts";
+import { type MigrationKind, markerPattern, matchMarker } from "./marker.ts";
 
 /** One migration file of a consumer's source, as the applier and the checks see it. */
 export interface SourceMigration {
@@ -35,54 +35,56 @@ export interface SourceOptions {
   readonly marker: MarkerRule;
 }
 
-const MARKER_WINDOW_LINES = 40;
-const PREFIX = /^[a-z][a-z0-9-]*$/;
-const BREAKPOINT = "--> statement-breakpoint";
+// drizzle-kit's separator, split as drizzle splits it: anywhere, untrimmed.
+// rootstock's own files use a whole-line split instead (migrations.ts).
+const DRIZZLE_BREAKPOINT = "--> statement-breakpoint";
 
 function fail(message: string): never {
   throw new Error(`rootstock migrate: ${message}`);
 }
 
-function markerPattern(prefix: string): RegExp {
-  if (!PREFIX.test(prefix)) fail(`marker prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`);
-  return new RegExp(`^--\\s*${prefix}-migration:\\s*(additive|heavy)\\s*$`, "m");
-}
-
-/**
- * The `-- <prefix>-migration: additive|heavy` marker in the first 40 lines, or
- * null. Only the header counts, so a marker quoted inside a statement does not.
- */
-export function parseMarker(text: string, prefix: string): MigrationKind | null {
-  const head = text.split("\n").slice(0, MARKER_WINDOW_LINES).join("\n");
-  return (markerPattern(prefix).exec(head)?.[1] as MigrationKind | undefined) ?? null;
+function reason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 // Decoded the way the origin migrators read their files (fs's utf8, which keeps
 // a byte-order mark), so the hash of the re-encoded text is the one they stored.
 const UTF8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
-function readText(folder: URL, file: string): string {
-  return UTF8.decode(readFileSync(new URL(file, folder)));
+function readText(url: URL): string {
+  return UTF8.decode(readFileSync(url));
 }
 
-function folderUrl(folder: string | URL): URL {
-  let url: URL;
-  if (folder instanceof URL) url = new URL(folder.href);
-  else {
-    if (!folder.startsWith("/"))
-      fail(`a source folder must be an absolute path or a file: URL — got ${q(folder)}`);
-    url = new URL("file:///");
-    url.pathname = folder; // percent-encodes what a path may hold and a URL may not
-  }
-  if (url.protocol !== "file:") fail(`a source folder must be a file: URL — got ${q(url.href)}`);
-  if (!url.pathname.endsWith("/")) url.pathname += "/";
-  return url;
+interface Opened {
+  dir: URL;
+  source: string;
+  pattern: RegExp;
+  baseline: string | undefined;
 }
 
-function checkName(name: unknown): string {
+/** Checks a reader's arguments once, before any file is read. */
+function open(folder: string | URL, opts: SourceOptions): Opened {
+  const { name } = opts;
   if (typeof name !== "string" || name.trim() === "")
     fail(`a source name must be a non-empty string — got ${q(name)}`);
-  return name;
+  let dir: URL;
+  if (folder instanceof URL) {
+    if (folder.protocol !== "file:")
+      fail(`a source folder must be a file: URL — got ${q(folder.href)}`);
+    dir = new URL(folder.href);
+  } else {
+    if (!folder.startsWith("/"))
+      fail(`a source folder must be an absolute path or a file: URL — got ${q(folder)}`);
+    dir = new URL("file:///");
+    dir.pathname = folder; // percent-encodes what a path may hold and a URL may not
+  }
+  if (!dir.pathname.endsWith("/")) dir.pathname += "/";
+  return {
+    dir,
+    source: name,
+    pattern: markerPattern(opts.marker.prefix),
+    baseline: opts.marker.baseline,
+  };
 }
 
 interface Draft {
@@ -92,10 +94,10 @@ interface Draft {
   statements: readonly string[];
 }
 
-function build(opts: SourceOptions, drafts: readonly Draft[]): readonly SourceMigration[] {
-  const source = checkName(opts.name);
-  const { prefix, baseline } = opts.marker;
-  markerPattern(prefix);
+function build(
+  { source, pattern, baseline }: Opened,
+  drafts: readonly Draft[],
+): readonly SourceMigration[] {
   const at = baseline === undefined ? -1 : drafts.findIndex((d) => d.id === baseline);
   if (baseline !== undefined && at === -1) {
     fail(
@@ -109,7 +111,7 @@ function build(opts: SourceOptions, drafts: readonly Draft[]): readonly SourceMi
         id: d.id,
         key: d.key,
         sha256: sha256Hex(d.text),
-        kind: parseMarker(d.text, prefix),
+        kind: matchMarker(d.text, pattern),
         baselined: i <= at,
         statements: Object.freeze(d.statements),
       }),
@@ -132,46 +134,48 @@ export function drizzleJournal(
   folder: string | URL,
   opts: SourceOptions,
 ): readonly SourceMigration[] {
-  const dir = folderUrl(folder);
-  const name = checkName(opts.name);
+  const opened = open(folder, opts);
+  const { dir, source } = opened;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readText(dir, "meta/_journal.json"));
+    parsed = JSON.parse(readText(new URL("meta/_journal.json", dir)));
   } catch (err) {
-    fail(
-      `source ${q(name)}: cannot read ${dir.pathname}meta/_journal.json — ${err instanceof Error ? err.message : String(err)}`,
-    );
+    fail(`source ${q(source)}: cannot read ${dir.pathname}meta/_journal.json — ${reason(err)}`);
   }
   const entries = (parsed as { entries?: unknown } | null)?.entries;
   if (!Array.isArray(entries) || entries.length === 0) {
-    fail(`source ${q(name)}: the journal has no entries — wrong folder?`);
+    fail(`source ${q(source)}: the journal has no entries — wrong folder?`);
   }
   const tags = new Set<string>();
   const whens = new Set<number>();
   const drafts = entries.map((e: unknown): Draft => {
     const r = (e ?? {}) as { tag?: unknown; when?: unknown };
     if (typeof r.tag !== "string" || !/^[\w-]+$/.test(r.tag) || !isInt(r.when)) {
-      fail(`source ${q(name)}: journal entry is malformed — got ${q(e)}`);
+      fail(`source ${q(source)}: journal entry is malformed — got ${q(e)}`);
     }
     if (tags.has(r.tag) || whens.has(r.when)) {
       fail(
-        `source ${q(name)}: journal entry ${q(r.tag)} repeats a tag or a when — each must be unique`,
+        `source ${q(source)}: journal entry ${q(r.tag)} repeats a tag or a when — each must be unique`,
       );
     }
     tags.add(r.tag);
     whens.add(r.when);
-    const file = `${r.tag}.sql`;
-    if (!existsSync(new URL(file, dir)))
-      fail(`source ${q(name)}: journal entry ${q(r.tag)} has no file ${file}`);
-    const text = readText(dir, file);
+    let text: string;
+    try {
+      text = readText(new URL(`${r.tag}.sql`, dir));
+    } catch (err) {
+      fail(
+        `source ${q(source)}: journal entry ${q(r.tag)} has no readable file ${r.tag}.sql — ${reason(err)}`,
+      );
+    }
     return {
       id: r.tag,
       key: String(r.when),
       text,
-      statements: text.split(BREAKPOINT).filter((s) => s.trim() !== ""),
+      statements: text.split(DRIZZLE_BREAKPOINT).filter((s) => s.trim() !== ""),
     };
   });
-  return build(opts, drafts);
+  return build(opened, drafts);
 }
 
 /**
@@ -180,8 +184,8 @@ export function drizzleJournal(
  * subfolders included, are ignored. Refuses a folder with no `.sql` file.
  */
 export function sqlFolder(folder: string | URL, opts: SourceOptions): readonly SourceMigration[] {
-  const dir = folderUrl(folder);
-  const name = checkName(opts.name);
+  const opened = open(folder, opts);
+  const { dir, source } = opened;
   let files: string[];
   try {
     files = readdirSync(dir, { withFileTypes: true })
@@ -189,16 +193,14 @@ export function sqlFolder(folder: string | URL, opts: SourceOptions): readonly S
       .map((d) => d.name)
       .sort();
   } catch (err) {
-    fail(
-      `source ${q(name)}: cannot list ${dir.pathname} — ${err instanceof Error ? err.message : String(err)}`,
-    );
+    fail(`source ${q(source)}: cannot list ${dir.pathname} — ${reason(err)}`);
   }
   if (files.length === 0)
-    fail(`source ${q(name)}: ${dir.pathname} holds no .sql file — wrong folder?`);
+    fail(`source ${q(source)}: ${dir.pathname} holds no .sql file — wrong folder?`);
   return build(
-    opts,
+    opened,
     files.map((file) => {
-      const text = readText(dir, file);
+      const text = readText(new URL(file, dir));
       return { id: file, key: file, text, statements: [text] };
     }),
   );

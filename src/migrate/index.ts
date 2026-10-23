@@ -8,7 +8,6 @@ export { type MigrateSlice, type MigrateSliceInput, migrateSlice } from "./slice
 export {
   drizzleJournal,
   type MarkerRule,
-  parseMarker,
   type SourceMigration,
   type SourceOptions,
   sqlFolder,

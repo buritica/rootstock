@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readMigrationFiles } from "drizzle-orm/migrator";
-import { drizzleJournal, parseMarker, sqlFolder, unmarkedAfterBaseline } from "./sources.ts";
+import { markerPattern, matchMarker } from "./marker.ts";
+import { drizzleJournal, sqlFolder, unmarkedAfterBaseline } from "./sources.ts";
 
 const ROOT = mkdtempSync(join(tmpdir(), "rootstock-sources-"));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
@@ -36,6 +37,7 @@ function journal(entries: readonly { tag: string; when: number }[]): string {
 }
 
 const MARK = { prefix: "app" } as const;
+const OPTS = { name: "app", marker: MARK } as const;
 const A =
   "-- app-migration: additive\nCREATE TABLE a (id int);\n--> statement-breakpoint\nCREATE INDEX a_i ON a (id);\n";
 const H = "-- app-migration: heavy\nCREATE INDEX b_i ON b (id);\n";
@@ -76,18 +78,13 @@ describe("drizzleJournal", () => {
       "0002_invalid_utf8.sql": invalid,
       "0003_breakpoints.sql": A,
     });
-    const ours = drizzleJournal(dir, { name: "app", marker: MARK });
+    const ours = drizzleJournal(dir, OPTS);
     const theirs = readMigrationFiles({ migrationsFolder: dir });
     expect(ours.map((m) => m.sha256)).toEqual(theirs.map((m) => m.hash));
     expect(ours.map((m) => m.key)).toEqual(theirs.map((m) => String(m.folderMillis)));
     expect(ours.map((m) => m.statements)).toEqual(
       theirs.map((m) => m.sql.filter((s) => s.trim() !== "")),
     );
-  });
-
-  test("valid UTF-8 hashes as its bytes", () => {
-    const [first] = drizzleJournal(drizzleFolder(), { name: "app", marker: MARK });
-    expect(first?.sha256).toBe(createHash("sha256").update(OLD).digest("hex"));
   });
 
   test("journal order, markers and the baseline", () => {
@@ -108,13 +105,11 @@ describe("drizzleJournal", () => {
   });
 
   test("without a baseline every unmarked file is reported", () => {
-    expect(
-      unmarkedAfterBaseline(drizzleJournal(drizzleFolder(), { name: "app", marker: MARK })),
-    ).toEqual(["0000_old"]);
+    expect(unmarkedAfterBaseline(drizzleJournal(drizzleFolder(), OPTS))).toEqual(["0000_old"]);
   });
 
   test("is frozen all the way down", () => {
-    const list = drizzleJournal(drizzleFolder(), { name: "app", marker: MARK });
+    const list = drizzleJournal(drizzleFolder(), OPTS);
     expect(Object.isFrozen(list)).toBe(true);
     for (const m of list) {
       expect(Object.isFrozen(m)).toBe(true);
@@ -124,7 +119,7 @@ describe("drizzleJournal", () => {
 
   test("accepts a file: URL", () => {
     const dir = drizzleFolder();
-    expect(drizzleJournal(pathToFileURL(dir), { name: "app", marker: MARK })).toHaveLength(3);
+    expect(drizzleJournal(pathToFileURL(dir), OPTS)).toHaveLength(3);
   });
 
   test("accepts a folder whose path needs percent-encoding", () => {
@@ -132,13 +127,13 @@ describe("drizzleJournal", () => {
     mkdirSync(join(dir, "meta"), { recursive: true });
     writeFileSync(join(dir, "meta/_journal.json"), journal([{ tag: "0000_old", when: 1 }]));
     writeFileSync(join(dir, "0000_old.sql"), OLD);
-    expect(drizzleJournal(dir, { name: "app", marker: MARK })[0]?.id).toBe("0000_old");
+    expect(drizzleJournal(dir, OPTS)[0]?.id).toBe("0000_old");
   });
 
   const refusals: [string, () => unknown, RegExp][] = [
     [
       "no journal",
-      () => drizzleJournal(folder({ "x.sql": OLD }), { name: "app", marker: MARK }),
+      () => drizzleJournal(folder({ "x.sql": OLD }), OPTS),
       /cannot read .*meta\/_journal\.json/,
     ],
     [
@@ -155,7 +150,7 @@ describe("drizzleJournal", () => {
       () =>
         drizzleJournal(
           folder({ "meta/_journal.json": JSON.stringify({ entries: [{ tag: "a", when: "1" }] }) }),
-          { name: "app", marker: MARK },
+          OPTS,
         ),
       /journal entry is malformed/,
     ],
@@ -171,7 +166,7 @@ describe("drizzleJournal", () => {
             "a.sql": OLD,
             "b.sql": OLD,
           }),
-          { name: "app", marker: MARK },
+          OPTS,
         ),
       /"b" repeats a tag or a when/,
     ],
@@ -209,7 +204,7 @@ describe("drizzleJournal", () => {
           name: "app",
           marker: MARK,
         }),
-      /"a" has no file a\.sql/,
+      /"a" has no readable file a\.sql/,
     ],
     [
       "unknown baseline",
@@ -225,11 +220,7 @@ describe("drizzleJournal", () => {
       () => drizzleJournal(drizzleFolder(), { name: "app", marker: { prefix: "App(" } }),
       /marker prefix must match/,
     ],
-    [
-      "relative folder",
-      () => drizzleJournal("drizzle", { name: "app", marker: MARK }),
-      /absolute path or a file: URL/,
-    ],
+    ["relative folder", () => drizzleJournal("drizzle", OPTS), /absolute path or a file: URL/],
     [
       "empty name",
       () => drizzleJournal(drizzleFolder(), { name: " ", marker: MARK }),
@@ -280,16 +271,18 @@ describe("sqlFolder", () => {
   });
 });
 
-describe("parseMarker", () => {
+describe("matchMarker", () => {
   test("reads only the first 40 lines", () => {
     const deep = `${"--\n".repeat(40)}-- app-migration: additive\n`;
-    expect(parseMarker(deep, "app")).toBeNull();
-    expect(parseMarker(`${"--\n".repeat(39)}-- app-migration: additive\n`, "app")).toBe("additive");
+    expect(matchMarker(deep, markerPattern("app"))).toBeNull();
+    expect(
+      matchMarker(`${"--\n".repeat(39)}-- app-migration: additive\n`, markerPattern("app")),
+    ).toBe("additive");
   });
 
   test("matches its own prefix only", () => {
-    expect(parseMarker("-- other-migration: heavy\n", "app")).toBeNull();
-    expect(parseMarker("--app-migration:heavy  \n", "app")).toBe("heavy");
-    expect(parseMarker("-- app-migration: additive, mostly\n", "app")).toBeNull();
+    expect(matchMarker("-- other-migration: heavy\n", markerPattern("app"))).toBeNull();
+    expect(matchMarker("--app-migration:heavy  \n", markerPattern("app"))).toBe("heavy");
+    expect(matchMarker("-- app-migration: additive, mostly\n", markerPattern("app"))).toBeNull();
   });
 });

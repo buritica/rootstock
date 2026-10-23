@@ -5,7 +5,6 @@ test("migrate exports exactly the frozen surface", async () => {
     "applyRootstockMigrations",
     "drizzleJournal",
     "migrateSlice",
-    "parseMarker",
     "rootstockMigrationStatus",
     "rootstockMigrations",
     "sqlFolder",
