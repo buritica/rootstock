@@ -63,7 +63,14 @@ describe("composed with the real slice parsers", () => {
 
   test("the composed migrate slice is still the parser's own, branded slice", async () => {
     const config = composeRootstockConfig(parsers, input);
-    const sql = Object.assign(async () => [{ tracked: false }], { unsafe: async () => [] });
+    const none = {
+      schemaExists: false,
+      relkind: null,
+      hashType: null,
+      keyType: null,
+      idType: null,
+    };
+    const sql = Object.assign(async () => [none], { unsafe: async () => [] });
     const status = await migrate.rootstockMigrationStatus(sql as never, config.migrate);
     expect(status.schema).toBe("rootstock");
   });

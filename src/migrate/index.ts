@@ -37,7 +37,14 @@ export {
   timestampRenames,
   unmarkedAfterBaseline,
 } from "./sources.ts";
-export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";
+export {
+  type MigrationStatus,
+  migrationStatus,
+  type RootstockMigrationStatus,
+  renderMigrationStatus,
+  rootstockMigrationStatus,
+  type SourceStatus,
+} from "./status.ts";
 export { assertThrowawayDb, type ThrowawayOptions } from "./throwaway.ts";
 export {
   drizzleTracker,
