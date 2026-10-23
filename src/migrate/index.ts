@@ -8,6 +8,7 @@ export {
   type MigrationPlan,
 } from "./applier.ts";
 export { type ApplyReport, applyRootstockMigrations, rootstockSource } from "./apply.ts";
+export { type MigrateCliDeps, migrateCli } from "./cli.ts";
 export {
   type MigrationKind,
   type RootstockMigration,

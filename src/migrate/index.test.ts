@@ -11,6 +11,7 @@ test("migrate exports exactly the frozen surface", async () => {
     "drizzleTracker",
     "filenameTracker",
     "gitMainReader",
+    "migrateCli",
     "migrateSlice",
     "migrationStatus",
     "renderMigrationStatus",
