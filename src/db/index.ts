@@ -21,6 +21,10 @@ export {
   type Row,
   type Sql,
   type Transactor,
+  type TransactorErrorCode,
+  type TransactorHooks,
   type TransactorId,
+  type TransactorRollbackCause,
+  type TransactorScopeInfo,
   type TxSql,
 } from "./transactor.ts";
