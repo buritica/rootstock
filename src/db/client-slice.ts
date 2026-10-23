@@ -1,4 +1,4 @@
-import { type Brand, isRecord, q, sliceBrand, sliceRefusals } from "../internal/slice.ts";
+import { type Brand, isRecord, own, q, sliceBrand, sliceRefusals } from "../internal/slice.ts";
 
 export type DriverDefault = "driver-default";
 
@@ -88,7 +88,7 @@ function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInp
   const out: Record<string, unknown> = {};
   for (const field of FIELD_NAMES) {
     // Own keys only: an inherited value is not a field the profile declared.
-    const value = Object.hasOwn(input, field) ? input[field] : undefined;
+    const value = own(input, field);
     if (value === undefined) throw refuse.required(`${path}.${field}`);
     const { ok, expected } = FIELDS[field];
     if (!ok(value)) throw refuse.invalid(`${path}.${field}`, expected, value);
@@ -109,7 +109,7 @@ function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInp
 export function clientSlice(input: ClientSliceInput): ClientSlice {
   const record: Record<string, unknown> = isRecord(input) ? input : {};
   refuse.refuseUnknownKeys(record, SLICE_KEYS, "");
-  const profiles = Object.hasOwn(record, "profiles") ? record.profiles : undefined;
+  const profiles = own(record, "profiles");
   if (profiles === undefined) throw refuse.required("profiles");
   if (!isRecord(profiles) || Object.keys(profiles).length === 0) {
     throw refuse.invalid("profiles", "an object with at least one profile", profiles);
