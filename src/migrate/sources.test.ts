@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -284,5 +284,90 @@ describe("matchMarker", () => {
     expect(matchMarker("-- other-migration: heavy\n", markerPattern("app"))).toBeNull();
     expect(matchMarker("--app-migration:heavy  \n", markerPattern("app"))).toBe("heavy");
     expect(matchMarker("-- app-migration: additive, mostly\n", markerPattern("app"))).toBeNull();
+  });
+});
+
+describe("edges the review found", () => {
+  const enc = (t: string) => new TextEncoder().encode(t);
+
+  test("a path holding % or a backslash names that folder, not a decoded one", () => {
+    for (const name of ["a%20b", "a\\b"]) {
+      const dir = join(ROOT, name);
+      mkdirSync(join(dir, "meta"), { recursive: true });
+      writeFileSync(join(dir, "meta/_journal.json"), journal([{ tag: "0000_old", when: 1 }]));
+      writeFileSync(join(dir, "0000_old.sql"), OLD);
+      expect(drizzleJournal(dir, OPTS)[0]?.id).toBe("0000_old");
+    }
+  });
+
+  test("refuses a URL that is not file:", () => {
+    expect(() => drizzleJournal(new URL("https://example.invalid/m/"), OPTS)).toThrow(
+      /must be a file: URL/,
+    );
+  });
+
+  test("refuses a when that is not an integer", () => {
+    const dir = folder({ "meta/_journal.json": journal([{ tag: "a", when: 1.5 }]), "a.sql": OLD });
+    expect(() => drizzleJournal(dir, OPTS)).toThrow(/journal entry is malformed/);
+  });
+
+  test("refuses missing or ill-typed marker options", () => {
+    const dir = drizzleFolder();
+    expect(() => drizzleJournal(dir, { name: "app" } as never)).toThrow(/marker must be an object/);
+    expect(() =>
+      drizzleJournal(dir, { name: "app", marker: { prefix: "app", baseline: 1 } } as never),
+    ).toThrow(/marker baseline must be a string/);
+  });
+
+  test("sqlFolder counts a symlinked file and refuses a dangling one", () => {
+    const real = folder({ "x.sql": A });
+    const dir = folder({ "0000_init.sql": OLD });
+    symlinkSync(join(real, "x.sql"), join(dir, "0001_link.sql"));
+    expect(sqlFolder(dir, OPTS).map((m) => [m.id, m.kind])).toEqual([
+      ["0000_init.sql", null],
+      ["0001_link.sql", "additive"],
+    ]);
+    symlinkSync(join(real, "gone.sql"), join(dir, "0002_dangling.sql"));
+    expect(() => sqlFolder(dir, OPTS)).toThrow(/cannot read 0002_dangling\.sql/);
+  });
+
+  test("sqlFolder drops a byte-order mark from the statement and hashes the bytes", () => {
+    const bom = new Uint8Array([0xef, 0xbb, 0xbf, ...enc(A)]);
+    const invalid = new Uint8Array([...enc("SELECT '"), 0xff, ...enc("';\n")]);
+    const [b, i] = sqlFolder(folder({ "0000_bom.sql": bom, "0001_bad.sql": invalid }), OPTS);
+    expect(b?.statements).toEqual([A]);
+    expect(b?.kind).toBe("additive");
+    expect(b?.sha256).toBe(createHash("sha256").update(bom).digest("hex"));
+    expect(i?.sha256).toBe(createHash("sha256").update(invalid).digest("hex"));
+  });
+
+  test("drizzleJournal finds a marker behind a byte-order mark", () => {
+    const dir = folder({
+      "meta/_journal.json": journal([{ tag: "a", when: 1 }]),
+      "a.sql": new Uint8Array([0xef, 0xbb, 0xbf, ...enc(H)]),
+    });
+    expect(drizzleJournal(dir, OPTS)[0]?.kind).toBe("heavy");
+  });
+});
+
+describe("matchMarker edges", () => {
+  const p = markerPattern("app");
+
+  test("a marker must start its line", () => {
+    expect(matchMarker("SELECT 1; -- app-migration: heavy\n", p)).toBeNull();
+  });
+
+  test("the prefix is lower-case only", () => {
+    expect(() => markerPattern("App")).toThrow(/marker prefix must match/);
+  });
+
+  test("a CR-only file cannot widen the 40-line window", () => {
+    expect(matchMarker(`${"--\r".repeat(100)}-- app-migration: heavy\r`, p)).toBeNull();
+    expect(matchMarker(`${"-- ".repeat(100)}-- app-migration: heavy`, p)).toBeNull();
+  });
+
+  test("heavy wins when the header carries both kinds", () => {
+    expect(matchMarker("-- app-migration: additive\n-- app-migration: heavy\n", p)).toBe("heavy");
+    expect(matchMarker("-- app-migration: heavy\n-- app-migration: additive\n", p)).toBe("heavy");
   });
 });
