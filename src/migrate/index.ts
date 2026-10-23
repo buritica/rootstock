@@ -7,10 +7,14 @@ export {
 export { type MigrateSlice, type MigrateSliceInput, migrateSlice } from "./slice.ts";
 export {
   drizzleJournal,
+  drizzleJournalFrom,
   type MarkerRule,
+  type ReadFile,
   type SourceMigration,
   type SourceOptions,
   sqlFolder,
+  sqlFolderFrom,
+  timestampRenames,
   unmarkedAfterBaseline,
 } from "./sources.ts";
 export { type RootstockMigrationStatus, rootstockMigrationStatus } from "./status.ts";

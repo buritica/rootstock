@@ -4,10 +4,13 @@ test("migrate exports exactly the frozen surface", async () => {
   expect(Object.keys(await import("./index.ts")).sort()).toEqual([
     "applyRootstockMigrations",
     "drizzleJournal",
+    "drizzleJournalFrom",
     "migrateSlice",
     "rootstockMigrationStatus",
     "rootstockMigrations",
     "sqlFolder",
+    "sqlFolderFrom",
+    "timestampRenames",
     "unmarkedAfterBaseline",
   ]);
 });
