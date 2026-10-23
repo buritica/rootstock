@@ -27,9 +27,14 @@ export interface MigrationStatus {
 /**
  * Read-only, lock-free status of every source (contract §1.3): one snapshot
  * per source, so a concurrent apply can make two sources disagree in time.
- * Build `sources` once at boot; each call costs only the database reads. The
- * role needs USAGE on each tracker's schema, or this rejects with the
- * driver's 42501.
+ * Build `sources` once at boot; each call costs two queries per source, in
+ * order, with no timeout of its own, so give a probe its own small pool and a
+ * statement_timeout. The role needs USAGE on each tracker's schema, or this
+ * rejects with the driver's 42501, uncoded.
+ *
+ * During a deploy, status is red for a while by design: behind while the
+ * applier runs, ahead on an old instance after it. A readiness probe gates on
+ * `behind || tampered`, never on `red`; a drift job re-reads before paging.
  */
 export async function migrationStatus(
   sql: Sql,
@@ -100,7 +105,19 @@ export function renderMigrationStatus(status: MigrationStatus, opts: { fix: stri
     );
   }
   const lines = status.sources.map(sourceLine);
-  if (status.behind) lines.push(`fix: ${opts.fix}`);
+  if (status.behind) {
+    // The migrate command refuses while anything else is red but a stale
+    // acceptance (§1.4 step 2), so it is offered only when it can run.
+    const blocked =
+      status.ahead ||
+      status.tampered ||
+      status.sources.some((s) => s.unknown.length > 0 || s.duplicate.length > 0);
+    lines.push(
+      blocked
+        ? `fix: resolve the lines above first; ${opts.fix} refuses until then`
+        : `fix: ${opts.fix}`,
+    );
+  }
   if (status.ahead) {
     const ids = status.sources.flatMap((s) => s.ahead.map((id) => `${s.source}/${id}`));
     lines.push(

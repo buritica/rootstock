@@ -65,9 +65,6 @@ describe("renderMigrationStatus", () => {
         applied: ["20260101000000_u.sql"],
         hashTracking: false,
         unhashed: ["20260101000000_u.sql"],
-        accepted: [
-          { id: "20260101000000_u.sql", recorded: H1, current: H2, reason: "census", stale: false },
-        ],
       }),
       source("ops", { ahead: ["20270101000000_x.sql"] }),
     ]);
@@ -75,9 +72,9 @@ describe("renderMigrationStatus", () => {
       [
         "rootstock: ok (1 applied)",
         "app: behind: 0002_c, 0004_e; ahead: 1700000000009; TAMPERED: 0001_b recorded 11111111 now 22222222; accepted: 0000_a (comment only), 0003_d (reformatted) STALE; unknown rows: 7; duplicate keys: 1700000000001; out of order: 0002_c",
-        "auth: ok (1 applied); accepted: 20260101000000_u.sql (census); hashes not yet stamped: 1",
+        "auth: ok (1 applied); hashes not yet stamped: 1",
         "ops: ahead: 20270101000000_x.sql",
-        "fix: bun run migrate --manual",
+        "fix: resolve the lines above first; bun run migrate --manual refuses until then",
         "ahead: fix forward with a deploy that carries app/1700000000009, ops/20270101000000_x.sql; do not run the migrate command",
         "",
       ].join("\n"),
@@ -100,6 +97,28 @@ describe("renderMigrationStatus", () => {
     expect(out).not.toContain("fix: f");
     expect(out).toContain("do not run the migrate command");
   });
+
+  test("behind alone, or with only a stale acceptance: the migrate command", () => {
+    const stale = { id: "0000_a", recorded: H1, current: H2, reason: "r", stale: true };
+    const s = status([source("app", { pending: [pending("0001_b")], accepted: [stale] })]);
+    expect(renderMigrationStatus(s, { fix: "m" })).toBe(
+      "app: behind: 0001_b; accepted: 0000_a (r) STALE\nfix: m\n",
+    );
+  });
+
+  test.each([
+    ["tampered", { tampered: [{ id: "x", recorded: H1, current: H2 }] }],
+    ["unknown rows", { unknown: [{ rowId: 1, hash: "h" }] }],
+    ["duplicate keys", { duplicate: ["1"] }],
+  ] as [string, Partial<SourceStatus>][])(
+    "behind with %s: the command would refuse, so it says so",
+    (_l, over) => {
+      const s = status([source("app", { pending: [pending("0001_b")] }), source("b", over)]);
+      expect(renderMigrationStatus(s, { fix: "m" })).toEndWith(
+        "\nfix: resolve the lines above first; m refuses until then\n",
+      );
+    },
+  );
 
   test("refuses an empty fix command", () => {
     expect(() => renderMigrationStatus(status([source("app")]), { fix: " " })).toThrow(

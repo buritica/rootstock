@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { Sql } from "../db/index.ts";
+import { pgCode, type Sql } from "../db/index.ts";
 import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-support.ts";
 import { sha256Hex } from "../hash/index.ts";
 import { applyMigrations } from "./applier.ts";
@@ -210,5 +210,54 @@ describe("migrationStatus", () => {
     expect(renderMigrationStatus(status, { fix: "f" })).toContain(
       "auth: ok (1 applied); hashes not yet stamped: 1",
     );
+  });
+
+  test("an acceptance is not stale on a database that applied the edited file", async () => {
+    const w = world();
+    const edited = mig("app", "0000_a", "1700000000000", `${textA(w)} -- comment`);
+    const fileB = mig("app", "0001_b", "1700000000001", textB(w));
+    const entry = {
+      source: "app",
+      id: "0000_a",
+      recorded: sha256Hex(textA(w)),
+      current: edited.sha256,
+      reason: "r",
+    };
+    const slice = migrateSlice({ schema: w.slice.schema, accepted: [entry] });
+    const own = sources({ ...w, slice }, [edited, fileB]);
+    // Before the apply the file is pending, after it the row holds today's hash.
+    expect((await migrationStatus(sql, slice, own)).trackerRot).toBe(false);
+    await applyMigrations(main.transactor, slice, own, {
+      entry: "deploy",
+      backup: { skip: "test" },
+      fix: "x",
+    });
+    const status = await migrationStatus(sql, slice, own);
+    expect(status).toMatchObject({ red: false, trackerRot: false });
+    expect(status.sources[1]?.accepted[0]?.stale).toBe(false);
+  });
+
+  test("a role without USAGE on a tracker's schema gets the driver's 42501, uncoded", async () => {
+    for (const role of ["rs_owner", "rs_app"]) {
+      const [found] = await sql.unsafe<{ x: number }>(
+        "select 1 as x from pg_roles where rolname = $1::text",
+        [role],
+      );
+      if (found === undefined) await sql.unsafe(`CREATE ROLE ${role} NOLOGIN`);
+    }
+    const w = world();
+    await sql.unsafe(`CREATE SCHEMA "${w.d}" AUTHORIZATION rs_owner`);
+    // One transaction, so the role and the reads share a connection.
+    const err = await main.transactor
+      .begin(async (tx) => {
+        await tx.unsafe("SET LOCAL ROLE rs_app");
+        return migrationStatus(tx as unknown as Sql, w.slice, sources(w));
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(pgCode(err)).toBe("42501");
+    expect(String((err as { code?: unknown }).code)).not.toMatch(/^ERR_ROOTSTOCK_MIG_/);
   });
 });

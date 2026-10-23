@@ -132,11 +132,14 @@ export function sourceState(
   const acceptedState = mine.map((a) => {
     const m = source.migrations.find((x) => x.id === a.id);
     const rows = m === undefined ? undefined : byKey.get(m.key);
+    // A row already holding today's hash needs no acceptance on this database
+    // (a dev or preview database applied the edited file): not stale. The
+    // acceptance is stale when the file is gone or back to `recorded`, or when
+    // a row holds neither hash.
     const stale =
       m === undefined ||
-      rows === undefined ||
-      !rows.some((r) => r.hash === a.recorded) ||
-      m.sha256 === a.recorded;
+      m.sha256 === a.recorded ||
+      (rows !== undefined && !rows.every((r) => r.hash === a.recorded || r.hash === m.sha256));
     return Object.freeze({ ...a, stale });
   });
   return Object.freeze({
