@@ -5,17 +5,7 @@
  * table test holds the two copies to the same verdicts.
  */
 
-/**
- * `JSON.stringify(value)` for the `got …` part of a refusal, except that a
- * value it cannot serialize still yields text, as `db`'s refusals do.
- */
-export function q(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return typeof value === "bigint" ? `${value}n` : "an unserializable value";
-  }
-}
+import { q } from "../internal/slice.ts";
 
 // ASCII-only, so the length is the byte count.
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;

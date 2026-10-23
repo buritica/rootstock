@@ -7,6 +7,10 @@ import {
   postgresJsOptions,
 } from "./client-slice.ts";
 
+// The `got …` text: JSON, except that NaN and ±Infinity print as themselves.
+const shown = (v: unknown): string =>
+  typeof v === "number" && !Number.isFinite(v) ? String(v) : JSON.stringify(v);
+
 function messageOf(fn: () => unknown): string {
   try {
     fn();
@@ -117,7 +121,7 @@ describe("clientSlice", () => {
   for (const [field, value, expected] of INVALID) {
     test(`${field} = ${JSON.stringify(value)} is refused with E-SLICE-VAL`, () => {
       expect(messageOf(() => one({ [field]: value }))).toBe(
-        `clientSlice: profiles.app.${field} must be ${expected} — got ${JSON.stringify(value)}`,
+        `clientSlice: profiles.app.${field} must be ${expected} — got ${shown(value)}`,
       );
     });
   }
@@ -134,6 +138,37 @@ describe("clientSlice", () => {
     expect(
       messageOf(() => clientSlice({ profiles: { app: APP }, url: "pg://u:secret@h/d" } as never)),
     ).toBe("clientSlice: url is not a known key");
+  });
+
+  test("unknown keys are refused before missing or invalid fields", () => {
+    expect(messageOf(() => clientSlice({ profile: {} } as never))).toBe(
+      "clientSlice: profile is not a known key",
+    );
+    const { max: _max, ...noMax } = APP;
+    expect(messageOf(() => slice({ app: { ...noMax, ssl: true } as never }))).toBe(
+      "clientSlice: profiles.app.ssl is not a known key",
+    );
+    expect(messageOf(() => one({ max: -1, ssl: true } as never))).toBe(
+      "clientSlice: profiles.app.ssl is not a known key",
+    );
+  });
+
+  for (const [label, entry] of [
+    ["a number", 4],
+    ["null", null],
+    ["an array", [1]],
+  ] as const) {
+    test(`a profile that is ${label} must be an object`, () => {
+      expect(messageOf(() => slice({ app: entry as never }))).toBe(
+        `clientSlice: profiles.app must be an object — got ${JSON.stringify(entry)}`,
+      );
+    });
+  }
+
+  test("an inherited profiles is not a declared one", () => {
+    expect(messageOf(() => clientSlice(Object.create({ profiles: { app: APP } })))).toBe(
+      "clientSlice: profiles is required",
+    );
   });
 
   test("an inherited field is not a declared one", () => {
@@ -317,7 +352,7 @@ describe("renderers", () => {
       test("a bad call statement timeout is refused with E-CALL-STMT", () => {
         for (const statementTimeoutMs of [-1, 1.5, Number.NaN]) {
           expect(messageOf(() => render(C, "reader", { statementTimeoutMs }))).toBe(
-            `${render.name}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${JSON.stringify(statementTimeoutMs)}`,
+            `${render.name}: statementTimeoutMs must be a non-negative integer (0 = none) — got ${shown(statementTimeoutMs)}`,
           );
         }
       });
@@ -353,7 +388,7 @@ describe("renderers", () => {
       for (const max of [0, 1.5, Number.NaN, -1]) {
         test(`call max ${max} is refused with E-CALL-MAX`, () => {
           expect(messageOf(() => render(C, "app", { max }))).toBe(
-            `${render.name}: max for profile "app" must be an integer from 1 to 8 — got ${JSON.stringify(max)}`,
+            `${render.name}: max for profile "app" must be an integer from 1 to 8 — got ${shown(max)}`,
           );
         });
       }

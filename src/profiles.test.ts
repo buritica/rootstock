@@ -83,7 +83,16 @@ test("webhook-verify depends on node:crypto only", async () => {
   expect(offenders).toEqual([]);
 });
 
-const PURE_SUBPATHS = ["src/retry/", "src/slack/", "src/db/", "src/concurrency/"] as const;
+const PURE_SUBPATHS = [
+  "src/retry/",
+  "src/slack/",
+  "src/db/",
+  "src/concurrency/",
+  "src/internal/",
+] as const;
+// The one cross-subpath import a pure subpath may make: the shared slice
+// parser pieces, which are pure themselves and are no package export.
+const SHARED_INTERNAL = "../internal/slice.ts";
 const FORBIDDEN_GLOBALS =
   /\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|AbortSignal|crypto|process|console|Bun|globalThis|require)\b/;
 
@@ -97,10 +106,18 @@ describe("pure subpaths (every clock, timer and I/O is injected)", () => {
     for (const path of await sourceFiles()) {
       if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || TEST_FILE.test(path)) continue;
       for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
-        if (!spec.startsWith("./")) offenders.push(`${path} imports ${spec}`);
+        if (!spec.startsWith("./") && spec !== SHARED_INTERNAL) {
+          offenders.push(`${path} imports ${spec}`);
+        }
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  test("src/internal is no package export", async () => {
+    const pkg = await Bun.file(`${ROOT}/package.json`).json();
+    const targets = Object.values(pkg.exports as Record<string, string>);
+    expect(targets.filter((t) => t.includes("/internal/"))).toEqual([]);
   });
 
   test("non-test files reach no ambient global once comments are stripped", async () => {
@@ -118,6 +135,7 @@ describe("pure subpaths (every clock, timer and I/O is injected)", () => {
 
   test("they export no profiles", async () => {
     for (const sub of PURE_SUBPATHS) {
+      if (sub === "src/internal/") continue; // no index: nothing is exported from it
       const mod: Record<string, unknown> = await import(`${ROOT}/${sub}index.ts`);
       for (const [name, value] of Object.entries(mod)) {
         const isProfile = value !== null && typeof value === "object" && "id" in value;
@@ -130,7 +148,7 @@ describe("pure subpaths (every clock, timer and I/O is injected)", () => {
 // Non-test files of these subpaths may import only what is listed. A prefix
 // entry ending in "/" admits any specifier starting with it.
 const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
-  "src/migrate/": ["./", "../db/index.ts", "../hash/index.ts", "node:fs"],
+  "src/migrate/": ["./", "../db/index.ts", "../hash/index.ts", "../internal/slice.ts", "node:fs"],
   "src/config/": [
     "./",
     "../db/index.ts",

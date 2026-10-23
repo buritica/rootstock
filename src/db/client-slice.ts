@@ -1,4 +1,4 @@
-import { q } from "./quote-value.ts";
+import { type Brand, isRecord, q, sliceBrand, sliceRefusals } from "../internal/slice.ts";
 
 export type DriverDefault = "driver-default";
 
@@ -73,47 +73,31 @@ const FIELDS: Readonly<Record<Field, { ok: (v: unknown) => boolean; expected: st
 };
 
 const FIELD_NAMES = Object.keys(FIELDS) as Field[];
+const PROFILE_KEYS: ReadonlySet<string> = new Set(FIELD_NAMES);
+const SLICE_KEYS: ReadonlySet<string> = new Set(["profiles"]);
 const CALL_KEYS: readonly string[] = ["max", "statementTimeoutMs"];
 
+const refuse = sliceRefusals("clientSlice");
 // Every slice clientSlice() returned, so a hand-built literal is refused at use.
-const BUILT = new WeakSet<object>();
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function required(path: string): Error {
-  return new Error(`clientSlice: ${path} is required`);
-}
-
-function invalid(path: string, expected: string, value: unknown): Error {
-  return new Error(`clientSlice: ${path} must be ${expected} — got ${q(value)}`);
-}
-
-function refuseUnknownKeys(record: Record<string, unknown>, known: readonly string[], at: string) {
-  for (const key of Object.keys(record)) {
-    // The value is never echoed: an unknown key is where a URL or a password lands.
-    if (!known.includes(key)) throw new Error(`clientSlice: ${at}${key} is not a known key`);
-  }
-}
+const brand: Brand<ClientSlice> = sliceBrand("ClientSlice", "clientSlice");
 
 function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInput> {
-  const input = isRecord(raw) ? raw : {};
   const path = `profiles.${name}`;
+  const input = refuse.record(path, raw);
+  refuse.refuseUnknownKeys(input, PROFILE_KEYS, `${path}.`);
   const out: Record<string, unknown> = {};
   for (const field of FIELD_NAMES) {
     // Own keys only: an inherited value is not a field the profile declared.
     const value = Object.hasOwn(input, field) ? input[field] : undefined;
-    if (value === undefined) throw required(`${path}.${field}`);
+    if (value === undefined) throw refuse.required(`${path}.${field}`);
     const { ok, expected } = FIELDS[field];
-    if (!ok(value)) throw invalid(`${path}.${field}`, expected, value);
+    if (!ok(value)) throw refuse.invalid(`${path}.${field}`, expected, value);
     out[field] = value;
   }
   const { max, maxCeiling } = out as { max: number | DriverDefault; maxCeiling: number };
   if (max !== DD && maxCeiling < max) {
-    throw invalid(`${path}.maxCeiling`, FIELDS.maxCeiling.expected, maxCeiling);
+    throw refuse.invalid(`${path}.maxCeiling`, FIELDS.maxCeiling.expected, maxCeiling);
   }
-  refuseUnknownKeys(input, FIELD_NAMES, `${path}.`);
   return Object.freeze(out) as unknown as Readonly<ConnectionProfileInput>;
 }
 
@@ -124,22 +108,20 @@ function parseProfile(name: string, raw: unknown): Readonly<ConnectionProfileInp
  */
 export function clientSlice(input: ClientSliceInput): ClientSlice {
   const record: Record<string, unknown> = isRecord(input) ? input : {};
-  if (record.profiles === undefined) throw required("profiles");
-  const profiles = record.profiles;
+  refuse.refuseUnknownKeys(record, SLICE_KEYS, "");
+  const profiles = Object.hasOwn(record, "profiles") ? record.profiles : undefined;
+  if (profiles === undefined) throw refuse.required("profiles");
   if (!isRecord(profiles) || Object.keys(profiles).length === 0) {
-    throw invalid("profiles", "an object with at least one profile", profiles);
+    throw refuse.invalid("profiles", "an object with at least one profile", profiles);
   }
   const parsed: Record<string, Readonly<ConnectionProfileInput>> = {};
   for (const name of Object.keys(profiles)) {
     if (!PROFILE_NAME.test(name)) {
-      throw invalid(`profiles.${name}`, "a name matching [a-z][a-z0-9-]*", name);
+      throw refuse.invalid(`profiles.${name}`, "a name matching [a-z][a-z0-9-]*", name);
     }
     parsed[name] = parseProfile(name, profiles[name]);
   }
-  refuseUnknownKeys(record, ["profiles"], "");
-  const slice = Object.freeze({ profiles: Object.freeze(parsed) }) as unknown as ClientSlice;
-  BUILT.add(slice);
-  return slice;
+  return brand.mark(Object.freeze({ profiles: Object.freeze(parsed) }) as unknown as ClientSlice);
 }
 
 /** The profile a renderer renders, with the call's overrides checked against it. */
@@ -149,11 +131,7 @@ function resolve(
   name: string,
   call: ConnectionCallOptions | undefined,
 ): { profile: Readonly<ConnectionProfileInput>; max: number | DriverDefault; timeoutMs: number } {
-  if (!BUILT.has(slice)) {
-    throw new Error(
-      `${fn}: expected a ClientSlice built by clientSlice() — got an object that parser did not return`,
-    );
-  }
+  brand.assert(fn, slice);
   if (call !== undefined) {
     if (!isRecord(call)) {
       throw new Error(`${fn}: call options must be an object — got ${typeof call}`);
