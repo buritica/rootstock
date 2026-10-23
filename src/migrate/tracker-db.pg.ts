@@ -6,7 +6,7 @@ import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
-import type { Sql, Transactor } from "../db/index.ts";
+import { pgCode, type Sql, type Transactor } from "../db/index.ts";
 import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-support.ts";
 import { migrateSlice } from "./slice.ts";
 import { drizzleJournalFrom, type SourceMigration, sqlFolderFrom } from "./sources.ts";
@@ -94,14 +94,28 @@ async function rejection(p: Promise<unknown>): Promise<unknown> {
   throw new Error("expected a rejection");
 }
 
-/** The SQLSTATE anywhere on an error's cause chain (drivers and drizzle nest it differently). */
-function sqlstate(err: unknown): string | undefined {
-  for (let e = err, hop = 0; e !== null && typeof e === "object" && hop < 5; hop++) {
-    const { code, errno, cause } = e as { code?: unknown; errno?: unknown; cause?: unknown };
-    for (const c of [code, errno]) if (typeof c === "string" && /^[0-9A-Z]{5}$/.test(c)) return c;
-    e = cause;
+/** drizzle-orm's own migrate() over a folder holding `journal` and `files`. */
+async function drizzleMigrate(
+  migrationsSchema: string,
+  journal: typeof JOURNAL,
+  files: Record<string, string>,
+  check?: (dir: string) => void,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "rs-drz-"));
+  const client = postgres(process.env.ROOTSTOCK_TEST_DATABASE_URL ?? "", {
+    max: 1,
+    onnotice: () => {},
+  });
+  try {
+    mkdirSync(join(dir, "meta"));
+    writeFileSync(join(dir, "meta", "_journal.json"), JSON.stringify(journal));
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+    check?.(dir);
+    await migrate(drizzle(client), { migrationsFolder: dir, migrationsSchema });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await client.end();
   }
-  return undefined;
 }
 
 beforeAll(() => {
@@ -119,22 +133,10 @@ afterAll(async () => {
 
 describe("drizzle tracker", () => {
   test("bootstrap creates schema and table with drizzle's own shape, once", async () => {
-    const ours = drizzleTracker({ schema: schema() });
+    const mine = schema();
+    const ours = drizzleTracker({ schema: mine });
     const theirs = schema();
-    const url = process.env.ROOTSTOCK_TEST_DATABASE_URL ?? "";
-    const client = postgres(url, { max: 1, onnotice: () => {} });
-    const dir = mkdtempSync(join(tmpdir(), "rs-drz-"));
-    try {
-      mkdirSync(join(dir, "meta"));
-      writeFileSync(
-        join(dir, "meta", "_journal.json"),
-        JSON.stringify({ ...JOURNAL, entries: [] }),
-      );
-      await migrate(drizzle(client), { migrationsFolder: dir, migrationsSchema: theirs });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-      await client.end();
-    }
+    await drizzleMigrate(theirs, { ...JOURNAL, entries: [] }, {});
 
     const first = await bootstrap(source(ours, JOURNALED));
     expect(first.result).toEqual({ created: true, upgraded: false, stamped: [] });
@@ -142,7 +144,7 @@ describe("drizzle tracker", () => {
       {
         type: "migrate.tracker_created",
         source: "app",
-        table: `${(ours as { schema: string }).schema}.__drizzle_migrations`,
+        table: `${mine}.__drizzle_migrations`,
       },
     ]);
     const shape = async (s: string) =>
@@ -153,7 +155,7 @@ describe("drizzle tracker", () => {
           where table_schema = $1 and table_name = '__drizzle_migrations' order by ordinal_position`,
         [s],
       );
-    expect(await shape((ours as { schema: string }).schema)).toEqual(await shape(theirs));
+    expect(await shape(mine)).toEqual(await shape(theirs));
 
     const again = await bootstrap(source(ours, JOURNALED));
     expect(again).toEqual({
@@ -171,29 +173,16 @@ describe("drizzle tracker", () => {
       for (const m of JOURNALED) await recordApplied(t, tracker, SLICE, m);
     });
 
-    const dir = mkdtempSync(join(tmpdir(), "rs-drz-"));
-    const client = postgres(process.env.ROOTSTOCK_TEST_DATABASE_URL ?? "", {
-      max: 1,
-      onnotice: () => {},
-    });
-    try {
-      mkdirSync(join(dir, "meta"));
-      writeFileSync(join(dir, "meta", "_journal.json"), JSON.stringify(JOURNAL));
-      for (const [name, text] of Object.entries(JOURNAL_FILES)) {
-        writeFileSync(join(dir, name), text);
-      }
+    // Every file divides by zero: drizzle running any of them would throw.
+    await drizzleMigrate(s, JOURNAL, JOURNAL_FILES, (dir) => {
       // drizzle's own hash of each file is the hash rootstock recorded.
       expect(readMigrationFiles({ migrationsFolder: dir }).map((m) => m.hash)).toEqual(
         JOURNALED.map((m) => m.sha256),
       );
-      // Every file divides by zero: drizzle running any of them would throw.
-      await migrate(drizzle(client), { migrationsFolder: dir, migrationsSchema: s });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-      await client.end();
-    }
+    });
     const read = await readTracker(sql, tracker, SLICE);
     expect(read).toEqual({
+      schemaExists: true,
       tracked: true,
       hashColumn: true,
       rows: JOURNALED.map((m, i) => ({ rowId: i + 1, key: m.key, hash: m.sha256 })),
@@ -209,6 +198,7 @@ describe("drizzle tracker", () => {
       `INSERT INTO "${s}".mig (hash, created_at) VALUES ('h1', 9007199254740993), ('h2', NULL), ('h3', 9007199254740993)`,
     );
     expect(await readTracker(sql, tracker, SLICE)).toEqual({
+      schemaExists: true,
       tracked: true,
       hashColumn: true,
       rows: [
@@ -233,6 +223,7 @@ describe("filename tracker", () => {
     if (m === undefined) throw new Error("fixture");
     await tx.begin((t) => recordApplied(t, tracker, SLICE, m));
     expect(await readTracker(sql, tracker, SLICE)).toEqual({
+      schemaExists: true,
       tracked: true,
       hashColumn: true,
       rows: [{ rowId: null, key: m.key, hash: m.sha256 }],
@@ -241,7 +232,7 @@ describe("filename tracker", () => {
     const bad = await rejection(
       sql.unsafe(`INSERT INTO "${s}".schema_migrations (filename, sha256) VALUES ('x', 'nope')`),
     );
-    expect(sqlstate(bad)).toBe("23514");
+    expect(pgCode(bad)).toBe("23514");
   });
 
   test("a populated hash-less tracker is upgraded in place: rows kept, files' hashes stamped", async () => {
@@ -258,6 +249,7 @@ describe("filename tracker", () => {
     const tracker = filenameTracker({ schema: s });
     const before = await readTracker(sql, tracker, SLICE);
     expect(before).toEqual({
+      schemaExists: true,
       tracked: true,
       hashColumn: false,
       rows: [
@@ -389,6 +381,7 @@ describe("reads", () => {
     ]) {
       const slice = migrateSlice({ schema: schema(), ahead: "refuse" });
       expect(await readTracker(sql, tracker, slice)).toEqual({
+        schemaExists: false,
         tracked: false,
         hashColumn: tracker.kind !== "filename",
         rows: [],
@@ -415,6 +408,7 @@ describe("reads", () => {
     if (m === undefined) throw new Error("fixture");
     await tx.begin((t) => recordApplied(t, { kind: "rootstock" }, slice, m));
     expect(await readTracker(sql, { kind: "rootstock" }, slice)).toEqual({
+      schemaExists: true,
       tracked: true,
       hashColumn: true,
       rows: [{ rowId: null, key: m.key, hash: m.sha256 }],

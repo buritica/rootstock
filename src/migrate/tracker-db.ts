@@ -19,6 +19,8 @@ export interface TrackerRow {
 }
 
 export interface TrackerRead {
+  /** The tracker's schema exists. */
+  readonly schemaExists: boolean;
   /** The tracker table exists. */
   readonly tracked: boolean;
   /** Always true for drizzle and rootstock; a filename tracker once it has `sha256`. */
@@ -40,49 +42,69 @@ export interface TrackerBootstrap {
 
 const HASH_CHECK = "CHECK (sha256 ~ '^[0-9a-f]{64}$')";
 
-function qualified(tracker: Tracker, slice: MigrateSlice): { name: string; sql: string } {
+/** Everything kind-specific about a tracker's table, resolved once. */
+interface Resolved {
+  readonly tracker: Tracker;
+  readonly schema: string;
+  /** `schema.table`, for messages and events. */
+  readonly name: string;
+  /** The quoted `"schema"."table"`. */
+  readonly sql: string;
+  /** The expression a row's key is read from and compared with `SourceMigration.key`. */
+  readonly keyExpr: string;
+}
+
+function resolve(tracker: Tracker, slice: MigrateSlice): Resolved {
   const { schema, table } = trackerTable(tracker, slice);
   return {
+    tracker,
+    schema,
     name: `${schema}.${table}`,
     sql: `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`,
+    // created_at is bigint: ::text keeps it exact and a string on every driver.
+    keyExpr: tracker.kind === "drizzle" ? "created_at::text" : "filename",
   };
 }
 
 async function catalog(
   sql: Sql,
-  tracker: Tracker,
-  slice: MigrateSlice,
+  t: Resolved,
 ): Promise<{ schemaExists: boolean; tracked: boolean; hashColumn: boolean }> {
-  const { schema } = trackerTable(tracker, slice);
   const [row] = await sql<{ schemaExists: boolean; tracked: boolean; sha256: boolean }>`
-    select to_regnamespace(${schema}::text) is not null as "schemaExists",
-           to_regclass(${qualified(tracker, slice).sql}::text) is not null as "tracked",
+    select to_regnamespace(${t.schema}::text) is not null as "schemaExists",
+           to_regclass(${t.sql}::text) is not null as "tracked",
            exists (select 1 from pg_attribute
-                   where attrelid = to_regclass(${qualified(tracker, slice).sql}::text)
+                   where attrelid = to_regclass(${t.sql}::text)
                      and attname = 'sha256' and not attisdropped) as "sha256"`;
   if (row === undefined) fail("the tracker catalog query returned no row");
   return {
     schemaExists: row.schemaExists,
     tracked: row.tracked,
-    hashColumn: tracker.kind === "filename" ? row.sha256 : true,
+    hashColumn: t.tracker.kind === "filename" ? row.sha256 : true,
   };
 }
 
-function rowsQuery(tracker: Tracker, table: string, hashColumn: boolean, where = ""): string {
-  if (tracker.kind === "drizzle") {
-    // created_at is bigint: ::text keeps it exact and a string on every driver.
-    return `select id::text as "rowId", created_at::text as key, hash from ${table}${where} order by id`;
-  }
-  const hash = hashColumn ? "sha256" : "null::text";
-  return `select null::text as "rowId", filename as key, ${hash} as hash from ${table}${where} order by filename collate "C"`;
-}
-
-function toRow(r: { rowId: string | null; key: string | null; hash: string | null }): TrackerRow {
-  return Object.freeze({
-    rowId: r.rowId === null ? null : Number(r.rowId),
-    key: r.key,
-    hash: r.hash,
-  });
+/** The table's rows, or only those recorded under `key`. */
+async function selectRows(
+  sql: Sql,
+  t: Resolved,
+  hashColumn: boolean,
+  key?: string,
+): Promise<readonly TrackerRow[]> {
+  const drizzle = t.tracker.kind === "drizzle";
+  const rowId = drizzle ? "id::text" : "null::text";
+  const hash = drizzle ? "hash" : hashColumn ? "sha256" : "null::text";
+  const order = drizzle ? "id" : `filename collate "C"`;
+  const where = key === undefined ? "" : ` where ${t.keyExpr} = $1`;
+  const rows = await sql.unsafe<{ rowId: string | null; key: string | null; hash: string | null }>(
+    `select ${rowId} as "rowId", ${t.keyExpr} as key, ${hash} as hash from ${t.sql}${where} order by ${order}`,
+    key === undefined ? [] : [key],
+  );
+  return Object.freeze(
+    rows.map((r) =>
+      Object.freeze({ rowId: r.rowId === null ? null : Number(r.rowId), key: r.key, hash: r.hash }),
+    ),
+  );
 }
 
 /** Every row of a source's tracker. Read-only; a missing table reads as untracked. */
@@ -91,13 +113,10 @@ export async function readTracker(
   tracker: Tracker,
   slice: MigrateSlice,
 ): Promise<TrackerRead> {
-  const { tracked, hashColumn } = await catalog(sql, tracker, slice);
-  const rows = tracked
-    ? await sql.unsafe<{ rowId: string | null; key: string | null; hash: string | null }>(
-        rowsQuery(tracker, qualified(tracker, slice).sql, hashColumn),
-      )
-    : [];
-  return Object.freeze({ tracked, hashColumn, rows: Object.freeze(rows.map(toRow)) });
+  const t = resolve(tracker, slice);
+  const found = await catalog(sql, t);
+  const rows = found.tracked ? await selectRows(sql, t, found.hashColumn) : Object.freeze([]);
+  return Object.freeze({ ...found, rows });
 }
 
 /**
@@ -111,15 +130,9 @@ export async function trackerRowsFor(
   slice: MigrateSlice,
   key: string,
 ): Promise<readonly TrackerRow[]> {
-  const { tracked, hashColumn } = await catalog(tx, tracker, slice);
-  if (!tracked) return [];
-  const where =
-    tracker.kind === "drizzle" ? " where created_at::text = $1" : " where filename = $1";
-  const rows = await tx.unsafe<{ rowId: string | null; key: string | null; hash: string | null }>(
-    rowsQuery(tracker, qualified(tracker, slice).sql, hashColumn, where),
-    [key],
-  );
-  return Object.freeze(rows.map(toRow));
+  const t = resolve(tracker, slice);
+  const { tracked, hashColumn } = await catalog(tx, t);
+  return tracked ? selectRows(tx, t, hashColumn, key) : Object.freeze([]);
 }
 
 /** Records `m` as applied, in the caller's transaction. */
@@ -129,20 +142,17 @@ export async function recordApplied(
   slice: MigrateSlice,
   m: SourceMigration,
 ): Promise<void> {
-  const table = qualified(tracker, slice).sql;
+  const { sql } = resolve(tracker, slice);
   await (tracker.kind === "drizzle"
-    ? tx.unsafe(`INSERT INTO ${table} (hash, created_at) VALUES ($1, $2::bigint)`, [
-        m.sha256,
-        m.key,
-      ])
-    : tx.unsafe(`INSERT INTO ${table} (filename, sha256) VALUES ($1, $2)`, [m.key, m.sha256]));
+    ? tx.unsafe(`INSERT INTO ${sql} (hash, created_at) VALUES ($1, $2::bigint)`, [m.sha256, m.key])
+    : tx.unsafe(`INSERT INTO ${sql} (filename, sha256) VALUES ($1, $2)`, [m.key, m.sha256]));
 }
 
 /** drizzle-orm 0.45.3's own DDL, minus IF NOT EXISTS: the caller checked the catalog. */
-function createDdl(tracker: Tracker, table: string): string {
-  return tracker.kind === "drizzle"
-    ? `CREATE TABLE ${table} (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint)`
-    : `CREATE TABLE ${table} (filename text PRIMARY KEY, sha256 text ${HASH_CHECK}, applied_at timestamptz NOT NULL DEFAULT now())`;
+function createDdl(t: Resolved): string {
+  return t.tracker.kind === "drizzle"
+    ? `CREATE TABLE ${t.sql} (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint)`
+    : `CREATE TABLE ${t.sql} (filename text PRIMARY KEY, sha256 text ${HASH_CHECK}, applied_at timestamptz NOT NULL DEFAULT now())`;
 }
 
 /**
@@ -151,28 +161,24 @@ function createDdl(tracker: Tracker, table: string): string {
  * `applied_at timestamptz`, nothing else. It is the one table rootstock alters
  * without having created it.
  */
-async function assertUpgradable(tx: TxSql, table: { name: string; sql: string }): Promise<void> {
-  const cols = await tx.unsafe<{ name: string; type: string; pk: boolean }>(
-    `select a.attname::text as name, format_type(a.atttypid, a.atttypmod) as type,
-            coalesce(a.attnum = any(i.indkey::int2[]), false) as pk
-       from pg_attribute a
-       left join pg_index i on i.indrelid = a.attrelid and i.indisprimary
-      where a.attrelid = to_regclass($1::text) and a.attnum > 0 and not a.attisdropped
+async function assertUpgradable(tx: TxSql, t: Resolved): Promise<void> {
+  const cols = await tx.unsafe<{ col: string; owner: boolean; user: string }>(
+    `select a.attname::text || ' ' || format_type(a.atttypid, a.atttypmod)
+              || case when a.attnum = any(i.indkey::int2[]) then ' (primary key)' else '' end as col,
+            pg_get_userbyid(c.relowner) = current_user as owner, current_user::text as "user"
+       from pg_class c
+       join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+       left join pg_index i on i.indrelid = c.oid and i.indisprimary
+      where c.oid = to_regclass($1::text)
       order by a.attnum`,
-    [table.sql],
+    [t.sql],
   );
-  const [who] = await tx.unsafe<{ owner: boolean; user: string }>(
-    `select pg_get_userbyid(c.relowner) = current_user as owner, current_user::text as "user"
-       from pg_class c where c.oid = to_regclass($1::text)`,
-    [table.sql],
-  );
-  const shape = cols.map((c) => `${c.name} ${c.type}${c.pk ? " primary key" : ""}`).sort();
-  const expected = ["applied_at timestamp with time zone", "filename text primary key"];
-  const owner = who?.owner === true;
-  if (owner && shape.length === 2 && shape.every((c, i) => c === expected[i])) return;
-  const found = cols.map((c) => `${c.name} ${c.type}${c.pk ? " (primary key)" : ""}`).join(", ");
+  const found = cols.map((c) => c.col);
+  const owner = cols[0]?.owner === true;
+  const expected = ["applied_at timestamp with time zone", "filename text (primary key)"];
+  if (owner && [...found].sort().join() === expected.join()) return;
   fail(
-    `${table.name} is not a tracker rootstock can upgrade — found columns ${found}${owner ? "" : `, not owned by ${who?.user ?? "the current user"}`}; expected exactly filename text primary key and applied_at timestamptz`,
+    `${t.name} is not a tracker rootstock can upgrade — found columns ${found.join(", ")}${owner ? "" : `, not owned by ${cols[0]?.user ?? "the current user"}`}; expected exactly filename text primary key and applied_at timestamptz`,
     "ERR_ROOTSTOCK_MIG_TRACKER_SHAPE",
   );
 }
@@ -195,33 +201,36 @@ export async function bootstrapTracker(
   if (tracker.kind === "rootstock") {
     return Object.freeze({ created: false, upgraded: false, stamped: Object.freeze([]) });
   }
-  const table = qualified(tracker, slice);
-  const { schemaExists, tracked, hashColumn } = await catalog(tx, tracker, slice);
+  const t = resolve(tracker, slice);
+  const { schemaExists, tracked, hashColumn } = await catalog(tx, t);
   let created = false;
   let upgraded = false;
   if (!tracked) {
-    if (!schemaExists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(tracker.schema)}`);
-    await tx.unsafe(createDdl(tracker, table.sql));
+    if (!schemaExists) await tx.unsafe(`CREATE SCHEMA ${quoteIdentifier(t.schema)}`);
+    await tx.unsafe(createDdl(t));
     created = true;
-    emit({ type: "migrate.tracker_created", source: source.name, table: table.name });
+    emit({ type: "migrate.tracker_created", source: source.name, table: t.name });
   } else if (!hashColumn) {
-    await assertUpgradable(tx, table);
-    await tx.unsafe(`ALTER TABLE ${table.sql} ADD COLUMN sha256 text ${HASH_CHECK}`);
+    await assertUpgradable(tx, t);
+    await tx.unsafe(`ALTER TABLE ${t.sql} ADD COLUMN sha256 text ${HASH_CHECK}`);
     upgraded = true;
-    emit({ type: "migrate.tracker_upgraded", source: source.name, table: table.name });
+    emit({ type: "migrate.tracker_upgraded", source: source.name, table: t.name });
   }
   const stamped: string[] = [];
-  if (tracker.kind === "filename" && !created) {
-    const unstamped = await tx.unsafe<{ key: string }>(
-      `select filename as key from ${table.sql} where sha256 is null`,
+  if (tracker.kind === "filename" && !created && source.migrations.length > 0) {
+    // One statement whatever the count; a row already stamped is never
+    // rewritten. The pairs travel as one JSON text, since not every transactor
+    // binds arrays.
+    const done = await tx.unsafe<{ key: string }>(
+      `UPDATE ${t.sql} AS t SET sha256 = v.hash
+         FROM json_to_recordset($1::json) AS v(key text, hash text)
+        WHERE t.filename = v.key AND t.sha256 IS NULL
+        RETURNING t.filename AS key`,
+      [JSON.stringify(source.migrations.map((m) => ({ key: m.key, hash: m.sha256 })))],
     );
-    const keys = new Set(unstamped.map((r) => r.key));
+    const keys = new Set(done.map((r) => r.key));
     for (const m of source.migrations) {
       if (!keys.has(m.key)) continue;
-      await tx.unsafe(
-        `UPDATE ${table.sql} SET sha256 = $1 WHERE filename = $2 AND sha256 IS NULL`,
-        [m.sha256, m.key],
-      );
       stamped.push(m.id);
       emit({ type: "migrate.hash_stamped", source: source.name, id: m.id });
     }
