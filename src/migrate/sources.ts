@@ -16,10 +16,10 @@ export interface SourceMigration {
   /** The journal tag (drizzle) or the filename (SQL folder). */
   readonly id: string;
   /**
-   * The identity the source's tracker records: the decimal `when` of a drizzle
-   * journal entry (drizzle stores it as `created_at`), or the filename the file
-   * was applied under, which a SQL folder's `renames.json` maps from its
-   * current one. A rename never changes a key, so no tracker row is rewritten.
+   * The identity the source's tracker records. drizzle: the entry's `when` in
+   * decimal (drizzle's `created_at`). SQL folder: the file's original name, i.e.
+   * its `renames.json` entry's key when it was renamed, else its current
+   * filename. A rename never changes a key, so no tracker row is rewritten.
    */
   readonly key: string;
   /**
@@ -39,26 +39,31 @@ export interface SourceMigration {
 export interface MarkerRule {
   /**
    * The last id that predates markers: a journal tag (no `.sql`) or a filename
-   * (with `.sql`). An unmarked file at or before it is accepted by the PR check.
-   * Omit it when every file is marked.
+   * (with `.sql`), as the file is named now (after any rename), not its key.
+   * An unmarked file at or before it is accepted by the PR check. Omit it when
+   * every file is marked.
    */
   readonly baseline?: string;
   /**
-   * A source-specific prefix accepted for files up to and including `through`,
-   * e.g. `{ prefix: "legacy", through: "20260101000000_last_legacy" }`. After
-   * `through`, only the canonical `rootstock-migration` marker counts.
+   * A source-specific prefix accepted, beside the canonical `rootstock-migration`
+   * marker, for files up to and including `through` (the current id), e.g.
+   * `{ prefix: "legacy", through: "20260101000000_last_legacy" }`. After
+   * `through`, only the canonical marker counts.
    */
   readonly legacy?: { readonly prefix: string; readonly through: string };
 }
 
 export interface SourceOptions {
-  /** `[a-z][a-z0-9-]*`, unique within one run. */
+  /** `[a-z][a-z0-9-]*`; unique within one run, which the applier enforces. */
   readonly name: string;
   /** Omitted: the canonical marker only, and no baseline. */
   readonly marker?: MarkerRule;
 }
 
-/** Reads one file of the source by its name relative to the source's folder. */
+/**
+ * Reads one file of the source by its name relative to the source's folder.
+ * Synchronous; throwing is how it says the file is missing or unreadable.
+ */
 export type ReadFile = (name: string) => Uint8Array;
 
 // drizzle-kit's separator, split as drizzle splits it: anywhere, untrimmed.
@@ -74,8 +79,23 @@ const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 // it); dropping is the one that runs, since Postgres rejects a leading U+FEFF.
 const DROP_BOM = new TextDecoder("utf-8");
 
-function fail(message: string): never {
-  throw new Error(`rootstock migrate: ${message}`);
+/** Every reader refusal carries a code, so a caller never branches on text. */
+function fail(message: string, code = "ERR_ROOTSTOCK_MIG_SRC"): never {
+  throw Object.assign(new Error(`rootstock migrate: ${message}`), { code });
+}
+
+/** Refuses an own key `allowed` does not name, so a stale option shape is never silently read as empty. */
+function onlyKeys(
+  source: unknown,
+  path: string,
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      fail(`source ${q(source)}: ${path}${q(key)} is not a known key`);
+    }
+  }
 }
 
 function reason(err: unknown): string {
@@ -98,17 +118,21 @@ function open(opts: SourceOptions, where = ""): Opened {
   if (typeof name !== "string" || !NAME_RULE.test(name)) {
     fail(`a source name must match [a-z][a-z0-9-]* — got ${q(name)}`);
   }
+  onlyKeys(name, "", opts as unknown as Record<string, unknown>, ["name", "marker"]);
   if (marker !== undefined && !isRecord(marker)) {
     fail(`source ${q(name)}: marker must be an object — got ${q(marker)}`);
   }
+  if (marker !== undefined) onlyKeys(name, "marker.", marker, ["baseline", "legacy"]);
   const { baseline, legacy } = (marker ?? {}) as MarkerRule;
   if (baseline !== undefined && typeof baseline !== "string") {
     fail(`source ${q(name)}: marker baseline must be a string — got ${q(baseline)}`);
   }
   if (legacy !== undefined) {
-    const { prefix, through } = (isRecord(legacy) ? legacy : {}) as Partial<
-      NonNullable<MarkerRule["legacy"]>
-    >;
+    if (!isRecord(legacy)) {
+      fail(`source ${q(name)}: marker legacy must be an object — got ${q(legacy)}`);
+    }
+    onlyKeys(name, "marker.legacy.", legacy, ["prefix", "through"]);
+    const { prefix, through } = legacy as Partial<NonNullable<MarkerRule["legacy"]>>;
     if (typeof prefix !== "string" || !NAME_RULE.test(prefix)) {
       fail(`source ${q(name)}: marker legacy.prefix must match [a-z][a-z0-9-]* — got ${q(prefix)}`);
     }
@@ -164,7 +188,8 @@ function indexOf(source: string, drafts: readonly Draft[], field: string, id: st
   const at = drafts.findIndex((d) => d.id === id);
   if (at === -1) {
     fail(
-      `source ${q(source)}: marker ${field} ${q(id)} is not one of its migrations — the marker check would pass empty`,
+      `source ${q(source)}: marker ${field} ${q(id)} is not one of its migrations`,
+      "ERR_ROOTSTOCK_MIG_SRC_ID",
     );
   }
   return at;
@@ -184,7 +209,7 @@ function build(opened: Opened, drafts: readonly Draft[]): readonly SourceMigrati
         sha256: d.sha256,
         kind: matchMarker(
           d.text,
-          i <= through ? (legacy as { pattern: RegExp }).pattern : canonical,
+          legacy !== undefined && i <= through ? legacy.pattern : canonical,
         ),
         baselined: i <= at,
         statements: Object.freeze(d.statements),
@@ -297,21 +322,35 @@ export function drizzleJournal(
   return journalFrom(opened, text, read);
 }
 
-/** `renames.json`: `{ "<name applied under>": "<current name>" }`, as current → applied. */
+/** The own keys of a JSON object's text, duplicates included (JSON.parse keeps only the last). */
+function rawKeys(text: string): string[] {
+  const keys: string[] = [];
+  for (const m of text.matchAll(/"((?:[^"\\]|\\.)*)"\s*:/g)) keys.push(JSON.parse(`"${m[1]}"`));
+  return keys;
+}
+
+/** `renames.json`: `{ "<name applied under>": "<current name>" }`, returned as current → applied. */
 function readRenames(
   source: string,
   names: ReadonlySet<string>,
   readFile: ReadFile,
 ): ReadonlyMap<string, string> {
   if (!names.has(RENAMES)) return new Map();
+  let text: string;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(DROP_BOM.decode(readFile(RENAMES)));
+    text = DROP_BOM.decode(readFile(RENAMES));
+    parsed = JSON.parse(text);
   } catch (err) {
     fail(`source ${q(source)}: cannot read ${RENAMES} — ${reason(err)}`);
   }
   if (!isRecord(parsed)) {
     fail(`source ${q(source)}: ${RENAMES} must map old filenames to new ones — got ${q(parsed)}`);
+  }
+  const keys = rawKeys(text);
+  const repeated = keys.find((k, i) => keys.indexOf(k) !== i);
+  if (repeated !== undefined) {
+    fail(`source ${q(source)}: ${RENAMES} names ${q(repeated)} twice — JSON keeps only the last`);
   }
   const byNew = new Map<string, string>();
   for (const [from, to] of Object.entries(parsed)) {
@@ -340,8 +379,13 @@ function readRenames(
  * statement batch with any byte-order mark dropped (the simple query protocol
  * runs it whole). A `renames.json` in the folder maps the names files were
  * applied under to their current names: such a file's `id` is its current name
- * and its `key` the old one, so a renamed file is never re-applied. Refuses a
- * folder with no `.sql` file, and a file it cannot read.
+ * and its `key` the old one, so a renamed file is never re-applied. Renames do
+ * not chain: renaming a file again rewrites its entry (`old → newest`).
+ *
+ * Refuses: a repeated name, a folder with no `.sql` file, a file it cannot
+ * read, and a `renames.json` that is not a JSON object of `.sql` names, repeats
+ * a key, maps to a name not in the folder, maps from a name still in it, or
+ * maps two names to one.
  */
 export function sqlFolderFrom(
   names: readonly string[],
@@ -358,6 +402,10 @@ function folderFrom(
 ): readonly SourceMigration[] {
   const { source, where } = opened;
   const present = new Set(names);
+  if (present.size !== names.length) {
+    const repeated = names.find((n, i) => names.indexOf(n) !== i);
+    fail(`source ${q(source)}: ${q(repeated)} is listed twice`);
+  }
   const renamed = readRenames(source, present, readFile);
   const files = names.filter((f) => f.endsWith(".sql")).sort();
   if (files.length === 0) {
@@ -393,11 +441,16 @@ export function sqlFolder(folder: string | URL, opts: SourceOptions): readonly S
   // Regular files only (a symlink counts as its target): a subfolder named
   // *.sql is skipped, and a dangling link is refused when it is read.
   const names = listed.filter((name) => {
+    let isFile: boolean;
     try {
-      return statSync(new URL(name, dir)).isFile();
+      isFile = statSync(new URL(name, dir)).isFile();
     } catch {
       return true;
     }
+    if (name === RENAMES && !isFile) {
+      fail(`source ${q(opened.source)}: ${opened.where}${RENAMES} is not a file`);
+    }
+    return isFile;
   });
   return folderFrom(opened, names, folderReader(dir));
 }
@@ -408,10 +461,14 @@ export function unmarkedAfterBaseline(migrations: readonly SourceMigration[]): r
 }
 
 const STAMPED = /^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)_/;
-const NUMBERED = /^\d{1,6}_([a-z0-9_-]+)(\.sql)?$/;
+const NUMBERED = /^\d{1,6}_(.+?)(\.sql)?$/;
+const SUFFIX = /^[a-z0-9_-]+$/;
 
-function stampOf(second: number): string {
-  return new Date(second * 1000).toISOString().replace(/\D/g, "").slice(0, 14);
+/** The UTC `YYYYMMDDHHMMSS` of a second, or undefined outside years 1970–9999. */
+function stampOf(second: number): string | undefined {
+  if (!Number.isSafeInteger(second) || second < 0) return undefined;
+  const iso = new Date(second * 1000).toISOString();
+  return /^\d{4}-/.test(iso) ? iso.replace(/\D/g, "").slice(0, 14) : undefined;
 }
 
 /** The UTC second a `YYYYMMDDHHMMSS_` name stands for, or undefined when it is not one. */
@@ -430,43 +487,66 @@ function secondOf(id: string): number | undefined {
   return stampOf(second) === id.slice(0, 14) ? second : undefined;
 }
 
+function refuseRename(message: string): never {
+  fail(`timestampRenames: ${message}`, "ERR_ROOTSTOCK_MIG_RENAME");
+}
+
 /**
- * The timestamped names for a source's numbered files (D49), in the order
- * given, which must be the source's current order. A file already named
- * `<YYYYMMDDHHMMSS>_…` keeps its name and holds its second (its `at` is
- * ignored). Each numbered file becomes `<at, as UTC YYYYMMDDHHMMSS>_<its name
- * without the number>`, with `-` turned into `_`; when that second is taken, it
- * gets the next free one. Refuses a name or date that would reorder the source.
- * Pure: the caller supplies `at` (a journal's `when`, or a file's first commit
- * time read once from a full clone) and commits the result.
+ * The timestamped names for a source's numbered files, in the order given,
+ * which must be the source's current order (not verified: the caller passes
+ * it). A file already named `<YYYYMMDDHHMMSS>_…` keeps its name and needs no
+ * `at`. Each numbered file becomes `<at, as UTC YYYYMMDDHHMMSS>_<its name
+ * without the number>`, with `-` turned into `_`; when that second is taken,
+ * it gets the next free one, so any number of files may share a second.
+ * Refuses a date earlier than the one before it, a kept name that does not
+ * sort after the name before it, a repeated id, and a date outside 1970–9999.
+ * Pure: the caller supplies `at` (`new Date(when)` for a journal entry, or a
+ * file's first commit time read once from a full clone) and commits the result.
  */
 export function timestampRenames(
-  entries: readonly { readonly id: string; readonly at: Date }[],
+  entries: readonly { readonly id: string; readonly at?: Date }[],
 ): readonly { readonly from: string; readonly to: string }[] {
   const out: { from: string; to: string }[] = [];
-  let last = Number.NEGATIVE_INFINITY;
+  const seen = new Set<string>();
+  let lastName = "";
+  let lastSecond = Number.NEGATIVE_INFINITY;
+  let lastWanted = Number.NEGATIVE_INFINITY;
   for (const { id, at } of entries) {
+    if (seen.has(id)) refuseRename(`${q(id)} is listed twice`);
+    seen.add(id);
     const kept = secondOf(id);
-    const numbered = kept === undefined ? NUMBERED.exec(id) : null;
-    if (kept === undefined && numbered === null) {
-      fail(`timestampRenames: ${q(id)} is neither numbered nor a valid YYYYMMDDHHMMSS_ name`);
+    if (kept !== undefined) {
+      if (id <= lastName) refuseRename(`${q(id)} does not sort after ${q(lastName)}`);
+      lastName = id;
+      lastSecond = kept;
+      lastWanted = Math.max(lastWanted, kept);
+      continue;
     }
-    if (numbered !== null && (!(at instanceof Date) || Number.isNaN(at.getTime()))) {
-      fail(`timestampRenames: ${q(id)} needs a valid date — got ${q(at)}`);
+    const numbered = NUMBERED.exec(id);
+    if (numbered === null) {
+      refuseRename(`${q(id)} is neither numbered nor a valid YYYYMMDDHHMMSS_ name`);
     }
-    const wanted = kept ?? Math.floor(at.getTime() / 1000);
-    // A kept name cannot move, so it must clear the one before it; a renamed
-    // file may take the next free second, but never an earlier one.
-    if (kept !== undefined ? wanted <= last : wanted < last) {
-      fail(
-        `timestampRenames: ${q(id)} would sort before the name ahead of it — order would change`,
+    const [, rest = "", ext = ""] = numbered;
+    if (!SUFFIX.test(rest)) {
+      refuseRename(`${q(id)}: a numbered name must be lower-case [a-z0-9_-] after its number`);
+    }
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
+      refuseRename(`${q(id)} needs a valid date — got ${q(at)}`);
+    }
+    const wanted = Math.floor(at.getTime() / 1000);
+    if (wanted < lastWanted) {
+      refuseRename(
+        `${q(id)} is dated ${at.toISOString()}, before the file ahead of it — its name would reorder the source`,
       );
     }
-    last = Math.max(wanted, last + 1);
-    if (numbered !== null) {
-      const [, rest, ext = ""] = numbered;
-      out.push({ from: id, to: `${stampOf(last)}_${(rest as string).replaceAll("-", "_")}${ext}` });
-    }
+    const second = Math.max(wanted, lastSecond + 1);
+    const stamp = stampOf(second);
+    if (stamp === undefined) refuseRename(`${q(id)} is dated outside 1970–9999`);
+    const to = `${stamp}_${rest.replaceAll("-", "_")}${ext}`;
+    out.push({ from: id, to });
+    lastName = to;
+    lastSecond = second;
+    lastWanted = wanted;
   }
   return Object.freeze(out.map((r) => Object.freeze(r)));
 }

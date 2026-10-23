@@ -381,9 +381,16 @@ describe("matchMarker edges", () => {
     expect(() => markerPattern("App")).toThrow(/marker prefix must match/);
   });
 
-  test("a CR-only file cannot widen the 40-line window", () => {
-    expect(matchMarker(`${"--\r".repeat(100)}-- app-migration: heavy\r`, p)).toBeNull();
-    expect(matchMarker(`${"-- ".repeat(100)}-- app-migration: heavy`, p)).toBeNull();
+  test("every line terminator counts toward the 40-line window", () => {
+    for (const eol of ["\r", "\u2028", "\u2029", "\r\n"]) {
+      expect(matchMarker(`SELECT 1;${eol}-- app-migration: heavy${eol}`, p)).toBe("heavy");
+      expect(matchMarker(`${`--${eol}`.repeat(39)}-- app-migration: heavy${eol}`, p)).toBe("heavy");
+      expect(matchMarker(`${`--${eol}`.repeat(40)}-- app-migration: heavy${eol}`, p)).toBeNull();
+    }
+  });
+
+  test("markerPattern needs at least one prefix", () => {
+    expect(() => markerPattern()).toThrow(/needs a prefix/);
   });
 
   test("heavy wins when the header carries both kinds", () => {
@@ -424,6 +431,21 @@ describe("legacy markers", () => {
       ["20260103000000_mixed", "additive"],
     ]);
     expect(unmarkedAfterBaseline(list)).toEqual(["20260102000000_after"]);
+  });
+
+  test("the canonical marker also counts inside the legacy window, and heavy wins across both", () => {
+    for (const [body, kind] of [
+      ["-- rootstock-migration: heavy\nSELECT 1;\n", "heavy"],
+      ["-- legacy-migration: additive\n-- rootstock-migration: heavy\n", "heavy"],
+      ["-- rootstock-migration: heavy\n-- legacy-migration: additive\n", "heavy"],
+      ["-- rootstock-migration: additive\n", "additive"],
+    ] as const) {
+      const [m] = drizzleJournal(
+        folder({ "meta/_journal.json": journal([{ tag: "t", when: 1 }]), "t.sql": body }),
+        { name: "app", marker: { legacy: { prefix: "legacy", through: "t" } } },
+      );
+      expect(m?.kind).toBe(kind);
+    }
   });
 
   test("heavy wins across the legacy and canonical markers", () => {
@@ -579,17 +601,87 @@ describe("timestampRenames", () => {
         { id: "0000_a", at: at("2026-01-02T00:00:00Z") },
         { id: "0001_b", at: at("2026-01-01T00:00:00Z") },
       ]),
-    ).toThrow(/would sort before the name ahead of it/);
+    ).toThrow(/before the file ahead of it/);
   });
 
-  test("refuses a bump that runs into a kept timestamped name", () => {
+  test("refuses a bump that runs past a kept timestamped name", () => {
     expect(() =>
       timestampRenames([
         { id: "0000_a", at: at("2026-01-01T00:00:00Z") },
         { id: "0001_b", at: at("2026-01-01T00:00:00Z") },
-        { id: "20260101000001_kept", at: at("2026-01-01T00:00:01Z") },
+        { id: "20260101000001_a" },
       ]),
-    ).toThrow(/would sort before the name ahead of it/);
+    ).toThrow(/"20260101000001_a" does not sort after "20260101000001_b"/);
+  });
+
+  test("any number of files may share a second", () => {
+    expect(
+      timestampRenames([
+        { id: "0000_a", at: at("2026-01-01T10:00:00.100Z") },
+        { id: "0001_b", at: at("2026-01-01T10:00:00.500Z") },
+        { id: "0002_c", at: at("2026-01-01T10:00:00.900Z") },
+        { id: "0003_d", at: at("2026-01-01T10:00:01.000Z") },
+      ]).map((r) => r.to),
+    ).toEqual(["20260101100000_a", "20260101100001_b", "20260101100002_c", "20260101100003_d"]);
+  });
+
+  test("a kept name holds its own second and needs no date", () => {
+    expect(
+      timestampRenames([
+        { id: "0000_a", at: at("2026-01-01T00:00:00Z") },
+        { id: "20260105000000_k" },
+        { id: "0001_b", at: at("2026-01-06T00:00:00Z") },
+      ]),
+    ).toEqual([
+      { from: "0000_a", to: "20260101000000_a" },
+      { from: "0001_b", to: "20260106000000_b" },
+    ]);
+    expect(() =>
+      timestampRenames([
+        { id: "20260105000000_k" },
+        { id: "0001_b", at: at("2026-01-04T00:00:00Z") },
+      ]),
+    ).toThrow(/before the file ahead of it/);
+  });
+
+  test("two kept names in one second are fine when they sort, and a renamed one bumps past them", () => {
+    expect(
+      timestampRenames([
+        { id: "20260101000000_a" },
+        { id: "20260101000000_b" },
+        { id: "0001_c", at: at("2026-01-01T00:00:00Z") },
+      ]),
+    ).toEqual([{ from: "0001_c", to: "20260101000001_c" }]);
+  });
+
+  test("refuses a repeated id, a date out of range, an upper-case name and a non-Date", () => {
+    expect(() =>
+      timestampRenames([
+        { id: "0000_a", at: at("2026-01-01T00:00:00Z") },
+        { id: "0000_a", at: at("2026-01-02T00:00:00Z") },
+      ]),
+    ).toThrow(/"0000_a" is listed twice/);
+    expect(() => timestampRenames([{ id: "0000_a", at: at("+010000-01-01T00:00:00Z") }])).toThrow(
+      /outside 1970–9999/,
+    );
+    expect(() => timestampRenames([{ id: "0000_Init", at: at("2026-01-01T00:00:00Z") }])).toThrow(
+      /must be lower-case/,
+    );
+    expect(() => timestampRenames([{ id: "0000_a", at: "2026-01-01" as never }])).toThrow(
+      /needs a valid date/,
+    );
+  });
+
+  test("its result is frozen, its refusals carry a code, and an empty input is empty", () => {
+    const r = timestampRenames([{ id: "0000_a", at: at("2026-01-01T00:00:00Z") }]);
+    expect(Object.isFrozen(r) && Object.isFrozen(r[0])).toBe(true);
+    expect(timestampRenames([])).toEqual([]);
+    try {
+      timestampRenames([{ id: "init" }]);
+      throw new Error("no refusal");
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe("ERR_ROOTSTOCK_MIG_RENAME");
+    }
   });
 
   test("refuses a name that is neither numbered nor timestamped, and an invalid date", () => {
@@ -602,5 +694,174 @@ describe("timestampRenames", () => {
     expect(() => timestampRenames([{ id: "0000_a", at: new Date(Number.NaN) }])).toThrow(
       /needs a valid date/,
     );
+  });
+});
+
+describe("refusal texts and codes", () => {
+  const codeOf = (run: () => unknown): unknown => {
+    try {
+      run();
+    } catch (err) {
+      return (err as { code?: unknown }).code;
+    }
+    throw new Error("expected a refusal");
+  };
+
+  test("E-MIG-SRC-ID is the contract's text with its code", () => {
+    const run = () =>
+      drizzleJournal(drizzleFolder(), { name: "app", marker: { baseline: "nope" } });
+    expect(run).toThrow(
+      new Error(
+        'rootstock migrate: source "app": marker baseline "nope" is not one of its migrations',
+      ),
+    );
+    expect(codeOf(run)).toBe("ERR_ROOTSTOCK_MIG_SRC_ID");
+    const through = () =>
+      drizzleJournal(drizzleFolder(), {
+        name: "app",
+        marker: { legacy: { prefix: "legacy", through: "nope" } },
+      });
+    expect(through).toThrow(
+      new Error(
+        'rootstock migrate: source "app": marker legacy.through "nope" is not one of its migrations',
+      ),
+    );
+  });
+
+  test("every other reader refusal starts rootstock migrate: and carries the source code", () => {
+    const run = () => sqlFolder(folder({ "a.txt": "x" }), OPTS);
+    expect(run).toThrow(/^rootstock migrate: /);
+    expect(codeOf(run)).toBe("ERR_ROOTSTOCK_MIG_SRC");
+  });
+
+  test("a folder refusal names the folder", () => {
+    const empty = folder({ "a.txt": "x" });
+    expect(() => sqlFolder(empty, OPTS)).toThrow(empty);
+    const missing = join(ROOT, "missing-folder");
+    expect(() => sqlFolder(missing, OPTS)).toThrow(`cannot list ${missing}/`);
+    const nojournal = folder({ "x.sql": OLD });
+    expect(() => drizzleJournal(nojournal, OPTS)).toThrow(`${nojournal}/meta/_journal.json`);
+    const badjournal = folder({ "meta/_journal.json": "{" });
+    expect(() => drizzleJournal(badjournal, OPTS)).toThrow(
+      `${badjournal}/meta/_journal.json is not JSON`,
+    );
+    const real = folder({ "x.sql": A });
+    const dangling = folder({ "0000_init.sql": OLD });
+    symlinkSync(join(real, "gone.sql"), join(dangling, "0001_dangling.sql"));
+    expect(() => sqlFolder(dangling, OPTS)).toThrow(
+      `cannot read 0001_dangling.sql in ${dangling}/`,
+    );
+  });
+
+  test("an unknown key on the options, the marker or legacy is refused, naming it", () => {
+    const dir = drizzleFolder();
+    expect(() => drizzleJournal(dir, { name: "app", markers: {} } as never)).toThrow(
+      /"markers" is not a known key/,
+    );
+    expect(() => drizzleJournal(dir, { name: "app", marker: { prefix: "app" } } as never)).toThrow(
+      /marker\."prefix" is not a known key/,
+    );
+    expect(() =>
+      drizzleJournal(dir, {
+        name: "app",
+        marker: { legacy: { prefix: "legacy", through: "0000_old", until: "x" } },
+      } as never),
+    ).toThrow(/marker\.legacy\."until" is not a known key/);
+    expect(() => drizzleJournal(dir, { name: "app", marker: { legacy: 1 } } as never)).toThrow(
+      /marker legacy must be an object/,
+    );
+  });
+});
+
+describe("renames.json edges", () => {
+  const read = (files: Record<string, string | Uint8Array>) => (name: string) => {
+    const body = files[name];
+    if (body === undefined) throw new Error(`ENOENT ${name}`);
+    return typeof body === "string" ? new TextEncoder().encode(body) : body;
+  };
+  const RENAMED: Record<string, string> = {
+    "20260101000000_init.sql": OLD,
+    "20260101000001_a.sql": A,
+    "20260201000000_new.sql": H,
+    "notes.md": "not a migration",
+    "renames.json": JSON.stringify({
+      "0000_init.sql": "20260101000000_init.sql",
+      "0001_a.sql": "20260101000001_a.sql",
+    }),
+  };
+  const MARKED = {
+    name: "app",
+    marker: {
+      baseline: "20260101000000_init.sql",
+      legacy: { prefix: "legacy", through: "20260101000001_a.sql" },
+    },
+  } as const;
+
+  test("sqlFolderFrom and sqlFolder agree with renames, markers and other files present", () => {
+    expect(sqlFolderFrom(Object.keys(RENAMED), read(RENAMED), MARKED)).toEqual(
+      sqlFolder(folder(RENAMED), MARKED),
+    );
+  });
+
+  test("marker ids are the current names, never the keys", () => {
+    const list = sqlFolderFrom(Object.keys(RENAMED), read(RENAMED), MARKED);
+    expect(list.map((m) => m.baselined)).toEqual([true, false, false]);
+    expect(() =>
+      sqlFolderFrom(Object.keys(RENAMED), read(RENAMED), {
+        name: "app",
+        marker: { baseline: "0000_init.sql" },
+      }),
+    ).toThrow(/marker baseline "0000_init\.sql" is not one of its migrations/);
+    expect(() =>
+      sqlFolderFrom(Object.keys(RENAMED), read(RENAMED), {
+        name: "app",
+        marker: { baseline: "20260101000000_init" },
+      }),
+    ).toThrow(/is not one of its migrations/);
+  });
+
+  test("a byte-order mark before renames.json is fine", () => {
+    const files = {
+      ...RENAMED,
+      "renames.json": new Uint8Array([
+        0xef,
+        0xbb,
+        0xbf,
+        ...new TextEncoder().encode(RENAMED["renames.json"]),
+      ]),
+    };
+    expect(sqlFolderFrom(Object.keys(files), read(files), OPTS)[0]?.key).toBe("0000_init.sql");
+  });
+
+  const refusals: [string, string, RegExp][] = [
+    [
+      "a non-.sql target",
+      JSON.stringify({ "0000_a.sql": "notes.md" }),
+      /must map a \.sql name to a \.sql name/,
+    ],
+    [
+      "a non-string target",
+      JSON.stringify({ "0000_a.sql": 1 }),
+      /must map a \.sql name to a \.sql name/,
+    ],
+    [
+      "a repeated key",
+      '{"0000_a.sql": "20260101000000_init.sql", "0000_a.sql": "20260101000001_a.sql"}',
+      /names "0000_a\.sql" twice/,
+    ],
+  ];
+  for (const [what, map, message] of refusals) {
+    test(`refuses: ${what}`, () => {
+      const files = { ...RENAMED, "renames.json": map };
+      expect(() => sqlFolderFrom(Object.keys(files), read(files), OPTS)).toThrow(message);
+    });
+  }
+
+  test("refuses a name listed twice, and a renames.json that is a folder", () => {
+    expect(() => sqlFolderFrom(["x.sql", "x.sql"], read({ "x.sql": OLD }), OPTS)).toThrow(
+      /"x\.sql" is listed twice/,
+    );
+    const dir = folder({ "x.sql": OLD, "renames.json/keep": "" });
+    expect(() => sqlFolder(dir, OPTS)).toThrow(/renames\.json is not a file/);
   });
 });

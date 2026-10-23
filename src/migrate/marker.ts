@@ -26,7 +26,7 @@ export function markerPattern(...prefixes: readonly string[]): RegExp {
 }
 
 /**
- * The marker on a whole line within the first 40 lines of `text` (after a
+ * The marker on a whole line within the first MARKER_WINDOW_LINES lines of `text` (after a
  * leading byte-order mark), or null. When the header carries both kinds,
  * heavy wins: that is the direction that stops a deploy rather than runs it.
  */
