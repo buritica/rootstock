@@ -40,7 +40,7 @@ export function printRootstockConfig(config: RootstockConfig): string {
     client: { profiles },
     concurrency: { widths },
     invariants: [...config.invariants],
-    migrate: { ahead: config.migrate.ahead, schema: config.migrate.schema },
+    migrate: { accepted: config.migrate.accepted, schema: config.migrate.schema },
   };
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;

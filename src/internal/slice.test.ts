@@ -126,8 +126,11 @@ describe("the three slice parsers check in one order", () => {
       () => concurrencySlice(null as never),
       "concurrencySlice: widths is required",
     ],
-    ["migrateSlice", () => migrateSlice(null as never), "migrateSlice: ahead is required"],
   ])("%s: a missing input refuses like an empty one", (_label, run, text) => {
     expect(messageOf(run)).toBe(text);
+  });
+
+  test("migrateSlice: a missing input parses like an empty one", () => {
+    expect(migrateSlice(null as never) as unknown).toEqual(migrateSlice({}) as unknown);
   });
 });

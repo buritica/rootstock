@@ -21,7 +21,7 @@ const profile = {
 
 const input = {
   client: { profiles: { app: profile } },
-  migrate: { ahead: "refuse" },
+  migrate: {},
   concurrency: { widths: { fetch: { default: 2, max: 4 } } },
 } as RootstockConfigInput;
 
@@ -39,9 +39,9 @@ describe("defineRootstockConfig", () => {
   });
 
   test("a slice parser's refusal reaches the caller unchanged", () => {
-    expect(() => defineRootstockConfig({ ...input, migrate: {} as never })).toThrow(
-      "migrateSlice: ahead is required",
-    );
+    expect(() =>
+      defineRootstockConfig({ ...input, migrate: { ahead: "refuse" } as never }),
+    ).toThrow("migrateSlice: ahead is not a known key");
   });
 });
 
@@ -61,11 +61,9 @@ describe("composed with the real slice parsers", () => {
     expect(concurrency.width(config.concurrency, "fetch")).toBe(2);
   });
 
-  test("the composed migrate slice is still the parser's own, branded slice", async () => {
+  test("the composed migrate slice is still the parser's own, branded slice", () => {
     const config = composeRootstockConfig(parsers, input);
-    const sql = Object.assign(async () => [{ tracked: false }], { unsafe: async () => [] });
-    const status = await migrate.rootstockMigrationStatus(sql as never, config.migrate);
-    expect(status.schema).toBe("rootstock");
+    expect(migrate.rootstockSource(config.migrate).name).toBe("rootstock");
   });
 
   test("print spells out every field the real profile has", () => {
