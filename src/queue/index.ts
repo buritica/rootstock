@@ -1,3 +1,4 @@
+export { type CursorValue, getCursor, setCursor, touchCursor } from "./cursors.ts";
 export {
   type QueueErrorCode,
   type QueueRefusalReason,
@@ -21,4 +22,11 @@ export {
   type QueueRow,
   retryDead,
 } from "./queue.ts";
-export { type QueueSlice, type QueueSliceInput, queueSlice } from "./slice.ts";
+export {
+  type CursorTable,
+  type CursorTableInput,
+  cursorTable,
+  type QueueSlice,
+  type QueueSliceInput,
+  queueSlice,
+} from "./slice.ts";

@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { Sql, Transactor } from "../db/index.ts";
+import { getCursor, setCursor, touchCursor } from "./cursors.ts";
 import { RootstockQueueError } from "./errors.ts";
 import type { QueueEvent } from "./events.ts";
 import { QUEUE_INPUT } from "./fixtures.test-support.ts";
 import { claim, enqueue, fail } from "./queue.ts";
-import { queueSlice } from "./slice.ts";
+import { cursorTable, queueSlice } from "./slice.ts";
 
 const S = queueSlice(QUEUE_INPUT);
 
@@ -287,5 +288,44 @@ describe("QI2: the payload walk", () => {
     ]);
     const ok = { x: `é${"a".repeat(65_536 - 8 - 2)}` };
     expect(await stored(ok)).toEqual(ok);
+  });
+});
+
+describe("QI1: cursor reasons", () => {
+  const jsonT = cursorTable({ value: "jsonb", maxNameChars: 8, maxValueChars: 10 });
+  const textT = cursorTable({ value: "text", maxNameChars: 8, maxValueChars: 10 });
+
+  test("cursor_name_invalid in all three functions", async () => {
+    for (const run of [
+      (onEvent: (e: QueueEvent) => void) => getCursor(noSql, jsonT, "n".repeat(9), { onEvent }),
+      (onEvent: (e: QueueEvent) => void) => setCursor(noSql, jsonT, "", 1, { onEvent }),
+    ]) {
+      const { err, events } = await refused(run);
+      expect(err.reason).toBe("cursor_name_invalid");
+      expect(events[0]).toMatchObject({ type: "queue.refused", key: null, source: null });
+    }
+    await expect(touchCursor(noSql, jsonT, "a\0", 1)).rejects.toThrow(
+      "rootstock queue: cursor name contains a NUL byte",
+    );
+  });
+
+  test("cursor_value_invalid: text table, jsonb kinds, and the length cap", async () => {
+    const t = await refused((onEvent) => setCursor(noSql, textT, "n", 5, { onEvent }));
+    expect(t.err.detail).toBe("cursor value must be a non-empty string");
+    for (const bad of [undefined, () => 1, Symbol("s"), 1n, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { err } = await refused((onEvent) => setCursor(noSql, jsonT, "n", bad, { onEvent }));
+      expect(err.reason).toBe("cursor_value_invalid");
+      expect(err.detail).toBe("cursor value must be a JSON value");
+    }
+    const long = await refused((onEvent) =>
+      setCursor(noSql, jsonT, "n", "abcdefghij", { onEvent }),
+    );
+    expect(long.err.detail).toBe("cursor value is 12 characters, over the 10 cap");
+    expect(long.events).toEqual([
+      { type: "queue.refused", key: null, source: null, reason: "cursor_value_invalid", size: 12 },
+    ]);
+    await expect(touchCursor(noSql, textT, "n", "x".repeat(11))).rejects.toThrow(
+      "rootstock queue: cursor value is 11 characters, over the 10 cap",
+    );
   });
 });

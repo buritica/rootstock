@@ -5,12 +5,16 @@ test("queue exports exactly the frozen surface", async () => {
     "RootstockQueueError",
     "ack",
     "claim",
+    "cursorTable",
     "depth",
     "enqueue",
     "fail",
+    "getCursor",
     "listDead",
     "queueErrorCode",
     "queueSlice",
     "retryDead",
+    "setCursor",
+    "touchCursor",
   ]);
 });
