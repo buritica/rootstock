@@ -196,6 +196,29 @@ describe("checkMigrationOrder", () => {
     ]);
   });
 
+  // rootstock#36: a renamed file's key is its old name, so any stamped key
+  // sorts after it; the applier orders by id, so the id must sort after too.
+  test("after a rename, a new file must also sort after main's newest id", async () => {
+    const renames = JSON.stringify({ "0001_a.sql": "20260101000100_a.sql" });
+    const main = sql({ "20260101000100_a.sql": A, "renames.json": renames });
+    const branch = (extra: Record<string, string>) =>
+      sql({ "20260101000100_a.sql": A, "renames.json": renames, ...extra });
+    expect(await check(branch({ "20260101000000_b.sql": B }), main)).toEqual([
+      { source: "app", id: "20260101000000_b.sql", problem: "older-than-main" },
+    ]);
+    expect(await check(branch({ "20260101000200_b.sql": B }), main)).toEqual([]);
+  });
+
+  test("a drizzle source orders by when alone", async () => {
+    const main = drizzle([["20261002000000_a", 1000, A]]);
+    // A tag sorting before main's newest tag, with a later when, is fine.
+    const branch = drizzle([
+      ["20261002000000_a", 1000, A],
+      ["20261001000000_b", 2000, B],
+    ]);
+    expect(await check(branch, main)).toEqual([]);
+  });
+
   test("accepted entries must name a migration with that current hash", async () => {
     const branch = sql({ ...MAIN });
     const current = branch[0]?.sha256 as string;

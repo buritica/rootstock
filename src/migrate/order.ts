@@ -53,7 +53,8 @@ function keyOrder(
  * main (`readMain`) and returns what would break a deploy or a re-run.
  *
  * - An id not on main must be named `YYYYMMDDHHMMSS_…` with a real UTC time at
- *   most a day after `now()`, sort after main's newest key, and carry a marker
+ *   most a day after `now()`, sort after main's newest key (and, for a
+ *   filename source, main's newest id), and carry a marker
  *   unless baselined. An id not on main whose key and hash are on main is a
  *   rename: only its name and stamp are checked, and an unstamped one is a
  *   branch cut before main's rename (`stale-base`).
@@ -168,6 +169,16 @@ function compare(
     (top, m) => (top === undefined || compareKeys(m.key, top.key) > 0 ? m : top),
     undefined,
   );
+  // A filename source applies by id, and a renamed file keeps its old name as
+  // its key, so a new file must also sort after main's newest id. A drizzle
+  // key is its when, which already orders with the tag.
+  const newestId =
+    source.tracker.kind === "drizzle"
+      ? undefined
+      : main.reduce<string | undefined>(
+          (top, m) => (top === undefined || m.id > top ? m.id : top),
+          undefined,
+        );
   for (const m of source.migrations) {
     const onMain = mainById.get(m.id);
     if (onMain !== undefined) {
@@ -215,6 +226,12 @@ function compare(
         m.id,
         "older-than-main",
         `its key ${m.key} must sort after main's newest, ${newest.key} (${newest.id}); regenerate it on top of main`,
+      );
+    } else if (newestId !== undefined && m.id <= newestId) {
+      add(
+        m.id,
+        "older-than-main",
+        `its name must sort after main's newest, ${newestId}; regenerate it on top of main`,
       );
     }
     if (!m.baselined && m.kind === null) {
