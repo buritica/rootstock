@@ -1,7 +1,11 @@
 import type { Sql } from "../db/index.ts";
 import { sha256Hex } from "../hash/index.ts";
 import type { MigrationKind } from "./marker.ts";
+import { rootstockMigrations } from "./migrations.ts";
 import type { SourceMigration } from "./sources.ts";
+
+/** How many files rootstock's own source ships. */
+export const ROOTSTOCK_COUNT = rootstockMigrations().length;
 
 /**
  * Throwaway schema names for one DB suite (`<prefix>_<hex>`), and the drop

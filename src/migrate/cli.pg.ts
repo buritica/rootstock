@@ -8,7 +8,7 @@ import {
 import type { MigrateEvent } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
 import { migrateCli } from "./cli.ts";
-import { mig, schemaFactory } from "./fixtures.pg-support.ts";
+import { mig, ROOTSTOCK_COUNT, schemaFactory } from "./fixtures.pg-support.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { drizzleTracker, type TrackedSource } from "./tracked.ts";
@@ -86,7 +86,7 @@ describe("migrateCli", () => {
     expect(plan).toEqual({
       code: 0,
       lines: [
-        `plan (deploy): apply rootstock/${sources(w)[0]?.migrations[0]?.id} (additive), app/0000_a (additive)`,
+        `plan (deploy): apply ${(sources(w)[0]?.migrations ?? []).map((m) => `rootstock/${m.id} (additive)`).join(", ")}, app/0000_a (additive)`,
       ],
     });
     expect((await run(["status"], w)).code).toBe(1);
@@ -94,20 +94,23 @@ describe("migrateCli", () => {
     events.length = 0;
     const apply = await run(["apply", "--deploy"], w);
     expect(apply.code).toBe(0);
-    expect(apply.lines).toHaveLength(6);
-    expect(apply.lines[0]).toMatch(/^applying rootstock\/[^ ]+ \(additive\)$/);
-    expect(apply.lines[1]).toMatch(/^applied rootstock\/[^ ]+ \(\d+ ms\)$/);
-    expect(apply.lines.slice(2, 3)).toEqual(["applying app/0000_a (additive)"]);
-    expect(apply.lines[3]).toMatch(/^applied app\/0000_a \(\d+ ms\)$/);
-    expect(apply.lines.slice(4)).toEqual([
-      "done: 2 applied",
+    const own = 2 * ROOTSTOCK_COUNT;
+    expect(apply.lines).toHaveLength(own + 4);
+    for (let i = 0; i < own; i += 2) {
+      expect(apply.lines[i]).toMatch(/^applying rootstock\/[^ ]+ \(additive\)$/);
+      expect(apply.lines[i + 1]).toMatch(/^applied rootstock\/[^ ]+ \(\d+ ms\)$/);
+    }
+    expect(apply.lines.slice(own, own + 1)).toEqual(["applying app/0000_a (additive)"]);
+    expect(apply.lines[own + 1]).toMatch(/^applied app\/0000_a \(\d+ ms\)$/);
+    expect(apply.lines.slice(own + 2)).toEqual([
+      `done: ${ROOTSTOCK_COUNT + 1} applied`,
       `trackers created: ${w.d}.__drizzle_migrations`,
     ]);
     expect(events.map((e) => e.type)).toContain("migrate.done");
 
     expect(await run(["status"], w)).toEqual({
       code: 0,
-      lines: ["rootstock: ok (1 applied)", "app: ok (1 applied)"],
+      lines: [`rootstock: ok (${ROOTSTOCK_COUNT} applied)`, "app: ok (1 applied)"],
     });
     expect(await run(["apply", "--manual"], w)).toEqual({ code: 0, lines: ["done: 0 applied"] });
   });

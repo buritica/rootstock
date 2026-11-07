@@ -15,9 +15,14 @@ import {
 } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
 import type { MigrationKind } from "./marker.ts";
+import { rootstockMigrations } from "./migrations.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { drizzleTracker, filenameTracker, type TrackedSource } from "./tracked.ts";
+
+// rootstock's own files, then the three app files every world carries.
+const ROOTSTOCK_FILES = rootstockMigrations().map((m) => m.filename);
+const TOTAL = ROOTSTOCK_FILES.length + 3;
 
 // applyMigrations against a real Postgres, once per transactor kind. Every
 // case owns its schemas (`rs_a_<hex>`: the rootstock slice, the drizzle
@@ -159,7 +164,7 @@ describe("applyMigrations", () => {
     const result = await applyMigrations(main.transactor, w.slice, sources, opts({ onEvent }));
 
     expect(result.plan.apply.map((a) => `${a.source}/${a.id}`)).toEqual([
-      "rootstock/20261020000000_schema_migrations.sql",
+      ...ROOTSTOCK_FILES.map((f) => `rootstock/${f}`),
       "app/0000_a",
       "app/0001_b",
       "auth/20260101000000_u.sql",
@@ -181,7 +186,7 @@ describe("applyMigrations", () => {
     ]);
     expect(events.at(-1)).toEqual({
       type: "migrate.done",
-      applied: 4,
+      applied: TOTAL,
       skippedConcurrent: 0,
       ahead: 0,
     });
@@ -190,7 +195,7 @@ describe("applyMigrations", () => {
       (sources[1]?.migrations ?? []).map((m) => ({ created_at: m.key, hash: m.sha256 })),
     );
     expect(await folderRows(w)).toEqual(["20260101000000_u.sql"]);
-    expect(await rootstockRows(w)).toBe(1);
+    expect(await rootstockRows(w)).toBe(ROOTSTOCK_FILES.length);
     // Events carry ids, never SQL.
     expect(JSON.stringify(events)).not.toContain("CREATE");
   });
@@ -228,7 +233,7 @@ describe("applyMigrations", () => {
       appSources(w),
       opts({ planOnly: true }),
     );
-    expect(result.plan.apply).toHaveLength(4);
+    expect(result.plan.apply).toHaveLength(TOTAL);
     expect(result.applied).toEqual([]);
     for (const s of [w.slice.schema, w.d, w.f]) {
       const row = await one<{ e: boolean }>("select to_regnamespace($1::text) is not null as e", [
@@ -250,7 +255,7 @@ describe("applyMigrations", () => {
         },
       }),
     );
-    expect(result.applied).toHaveLength(4);
+    expect(result.applied).toHaveLength(TOTAL);
   });
 
   test("$1 inside a $$ body runs as text, through this driver", async () => {
@@ -334,7 +339,7 @@ describe("applyMigrations", () => {
     expect(await drizzleRows(w)).toEqual([]);
     // Kill point 1: the bootstrap committed, no file ran; a re-run is clean.
     const again = await applyMigrations(main.transactor, w.slice, appSources(w), opts());
-    expect(again.applied).toHaveLength(4);
+    expect(again.applied).toHaveLength(TOTAL);
     expect(again.bootstrap.created).toEqual([]);
   });
 
@@ -863,11 +868,11 @@ describe("concurrency (B1): two appliers, one database", () => {
     ]).catch((err: unknown) => String(err));
     if (typeof results === "string") return results;
     const total = results.reduce((n, r) => n + r.applied.length, 0);
-    if (total !== 4) return `applied ${total} times, expected 4`;
+    if (total !== TOTAL) return `applied ${total} times, expected ${TOTAL}`;
     pooledSkips += results.reduce((n, r) => n + r.skippedConcurrent.length, 0);
     if ((await drizzleRows(w)).length !== 2) return "drizzle rows";
     if ((await folderRows(w)).length !== 1) return "folder rows";
-    if ((await rootstockRows(w)) !== 1) return "rootstock rows";
+    if ((await rootstockRows(w)) !== ROOTSTOCK_FILES.length) return "rootstock rows";
     return undefined;
   }
 
@@ -903,7 +908,7 @@ describe("concurrency (B1): two appliers, one database", () => {
           continue;
         }
         const applied = settled.reduce((n, r) => n + r.applied.length, 0);
-        if (applied !== 4) failures.push(`applied ${applied} times`);
+        if (applied !== TOTAL) failures.push(`applied ${applied} times`);
         skips += settled.reduce((n, r) => n + r.skippedConcurrent.length, 0);
       }
       expect(failures).toEqual([]);

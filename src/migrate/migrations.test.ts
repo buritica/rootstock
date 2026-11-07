@@ -46,6 +46,71 @@ describe("the shipped files", () => {
   });
 });
 
+// The three Stage C files, byte for byte as the contract freezes them. A
+// shipped file is frozen once released: its hash is recorded in every
+// database that applied it.
+const STAGE_C: Readonly<Record<string, string>> = {
+  "20261107020000_run_locks.sql": `-- rootstock-migration: additive
+-- The fencing table behind the run lock. One row per lock name: the holder of
+-- the current acquisition, written after the advisory lock is taken and before
+-- the holder writes anything else. Run with search_path set to the target
+-- schema, so nothing here is schema-qualified.
+CREATE TABLE run_locks (
+  name text PRIMARY KEY,
+  holder uuid NOT NULL,
+  acquired_at timestamptz NOT NULL DEFAULT now(),
+  heartbeat_at timestamptz NOT NULL DEFAULT now()
+);
+`,
+  "20261107020001_work_queue.sql": `-- rootstock-migration: additive
+-- A durable work list: one row per unit of work, keyed \`<source>:<id>\`. The
+-- vocabulary of sources and kinds belongs to the consumer and is validated by
+-- the queue slice, not here. Run with search_path set to the target schema.
+CREATE TABLE work_queue (
+  key text PRIMARY KEY,
+  source text NOT NULL,
+  kind text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  not_before timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  claimed_by text,
+  attempts integer NOT NULL DEFAULT 0,
+  last_error text,
+  dead_at timestamptz,
+  enqueued_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT work_queue_key_source_check CHECK (key LIKE source || ':%'),
+  CONSTRAINT work_queue_key_length_check CHECK (length(key) <= 512)
+);
+CREATE INDEX work_queue_due_idx ON work_queue (source, not_before) WHERE dead_at IS NULL;
+`,
+  "20261107020002_cursors.sql": `-- rootstock-migration: additive
+-- Named resume points and pulses: where a feed resumes, or when a worker last
+-- beat. Run with search_path set to the target schema.
+CREATE TABLE cursors (
+  name text PRIMARY KEY,
+  value jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+`,
+};
+
+describe("the Stage C files", () => {
+  for (const [file, text] of Object.entries(STAGE_C)) {
+    test(`${file} is byte-equal to the frozen text`, () => {
+      expect(readFileSync(new URL(file, DIR), "utf8")).toBe(text);
+    });
+  }
+
+  test("they follow the first file in the manifest, in order, as one statement each", () => {
+    expect(MANIFEST.slice(1)).toEqual(Object.keys(STAGE_C));
+    for (const m of rootstockMigrations().slice(1)) {
+      expect(m.kind).toBe("additive");
+      expect(m.statements).toHaveLength(1);
+    }
+  });
+});
+
 describe("rootstockMigrations", () => {
   test("is read once and frozen all the way down", () => {
     const list = rootstockMigrations();
