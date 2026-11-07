@@ -1,7 +1,7 @@
 import type { Sql } from "../db/index.ts";
 import type { AcceptedHash, MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
-import type { TrackedSource } from "./tracked.ts";
+import { applyOrder, type TrackedSource } from "./tracked.ts";
 import { readTracker, type TrackerRead, type TrackerRow } from "./tracker-db.ts";
 
 /**
@@ -66,11 +66,6 @@ export function acceptanceOf(
   };
 }
 
-/** Compares keys the way the tracker orders them: drizzle's as integers. */
-function keyBefore(a: string, b: string, numeric: boolean): boolean {
-  return numeric ? BigInt(a) < BigInt(b) : a < b;
-}
-
 export function sourceState(
   source: TrackedSource,
   read: TrackerRead,
@@ -96,6 +91,7 @@ export function sourceState(
   const pending: SourceMigration[] = [];
   const tampered: SourceState["tampered"][number][] = [];
   const unhashed: string[] = [];
+  const { of, compare: order } = applyOrder(source);
   let newest: string | undefined;
   for (const m of source.migrations) {
     const rows = byKey.get(m.key);
@@ -104,7 +100,7 @@ export function sourceState(
       continue;
     }
     applied.push(m.id);
-    if (newest === undefined || keyBefore(newest, m.key, numeric)) newest = m.key;
+    if (newest === undefined || order(newest, of(m)) < 0) newest = of(m);
     for (const row of rows) {
       if (row.hash === null) continue;
       if (row.hash === m.sha256) continue;
@@ -128,7 +124,7 @@ export function sourceState(
   const outOfOrder =
     newest === undefined
       ? []
-      : pending.filter((m) => keyBefore(m.key, newest as string, numeric)).map((m) => m.id);
+      : pending.filter((m) => order(of(m), newest as string) < 0).map((m) => m.id);
   const acceptedState = mine.map((a) => {
     const m = source.migrations.find((x) => x.id === a.id);
     const rows = m === undefined ? undefined : byKey.get(m.key);

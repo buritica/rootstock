@@ -304,7 +304,7 @@ describe("checkMigrationOrder", () => {
         (f) => f.detail,
       );
     expect(await detailOf(sql({ ...MAIN, "20261001120000_c.sql": C }), sql(MAIN))).toEqual([
-      "its key 20261001120000_c.sql must sort after main's newest, 20261002000000_b.sql (20261002000000_b.sql); regenerate it on top of main",
+      "it must sort after main's newest, 20261002000000_b.sql, in apply order; regenerate it on top of main",
     ]);
     const branch = sql(MAIN);
     const slice = migrateSlice({

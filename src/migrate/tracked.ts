@@ -16,6 +16,29 @@ export interface TrackedSource {
   readonly tracker: Tracker;
 }
 
+/**
+ * Where a migration sits in apply order. A drizzle source applies in journal
+ * order, which its key (the `when`) follows, so it orders by key as an
+ * integer. Every other source applies by filename, so it orders by id: a
+ * renamed file keeps its old name as its key, which is not where it applies.
+ */
+export function applyOrder(source: TrackedSource): {
+  readonly of: (m: SourceMigration) => string;
+  readonly compare: (a: string, b: string) => number;
+} {
+  if (source.tracker.kind === "drizzle") {
+    return {
+      of: (m) => m.key,
+      compare: (a, b) => {
+        const x = BigInt(a);
+        const y = BigInt(b);
+        return x < y ? -1 : x > y ? 1 : 0;
+      },
+    };
+  }
+  return { of: (m) => m.id, compare: (a, b) => (a < b ? -1 : a > b ? 1 : 0) };
+}
+
 const TABLE_KEYS: ReadonlySet<string> = new Set(["schema", "table"]);
 
 function tableOptions(

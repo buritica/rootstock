@@ -2,7 +2,7 @@ import { isRecord, q } from "../internal/slice.ts";
 import { fail, failIo } from "./errors.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import { drizzleJournalAt, type SourceMigration, secondOf, sqlFolderAt } from "./sources.ts";
-import type { TrackedSource } from "./tracked.ts";
+import { applyOrder, type TrackedSource } from "./tracked.ts";
 
 export interface OrderFinding {
   readonly source: string;
@@ -26,26 +26,14 @@ export interface OrderFinding {
 const STAMPED_NAME = /^\d{14}_[a-z0-9_]+(\.sql)?$/;
 const DAY_S = 86_400;
 
-/** A drizzle key is its `when`, compared as an integer; any other key is a filename. */
-function keyOrder(
-  source: TrackedSource,
-  main: readonly SourceMigration[],
-): (a: string, b: string) => number {
-  if (source.tracker.kind === "drizzle") {
-    for (const m of [...source.migrations, ...main]) {
-      if (!/^\d+$/.test(m.key)) {
-        fail(
-          `source ${q(source.name)}: ${q(m.id)} has key ${q(m.key)}, but a drizzle key is a when`,
-        );
-      }
+/** A drizzle key is its `when`, so every one, on main too, must be an integer. */
+function assertDrizzleKeys(source: TrackedSource, main: readonly SourceMigration[]): void {
+  if (source.tracker.kind !== "drizzle") return;
+  for (const m of [...source.migrations, ...main]) {
+    if (!/^\d+$/.test(m.key)) {
+      fail(`source ${q(source.name)}: ${q(m.id)} has key ${q(m.key)}, but a drizzle key is a when`);
     }
-    return (a, b) => {
-      const x = BigInt(a);
-      const y = BigInt(b);
-      return x < y ? -1 : x > y ? 1 : 0;
-    };
   }
-  return (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 }
 
 /**
@@ -53,8 +41,8 @@ function keyOrder(
  * main (`readMain`) and returns what would break a deploy or a re-run.
  *
  * - An id not on main must be named `YYYYMMDDHHMMSS_…` with a real UTC time at
- *   most a day after `now()`, sort after main's newest key (and, for a
- *   filename source, main's newest id), and carry a marker
+ *   most a day after `now()`, sort after main's newest in apply order (a
+ *   drizzle source's `when`, any other source's filename), and carry a marker
  *   unless baselined. An id not on main whose key and hash are on main is a
  *   rename: only its name and stamp are checked, and an unstamped one is a
  *   branch cut before main's rename (`stale-base`).
@@ -157,7 +145,8 @@ function compare(
   main: readonly SourceMigration[],
   nowS: number,
 ): OrderFinding[] {
-  const compareKeys = keyOrder(source, main);
+  assertDrizzleKeys(source, main);
+  const { of, compare: order } = applyOrder(source);
   const out: OrderFinding[] = [];
   const add = (id: string, problem: OrderFinding["problem"], detail: string) =>
     out.push({ source: source.name, id, problem, detail });
@@ -166,19 +155,9 @@ function compare(
   const branchKeys = new Set(source.migrations.map((m) => m.key));
   const branchIds = new Set(source.migrations.map((m) => m.id));
   const newest = main.reduce<SourceMigration | undefined>(
-    (top, m) => (top === undefined || compareKeys(m.key, top.key) > 0 ? m : top),
+    (top, m) => (top === undefined || order(of(m), of(top)) > 0 ? m : top),
     undefined,
   );
-  // A filename source applies by id, and a renamed file keeps its old name as
-  // its key, so a new file must also sort after main's newest id. A drizzle
-  // key is its when, which already orders with the tag.
-  const newestId =
-    source.tracker.kind === "drizzle"
-      ? undefined
-      : main.reduce<string | undefined>(
-          (top, m) => (top === undefined || m.id > top ? m.id : top),
-          undefined,
-        );
   for (const m of source.migrations) {
     const onMain = mainById.get(m.id);
     if (onMain !== undefined) {
@@ -221,17 +200,11 @@ function compare(
       }
       continue;
     }
-    if (newest !== undefined && compareKeys(m.key, newest.key) <= 0) {
+    if (newest !== undefined && order(of(m), of(newest)) <= 0) {
       add(
         m.id,
         "older-than-main",
-        `its key ${m.key} must sort after main's newest, ${newest.key} (${newest.id}); regenerate it on top of main`,
-      );
-    } else if (newestId !== undefined && m.id <= newestId) {
-      add(
-        m.id,
-        "older-than-main",
-        `its name must sort after main's newest, ${newestId}; regenerate it on top of main`,
+        `it must sort after main's newest, ${newest.id}${of(newest) === newest.id ? "" : ` (key ${of(newest)})`}, in apply order; regenerate it on top of main`,
       );
     }
     if (!m.baselined && m.kind === null) {
