@@ -1,4 +1,4 @@
-import { own, q } from "../internal/slice.ts";
+import { intIn, own, q } from "../internal/slice.ts";
 import { refusals } from "./errors.ts";
 import type { RunStatus } from "./events.ts";
 import type { JobSnapshot, RunRow } from "./record.ts";
@@ -44,8 +44,9 @@ interface Settled {
  * over `staleHeartbeatSeconds` counts as settled `interrupted` at its last
  * beat (§20 A9): a black-holed holder reads live until its socket dies.
  */
-function newestSettledOf(snap: JobSnapshot, job: JobDecl, now: number): Settled | null {
-  const settled: Settled | null =
+function newestSettledOf(snap: JobSnapshot, job: JobDecl): Settled | null {
+  const staleMs = job.staleHeartbeatSeconds * 1000;
+  let out: Settled | null =
     snap.newestSettled === null
       ? null
       : {
@@ -53,11 +54,10 @@ function newestSettledOf(snap: JobSnapshot, job: JobDecl, now: number): Settled 
           startedAt: snap.newestSettled.startedAt,
           at: snap.newestSettled.finishedAt,
         };
-  const staleMs = job.staleHeartbeatSeconds * 1000;
-  let out = settled;
   for (const r of snap.running) {
-    const beat = r.heartbeatAt ?? null;
-    if (beat === null || now - beat.getTime() <= staleMs) continue;
+    const beat = r.heartbeatAt;
+    // The age is the database's (A18), so app/database clock skew cannot make a live run stale.
+    if (beat === null || r.heartbeatAgeMs === null || r.heartbeatAgeMs <= staleMs) continue;
     if (out === null || r.startedAt.getTime() > out.startedAt.getTime()) {
       out = { status: "interrupted", startedAt: r.startedAt, at: beat };
     }
@@ -76,7 +76,7 @@ export function verdictFor(
   input: { now: number; live?: number },
 ): Verdict {
   const now = nowOf("verdictFor()", input?.now);
-  const settled = newestSettledOf(snap, job, now);
+  const settled = newestSettledOf(snap, job);
   if (settled === null) return { verdict: "never-ran" };
   const ok: RunRow | null = snap.newestOk;
   if (ok === null) {
@@ -108,7 +108,7 @@ export function verdictFor(
         ok.job,
       );
     }
-    if (!Number.isInteger(live) || live < 0) {
+    if (!intIn(live, 0, Number.MAX_SAFE_INTEGER)) {
       throw refusals.input(
         `verdictFor(${ok.job}): live must be a non-negative integer — got ${q(live)}`,
         ok.job,

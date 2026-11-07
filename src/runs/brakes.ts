@@ -6,6 +6,7 @@ import { assertRunsSlice, type RunsSlice } from "./slice.ts";
 
 /** Shares carry at most 4 decimals (§10.1), so each is an exact N / 10 000. */
 const SHARE_DENOMINATOR = 10_000;
+const SHARE_DENOMINATOR_N = BigInt(SHARE_DENOMINATOR);
 
 /** True when `v` is a non-negative safe integer. */
 const count = (v: unknown): v is number => intIn(v, 0, Number.MAX_SAFE_INTEGER);
@@ -74,8 +75,7 @@ export function proportionalBrake(
     } else if (armed) {
       cap = Math.max(allowance, held * share);
       wouldRefuse =
-        planned > allowance &&
-        BigInt(planned) * BigInt(SHARE_DENOMINATOR) > BigInt(held) * numerator;
+        planned > allowance && BigInt(planned) * SHARE_DENOMINATOR_N > BigInt(held) * numerator;
     }
     return {
       planned,
@@ -129,22 +129,44 @@ export function windowedBudget(
   const { limit, windowMinutes } = declared("windowedBudget", "budget", slice.budgets, name);
   const windowMs = windowMinutes * 60_000;
   const emit = emitter(deps.onEvent);
-  let charges: { atMs: number; n: number }[] = [];
+  // Charges oldest first; `head` is the first still in the window, `used` the
+  // sum from `head` on. A clock that steps back only keeps a charge longer.
+  const charges: { atMs: number; n: number }[] = [];
+  let head = 0;
+  let used = 0;
   const input = (call: string, v: unknown) =>
     refusals.input(`${call}(${q(name)}): n must be a non-negative integer — got ${q(v)}`);
-  const remainingAt = (now: number): number => {
-    charges = charges.filter((c) => c.atMs > now - windowMs);
-    const used = charges.reduce((sum, c) => sum + c.n, 0);
+  /** deps.now(), refused when it is not a finite number: a NaN would fail open. */
+  const now = (): number => {
+    const t = deps.now();
+    if (typeof t !== "number" || !Number.isFinite(t)) {
+      throw refusals.input(
+        `windowedBudget(${q(name)}): deps.now() must be a finite number of ms — got ${q(t)}`,
+      );
+    }
+    return t;
+  };
+  const remainingAt = (t: number): number => {
+    while (head < charges.length && (charges[head] as { atMs: number }).atMs <= t - windowMs) {
+      used -= (charges[head] as { n: number }).n;
+      head += 1;
+    }
+    if (head > 1024 && head * 2 > charges.length) {
+      charges.splice(0, head);
+      head = 0;
+    }
     return Math.max(0, limit - used);
   };
-  const remaining = () => remainingAt(deps.now());
+  const remaining = () => remainingAt(now());
   return {
     remaining,
     charge(n) {
       if (!count(n)) throw input("charge", n);
-      const now = deps.now();
-      remainingAt(now);
-      charges.push({ atMs: now, n });
+      const t = now();
+      remainingAt(t);
+      if (n === 0) return;
+      charges.push({ atMs: t, n });
+      used += n;
     },
     spent: () => remaining() === 0,
     assert(planned) {

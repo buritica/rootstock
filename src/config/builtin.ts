@@ -117,21 +117,23 @@ export const runsJobLocks: Invariant = Object.freeze({
 });
 
 /**
- * Built in, never exported (contract §20 A9): a running row whose fence has
- * not beaten for `staleHeartbeatSeconds` reads interrupted, so the bound must
- * span two of the lock's beats or a live run could read interrupted between
- * them. Holds when there is no lock slice (`runs-job-locks` reports that).
+ * Built in, never exported (contract §20 A9, A17): a running row whose fence
+ * has not beaten for `staleHeartbeatSeconds` reads interrupted. A healthy
+ * keepalive skips its beat while a probe holds the guard (up to
+ * probeStallSeconds) and between beats waits heartbeatSeconds, so the bound
+ * is probeStallSeconds + 2 × heartbeatSeconds or a live run could read
+ * interrupted. Holds when there is no lock slice (`runs-job-locks` reports that).
  */
 export const runsStaleHeartbeat: Invariant = Object.freeze({
   id: "runs-stale-heartbeat",
   check(config: RootstockConfig): string | null {
     const { runs, lock } = config;
     if (runs === null || lock === null) return null;
-    const floor = 2 * lock.heartbeatSeconds;
+    const floor = lock.probeStallSeconds + 2 * lock.heartbeatSeconds;
     const offenders = Object.entries(runs.jobs).flatMap(([key, job]) =>
       job.staleHeartbeatSeconds < floor ? [`${key} (${job.staleHeartbeatSeconds})`] : [],
     );
     if (offenders.length === 0) return null;
-    return `jobs ${offenders.join(", ")} have staleHeartbeatSeconds below ${floor}, twice the lock slice's heartbeatSeconds: a live run would read interrupted between two beats`;
+    return `jobs ${offenders.join(", ")} have staleHeartbeatSeconds below ${floor}, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted between two beats`;
   },
 });

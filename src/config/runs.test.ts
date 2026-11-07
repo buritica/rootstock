@@ -26,7 +26,8 @@ const LOCK: LockInput = {
   profile: "lock",
   names: ["alpha-sync", "shared-write", "delta:*"],
   heartbeatSeconds: 30,
-  probeStallSeconds: 90,
+  // 60 + 2 × 30 = 120, the fixtures' staleHeartbeatSeconds: exactly the floor (A17).
+  probeStallSeconds: 60,
   maxRecoveries: 5,
   endTimeoutSeconds: 5,
   wait: { maxMs: 30000, pollIntervalMs: 1000 },
@@ -179,15 +180,15 @@ describe("RC2: the runs built-in invariants", () => {
     ).not.toThrow();
   });
 
-  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ 2 × the lock's heartbeatSeconds (A9)", () => {
+  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ probeStallSeconds + 2 × heartbeatSeconds (A17)", () => {
     expect(() =>
-      defineRootstockConfig(input({ lock: { heartbeatSeconds: 60, probeStallSeconds: 90 } })),
+      defineRootstockConfig(input({ lock: { heartbeatSeconds: 20, probeStallSeconds: 80 } })),
     ).not.toThrow();
-    const { jobs } = withJob("beta-sync", { staleHeartbeatSeconds: 122 });
+    const { jobs } = withJob("beta-sync", { staleHeartbeatSeconds: 121 });
     expect(
-      failure(input({ lock: { heartbeatSeconds: 61, probeStallSeconds: 90 }, runs: { jobs } })),
+      failure(input({ lock: { heartbeatSeconds: 20, probeStallSeconds: 81 }, runs: { jobs } })),
     ).toBe(
-      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 122, twice the lock slice's heartbeatSeconds: a live run would read interrupted between two beats",
+      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted between two beats",
     );
   });
 

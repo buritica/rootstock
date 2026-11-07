@@ -219,6 +219,7 @@ describe("record", () => {
         reason: null,
         live: true,
         heartbeatAt: expect.any(Date),
+        heartbeatAgeMs: expect.any(Number),
       },
     ]);
     // heartbeatAt is the fencing row's last beat, read as epoch-ms text (§20 A9).
@@ -226,6 +227,14 @@ describe("record", () => {
       `SELECT floor(extract(epoch FROM heartbeat_at) * 1000)::text AS ms FROM ${env.L} WHERE name = 'alpha-sync'`,
     );
     expect(during?.running[0]?.heartbeatAt).toEqual(new Date(Number(beat?.ms)));
+    // heartbeatAgeMs is measured on the database's clock (§20 A18).
+    await sql.unsafe(
+      `UPDATE ${env.L} SET heartbeat_at = clock_timestamp() - interval '1 hour' WHERE name = 'alpha-sync'`,
+    );
+    const aged = (await runsSnapshot(sql, env.runs, ["alpha-sync"])).get("alpha-sync");
+    const age = aged?.running[0]?.heartbeatAgeMs as number;
+    expect(age).toBeGreaterThanOrEqual(3_600_000);
+    expect(age).toBeLessThan(3_600_000 + 60_000);
     run.count("seen", 10);
     run.count("archived", 2);
     run.meter("model-a", 1000, 2000, { estimated: true });

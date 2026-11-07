@@ -85,9 +85,11 @@ RETURNING ${P}::text AS row`,
      ORDER BY r.started_at DESC, r.id DESC LIMIT 1)::text AS newest_ok,
   (SELECT jsonb_agg(${P} || jsonb_build_object('live',
             EXISTS (SELECT 1 FROM ${L} l WHERE l.name = r.lock_name AND l.holder = r.holder)
-            AND ${held},
-            'heartbeatAtMs', (SELECT floor(extract(epoch FROM l.heartbeat_at) * 1000)::text
-              FROM ${L} l WHERE l.name = r.lock_name AND l.holder = r.holder))
+            AND ${held})
+          || coalesce((SELECT jsonb_build_object(
+                'heartbeatAtMs', floor(extract(epoch FROM l.heartbeat_at) * 1000)::text,
+                'heartbeatAgeMs', floor(extract(epoch FROM clock_timestamp() - l.heartbeat_at) * 1000)::text)
+              FROM ${L} l WHERE l.name = r.lock_name AND l.holder = r.holder), '{}'::jsonb)
           ORDER BY r.started_at, r.id)
      FROM ${R} r WHERE r.job = j.job AND r.status = 'running')::text AS running
 FROM jsonb_array_elements_text($1::text::jsonb) WITH ORDINALITY AS j(job, i)

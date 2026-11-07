@@ -1011,11 +1011,15 @@ describe("runsSnapshot and pruneRuns", () => {
         newest_settled: JSON.stringify(row({ status: "failed", job: "delta:one" })),
         newest_ok: null,
         running: JSON.stringify([
-          { ...row({ status: "running", finishedAtMs: null }), live: true, heartbeatAtMs: "5000" },
+          {
+            ...row({ status: "running", finishedAtMs: null }),
+            live: true,
+            heartbeatAtMs: "5000",
+            heartbeatAgeMs: "750",
+          },
           {
             ...row({ status: "running", finishedAtMs: null, id: "x" }),
             live: false,
-            heartbeatAtMs: null,
           },
         ]),
       },
@@ -1029,9 +1033,11 @@ describe("runsSnapshot and pruneRuns", () => {
     expect(d?.newestSettled?.status).toBe("failed");
     expect(d?.newestSettled?.finishedAt).toEqual(new Date(2000));
     expect(d?.newestOk).toBeNull();
-    expect(d?.running.map((r) => [r.id, r.live, r.finishedAt, r.heartbeatAt])).toEqual([
-      [ID, true, null, new Date(5000)],
-      ["x", false, null, null],
+    expect(
+      d?.running.map((r) => [r.id, r.live, r.finishedAt, r.heartbeatAt, r.heartbeatAgeMs]),
+    ).toEqual([
+      [ID, true, null, new Date(5000), 750],
+      ["x", false, null, null, null],
     ]);
     expect(snap.get("beta-sync")).toEqual({
       total: 0,
@@ -1165,9 +1171,11 @@ RETURNING <P(r)>::text AS row`,
      ORDER BY r.started_at DESC, r.id DESC LIMIT 1)::text AS newest_ok,
   (SELECT jsonb_agg(<P(r)> || jsonb_build_object('live',
             EXISTS (SELECT 1 FROM <L> l WHERE l.name = r.lock_name AND l.holder = r.holder)
-            AND <HELD(r.lock_name)>,
-            'heartbeatAtMs', (SELECT floor(extract(epoch FROM l.heartbeat_at) * 1000)::text
-              FROM <L> l WHERE l.name = r.lock_name AND l.holder = r.holder))
+            AND <HELD(r.lock_name)>)
+          || coalesce((SELECT jsonb_build_object(
+                'heartbeatAtMs', floor(extract(epoch FROM l.heartbeat_at) * 1000)::text,
+                'heartbeatAgeMs', floor(extract(epoch FROM clock_timestamp() - l.heartbeat_at) * 1000)::text)
+              FROM <L> l WHERE l.name = r.lock_name AND l.holder = r.holder), '{}'::jsonb)
           ORDER BY r.started_at, r.id)
      FROM <R> r WHERE r.job = j.job AND r.status = 'running')::text AS running
 FROM jsonb_array_elements_text($1::text::jsonb) WITH ORDINALITY AS j(job, i)

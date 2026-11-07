@@ -24,6 +24,7 @@ export {
   type JobSnapshot,
   pruneRuns,
   type Run,
+  type RunningRow,
   type RunRow,
   type RunsSnapshot,
   runsSnapshot,

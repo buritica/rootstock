@@ -231,6 +231,41 @@ describe("windowedBudget", () => {
       'rootstock runs: windowedBudget("omega"): not a budget this slice declares — declared: alpha-calls',
     );
   });
+
+  test("RB7: a clock that is not a finite number refuses INPUT rather than failing open", () => {
+    const slice = runsSlice(runsInput());
+    let now: number = 1_000;
+    const b = windowedBudget("alpha-calls", slice, { now: () => now });
+    b.charge(100);
+    now = Number.NaN;
+    const err = thrown(() => b.assert(100));
+    expect(err.code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
+    expect(err.message).toBe(
+      'rootstock runs: windowedBudget("alpha-calls"): deps.now() must be a finite number of ms — got NaN',
+    );
+    expect(thrown(() => b.charge(1)).code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
+    now = 2_000;
+    expect(b.remaining()).toBe(0);
+  });
+
+  test("RB7: many charges stay linear and expire in order", () => {
+    const slice = runsSlice(
+      runsInput(["budgets", "alpha-calls"], { limit: 1_000_000, windowMinutes: 1 }),
+    );
+    let now = 0;
+    const b = windowedBudget("alpha-calls", slice, { now: () => now });
+    const started = performance.now();
+    for (let i = 0; i < 100_000; i += 1) {
+      now += 1;
+      b.charge(1);
+      b.assert(0);
+    }
+    expect(performance.now() - started).toBeLessThan(2_000);
+    // One charge per ms: those made in the last 60 000 ms are in the window.
+    expect(b.remaining()).toBe(1_000_000 - 60_000);
+    now += 60_000;
+    expect(b.remaining()).toBe(1_000_000);
+  });
 });
 
 const ROW: RunRow = {

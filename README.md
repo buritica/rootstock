@@ -227,6 +227,13 @@ forward on 0.8.x only: an older line can never ship a migration there.
   had committed before the connection dropped, the retry finds the row
   settled and answers `settled-elsewhere`. Any other failure, or a second
   one, is the result: later calls return it and send nothing.
+- **Start the lock's keepalive for every run.** `startRun` does not start
+  it. A running row whose fencing row has not beaten for
+  `staleHeartbeatSeconds` reads `interrupted` in `verdictFor`, so a run
+  without `lock.startKeepalive()` turns red once it outlives that bound. The
+  config holds `staleHeartbeatSeconds` at no less than the lock's
+  `probeStallSeconds` plus twice its `heartbeatSeconds` (150 for 30 s beats
+  and a 90 s stall); the age is read on the database's clock.
 - **A refused run records no buckets.** `finish("refused")` writes NULL
   buckets and `reconciled` even after `account()`; counters, tokens and cost
   are still recorded.

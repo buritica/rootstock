@@ -101,9 +101,14 @@ export interface JobSnapshot {
 /**
  * A running row as R4 reads it: `live` when its fence still names its holder
  * and the advisory lock is held; `heartbeatAt` the fencing row's last beat
- * while that row names this holder, else null (§20 A9).
+ * and `heartbeatAgeMs` its age on the database's clock, while that row names
+ * this holder, else null (§20 A9, A18).
  */
-export type RunningRow = RunRow & { live: boolean; heartbeatAt: Date | null };
+export type RunningRow = RunRow & {
+  live: boolean;
+  heartbeatAt: Date | null;
+  heartbeatAgeMs: number | null;
+};
 
 export type RunsSnapshot = ReadonlyMap<string, JobSnapshot>;
 
@@ -701,6 +706,10 @@ export async function runsSnapshot(
             ...parseRow(j),
             live: bool(j.live),
             heartbeatAt: date(j.heartbeatAtMs),
+            heartbeatAgeMs:
+              j.heartbeatAgeMs === null || j.heartbeatAgeMs === undefined
+                ? null
+                : Number(j.heartbeatAgeMs),
           }));
     out.set(String(r.job), {
       total: Number(r.total),

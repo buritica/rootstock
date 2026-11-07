@@ -57,6 +57,7 @@ const running = (startedH: number, beatMsAgo: number | null, live = true): Runni
   ...row("running", startedH, null),
   live,
   heartbeatAt: beatMsAgo === null ? null : new Date(NOW - beatMsAgo),
+  heartbeatAgeMs: beatMsAgo,
 });
 const snap = (
   newestSettled: RunRow | null,
@@ -222,6 +223,25 @@ describe("verdictFor", () => {
       verdict: "never-succeeded",
       lastStatus: "interrupted",
       lastAt: lone.heartbeatAt as Date,
+    });
+    // The age is the database's (A18): an app clock ahead of the database
+    // by an hour does not make a beating run stale.
+    const skewed = { ...running(5, 1_000), heartbeatAt: new Date(NOW - H) };
+    expect(verdictFor(snap(ok, ok, [skewed]), BETA, { now: NOW }).verdict).toBe("ok");
+    // A stale running row older than the newest settled row is ignored (A19).
+    const newer = row("failed", 2, 1, { job: "beta-sync" });
+    expect(verdictFor(snap(newer, ok, [running(5, 200_000)]), BETA, { now: NOW })).toEqual(
+      verdictFor(snap(newer, ok, []), BETA, { now: NOW }),
+    );
+    // Of several running rows, the newest stale one is the one judged.
+    const older = running(6, 300_000);
+    const newest = running(4, 200_000);
+    expect(
+      verdictFor(snap(ok, ok, [older, newest, running(3, 1_000)]), BETA, { now: NOW }),
+    ).toEqual({
+      verdict: "interrupted",
+      at: newest.heartbeatAt as Date,
+      graceHours: 0,
     });
     // stale still wins over it.
     const oldOk = row("ok", 31, 30);
