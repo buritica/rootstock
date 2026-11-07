@@ -34,6 +34,21 @@ export const LOCK_HELD_PREDICATE = `EXISTS (
     AND objid = (hashtext($1)::bigint & 4294967295)::oid
 )`;
 
+/**
+ * L9 end a stalled backend, params [name, pid]: terminates `pid` only while it
+ * holds the one-key advisory lock hashtext($1) in this database. No row: that
+ * backend does not hold it. A recovery sends it only for its own last backend.
+ */
+export const L9 = `SELECT pg_terminate_backend(l.pid) AS terminated
+FROM pg_locks l
+WHERE l.pid = $2
+  AND l.locktype = 'advisory'
+  AND l.granted
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND l.objsubid = 1
+  AND l.classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
+  AND l.objid = (hashtext($1)::bigint & 4294967295)::oid`;
+
 /** L7 probe many, params [JSON.stringify(names)]. */
 export const L7 = `SELECT n AS name, ${LOCK_HELD_PREDICATE.replaceAll("$1", "n")} AS held
 FROM jsonb_array_elements_text($1::text::jsonb) AS n`;

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { L1, L3, L6, L7, L8, LOCK_HELD_PREDICATE, tableStatements } from "./statements.ts";
+import { L1, L3, L6, L7, L8, L9, LOCK_HELD_PREDICATE, tableStatements } from "./statements.ts";
 
 /** The contract's §2.4 texts, copied by hand, for `rootstock.run_locks`. */
 const T = `"rootstock"."run_locks"`;
@@ -45,6 +45,18 @@ JOIN jsonb_array_elements_text($1::text::jsonb) WITH ORDINALITY AS b(n, i)
 ORDER BY a.i, b.i`);
   });
 
+  test("L9 is the frozen text, the predicate's key test on one pid", () => {
+    expect(L9).toBe(`SELECT pg_terminate_backend(l.pid) AS terminated
+FROM pg_locks l
+WHERE l.pid = $2
+  AND l.locktype = 'advisory'
+  AND l.granted
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND l.objsubid = 1
+  AND l.classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
+  AND l.objid = (hashtext($1)::bigint & 4294967295)::oid`);
+  });
+
   test("L2, L4, L5 name the table quoted", () => {
     const s = tableStatements({ schema: "rootstock", name: "run_locks" });
     expect(s.fence).toBe(`INSERT INTO ${T} (name, holder, acquired_at, heartbeat_at)
@@ -63,7 +75,7 @@ RETURNING pg_backend_pid() AS pid`);
 
   test("no statement carries a comment or a stray dollar", () => {
     const s = tableStatements({ schema: "a", name: "b" });
-    for (const text of [L1, L3, L6, L7, L8, s.fence, s.claim, s.heartbeat]) {
+    for (const text of [L1, L3, L6, L7, L8, L9, s.fence, s.claim, s.heartbeat]) {
       expect(text).not.toContain("--");
       expect(text.replace(/\$\d+/g, "")).not.toContain("$");
     }

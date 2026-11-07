@@ -34,9 +34,13 @@ export type LockEvent =
       name: string;
       attempt: number;
       reason: "held" | "displaced";
-      /** After a stalled probe: the run's own stalled backend still holds the lock (#41). */
+      /** After a stalled probe: the run's own stalled backend, seen still holding the lock in pg_locks (#41). */
       stalledPid?: number;
     }
+  /** A stalled probe's recovery ended the run's own stalled backend, which still held the lock (#41). */
+  | { type: "lock.stalled_backend_terminated"; name: string; attempt: number; pid: number }
+  /** Ending the run's own stalled backend failed (often a missing privilege); the recovery polls on (#41). */
+  | ({ type: "lock.terminate_failed"; name: string; attempt: number; pid: number } & Err)
   /** A stalled probe's recovery closed the session and opened a fresh one (#41). */
   | { type: "lock.session_replaced"; name: string; attempt: number; previousPid: number }
   | { type: "lock.recovered"; name: string; attempt: number; max: number; pid: number }

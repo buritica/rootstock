@@ -14,6 +14,7 @@ import {
   lockDriver,
   openBunSqlClient,
   openPostgresJsClient,
+  openRaw,
   testUrl,
 } from "./fixtures.pg-support.ts";
 import {
@@ -197,61 +198,65 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     expect((await locksHeld(adminSql, ["stall-a"])).get("stall-a")).toBe(false);
   }, 30_000);
 
-  test("S2: a black-holed backend the server ends during the poll is outwaited", async () => {
+  test("S2: a black-holed backend the server keeps is ended by the recovery, which then takes the lock", async () => {
     const proxy = startProxy();
     const events: LockEvent[] = [];
     const lock = await acquireRunLock(open(proxy.url), slice, "stall-b", deps(events));
     try {
       const old = acquiredPid(events);
       proxy.freeze({ forwardClose: false });
-      let settled = false;
-      const gate = lock.ensureExclusive().finally(() => {
-        settled = true;
-      });
-      // Wait until the fresh session's claim has read the lock held by the
-      // stalled backend, so the poll is what recovers, then the server reaps.
-      const deadline = Date.now() + 15_000;
-      while (!events.some((e) => e.type === "lock.session_replaced") && Date.now() < deadline) {
-        await Bun.sleep(20);
-      }
-      await Bun.sleep(300);
-      expect(settled).toBe(false);
-      expect(await backendAlive(old)).toBe(true);
-      await killBackend(adminSql, old);
-      await gate;
-      expect(events.map((e) => e.type)).toContain("lock.recovered");
       await lock.ensureExclusive();
+      expect(events).toContainEqual({
+        type: "lock.stalled_backend_terminated",
+        name: "stall-b",
+        attempt: 1,
+        pid: old,
+      });
+      expect(events.map((e) => e.type).at(-1)).toBe("lock.recovered");
+      expect(await backendAlive(old)).toBe(false);
+      await lock.ensureExclusive();
+      expect((await locksHeld(adminSql, ["stall-b"])).get("stall-b")).toBe(true);
     } finally {
       await lock.release();
       proxy.stop();
     }
+    expect((await locksHeld(adminSql, ["stall-b"])).get("stall-b")).toBe(false);
   }, 30_000);
 
-  test("S3: a black hole the server does not end within the stall refuses UNVERIFIABLE", async () => {
+  test("S3: a lock another backend took in the gap is left alone: the recovery refuses held", async () => {
     const proxy = startProxy();
     const events: LockEvent[] = [];
     const lock = await acquireRunLock(open(proxy.url), slice, "stall-c", deps(events));
     const old = acquiredPid(events);
+    const other = openRaw();
     try {
       proxy.freeze({ forwardClose: false });
-      let err: unknown;
-      try {
-        await lock.ensureExclusive();
-      } catch (e) {
-        err = e;
-      }
+      const gate = lock.ensureExclusive().then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      // The server reaps the stalled backend and another run's try-lock takes
+      // the lock before it fences, all inside the probe's stall window.
+      await killBackend(adminSql, old);
+      const [taken] = await other.sql.unsafe(
+        "SELECT pg_try_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid",
+        ["stall-c"],
+      );
+      expect(taken?.locked).toBe(true);
+      const err = await gate;
       expect(err).toBeInstanceOf(RootstockLockError);
       expect((err as RootstockLockError).code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
-      expect(events.at(-1)).toMatchObject({
+      expect(events.at(-1)).toEqual({
         type: "lock.recovery_refused",
+        name: "stall-c",
+        attempt: 1,
         reason: "held",
-        stalledPid: old,
       });
-      // The run never held a second level anywhere: only the stalled backend holds it.
-      expect((await locksHeld(adminSql, ["stall-c"])).get("stall-c")).toBe(true);
+      expect(events.map((e) => e.type)).not.toContain("lock.stalled_backend_terminated");
+      expect(await backendAlive(Number(taken?.pid))).toBe(true);
     } finally {
       await lock.release();
-      await killBackend(adminSql, old);
+      await other.end();
       proxy.stop();
     }
     expect((await locksHeld(adminSql, ["stall-c"])).get("stall-c")).toBe(false);

@@ -106,24 +106,34 @@ through. Fix forward with a release, not by reverting the migrations.
 - **Bounded waits.** Every statement the gate sends (the ownership probe and
   each recovery claim) is bounded by `probeStallSeconds`. A probe that does
   not answer in time (a silently dropped socket, a stalled server) spends one
-  of `maxRecoveries`: the lock closes the stalled session (bounded by
-  `endTimeoutSeconds` plus one second), opens a fresh one, emits
-  `lock.session_replaced`, and claims there. While that claim reads the lock
-  held and the fencing row still names this run, the holder is most likely
-  the run's own stalled backend, so the claim is retried every
-  `wait.pollIntervalMs` (even without `opts.wait`) for up to
-  `probeStallSeconds` more. A recovery that fails or stalls makes the gate
-  throw `UNVERIFIABLE`, and every later gate rethrows it; when the run's own
-  backend outlived the poll, `lock.recovery_refused` carries its pid as
-  `stalledPid`. How long a server keeps a dead connection's backend is its
-  TCP keepalive's business, not the lock's. A gate call can now block for
-  about four `probeStallSeconds` plus `endTimeoutSeconds` (probe, close, a
-  claim and its retry, the poll window, its last claim), where 0.6.0 refused
-  after one. A waited acquire bounds its try-lock and fence by what is left
-  of the wait (never less than `probeStallSeconds`) and by its signal.
-  `release()` bounds its unlock by `endTimeoutSeconds` and frees the
-  in-process turn before closing, so a close that hangs never holds the next
-  waiter (the database lock does, until that session ends).
+  of `maxRecoveries`:
+  1. The lock closes the stalled session (bounded by `endTimeoutSeconds` plus
+     one second), opens a fresh one, emits `lock.session_replaced`, and
+     claims there. The keepalive stands down until the recovery ends.
+  2. If the claim reads the lock held and the fencing row still names this
+     run, the holder is most likely the run's own stalled backend: a
+     black-holed connection's backend lives as long as the server's TCP
+     keepalive allows. The lock ends it with `pg_terminate_backend`, only
+     while `pg_locks` shows that backend (the pid the run last held the lock
+     on) holding this name, and emits `lock.stalled_backend_terminated`. The
+     lock role needs the privilege to end its own backends, which a role has
+     by default; without it the lock emits `lock.terminate_failed` and only
+     waits. If `pg_locks` shows another backend holding it, the recovery
+     refuses at once and that backend is left alone.
+  3. The claim is retried every `wait.pollIntervalMs` (at least 100 ms, and
+     even without `opts.wait`) for up to `probeStallSeconds` more.
+
+  A recovery that fails or stalls makes the gate throw `UNVERIFIABLE`, and
+  every later gate rethrows it; when the run's own backend outlived the poll,
+  `lock.recovery_refused` carries its pid as `stalledPid`. A gate call can
+  now block for up to about six `probeStallSeconds` plus `endTimeoutSeconds`
+  (probe, close, a claim and its retry, the terminate, the poll window and
+  its last claim); 0.6.0 refused after one. A waited acquire bounds its
+  try-lock and fence by what is left of the wait (never less than
+  `probeStallSeconds`) and by its signal. `release()` bounds its unlock by
+  `endTimeoutSeconds` and frees the in-process turn before closing, so a
+  close that hangs never holds the next waiter (the database lock does,
+  until that session ends).
 - **`open` must make a new client each call.** It runs once for the acquire
   and once more for each stalled-probe recovery, which closes the session it
   replaces. An `open` that wraps one shared client makes that recovery claim

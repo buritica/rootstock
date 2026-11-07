@@ -5,7 +5,7 @@ import { type Emit, emitter, failure, type LockEvent } from "./events.ts";
 import { lockOwnershipLost } from "./probe.ts";
 import type { LockSession } from "./session.ts";
 import { admits, assertLockSlice, type LockSlice } from "./slice.ts";
-import { L1, L3, L6, type TableStatements, tableStatements } from "./statements.ts";
+import { L1, L3, L6, L9, type TableStatements, tableStatements } from "./statements.ts";
 import { checkWait, type LockWait, pollAcquire } from "./wait.ts";
 
 export interface LockDeps {
@@ -234,6 +234,9 @@ class AfterRelease extends Error {}
  */
 export const CLOSE_MARGIN_MS = 1000;
 
+/** The recovery poll's floor: `wait.pollIntervalMs` may be as low as 10 for a waited acquire. */
+export const RECOVERY_POLL_FLOOR_MS = 100;
+
 /** How a recovery ended: `stalled` carries the timeout that made it unverifiable. */
 type Recovery = "recovered" | "failed" | "released" | { stalled: Error };
 
@@ -243,6 +246,10 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   let session = firstSession;
   /** The session a stalled-probe recovery is closing: nothing on it reports, nothing goes to it. */
   let retired: LockSession | undefined;
+  /** A stalled-probe recovery is moving the lock: the keepalive stands down until it ends. */
+  let replacing = false;
+  /** Whether the current session's backend took the advisory lock (release() unlocks only then). */
+  let holding = true;
   const stallMs = slice.probeStallSeconds * 1000;
   let pid = firstPid;
   let recoveries = 0;
@@ -325,6 +332,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   async function reopen(attempt: number): Promise<"released" | "failed" | undefined> {
     const stale = session;
     retired = stale;
+    holding = false;
     const ms = slice.endTimeoutSeconds * 1000 + CLOSE_MARGIN_MS;
     // One end_failed at most, and none once the bound has fired or release() began.
     let bounded = false;
@@ -365,25 +373,56 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   /**
    * After a stalled probe, a fresh claim that reads the lock held while the
    * fencing row still names this holder is most likely reading this run's own
-   * stalled backend, which the server has not ended yet. The claim is polled
-   * every `wait.pollIntervalMs` until the stall bound has passed. Polling is
-   * safe: a try-lock never takes a lock another backend holds, and a run that
-   * takes it meanwhile fences its own holder, which ends the poll.
+   * stalled backend, which the server has not ended yet (a black-holed
+   * socket can keep it for as long as the server's TCP keepalive allows).
+   * L9 ends that backend, and only while pg_locks shows it, the pid this run
+   * last held the lock on, holding this name. If another run's backend has
+   * taken that pid and the lock between its try-lock and its fence, ending it
+   * makes that run refuse (its fence fails), which is safe. No row: the
+   * holder is not this run's backend, so the poll stops. Then the claim is
+   * polled every `wait.pollIntervalMs` (at least RECOVERY_POLL_FLOOR_MS) until
+   * the stall bound has passed. Polling is safe: a try-lock never takes a lock
+   * another backend holds, and a run that takes it meanwhile fences its own
+   * holder, which ends the poll. `own`: pg_locks showed this run's backend.
    */
   async function outwaitStalledBackend(
     attempt: number,
     first: Row | undefined,
-  ): Promise<{ row: Row | undefined } | { stalled: Error } | "released" | "failed"> {
+  ): Promise<{ row: Row | undefined; own: boolean } | { stalled: Error } | "released" | "failed"> {
     let row = first;
+    const ours = () => row?.locked !== true && row?.holder === holder;
+    if (!ours()) return { row, own: false };
+    const stalledPid = pid;
+    let own = false;
+    try {
+      const ended = await within(deps, run(L9, [name, stalledPid]), stallMs);
+      if (released) return "released";
+      if (ended === "timeout") {
+        const error = stalled(`ending the stalled backend for ${name}`, stallMs);
+        emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
+        return { stalled: error };
+      }
+      if (ended.value.length === 0) return { row, own: false };
+      own = true;
+      if (ended.value[0]?.terminated === true) {
+        emit({ type: "lock.stalled_backend_terminated", name, attempt, pid: stalledPid });
+      }
+    } catch (error) {
+      if (released) return "released";
+      own = true;
+      emit({ type: "lock.terminate_failed", name, attempt, pid: stalledPid, ...failure(error) });
+    }
+    const every = Math.max(slice.wait.pollIntervalMs, RECOVERY_POLL_FLOOR_MS);
     const until = deps.now() + stallMs;
-    while (row?.locked !== true && row?.holder === holder && deps.now() < until) {
-      await pause(deps, Math.min(slice.wait.pollIntervalMs, until - deps.now()));
+    while (ours() && deps.now() < until) {
+      // A broken sleep must not turn the poll into a spin: stop and refuse.
+      if (!(await pause(deps, Math.min(every, until - deps.now())))) break;
       if (released) return "released";
       const next = await claim(attempt, false);
       if (typeof next === "string" || "stalled" in next) return next;
       row = next.row;
     }
-    return { row };
+    return { row, own };
   }
 
   /**
@@ -438,20 +477,33 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     }
     recoveries += 1;
     const attempt = recoveries;
-    if (probe === "stalled") {
+    if (probe !== "stalled") return settle(probe, attempt, await claim(attempt, true), false);
+    replacing = true;
+    try {
       const reopened = await reopen(attempt);
       if (reopened !== undefined) return reopened;
+      const claimed = await claim(attempt, true);
+      if (typeof claimed === "string" || "stalled" in claimed) return claimed;
+      const outwaited = await outwaitStalledBackend(attempt, claimed.row);
+      if (typeof outwaited === "string" || "stalled" in outwaited) return outwaited;
+      return await settle(probe, attempt, outwaited, outwaited.own);
+    } finally {
+      replacing = false;
     }
-    let claimed = await claim(attempt, true);
-    if (probe === "stalled" && typeof claimed !== "string" && "row" in claimed) {
-      claimed = await outwaitStalledBackend(attempt, claimed.row);
-    }
+  }
+
+  /** Steps 4-7 of a recovery: what the claim's row means. `own`: the holder is this run's stalled backend. */
+  async function settle(
+    probe: "lost" | "rejected" | "stalled",
+    attempt: number,
+    claimed: { row: Row | undefined } | { stalled: Error } | "released" | "failed",
+    own: boolean,
+  ): Promise<Recovery> {
     if (typeof claimed === "string" || "stalled" in claimed) return claimed;
     const { row } = claimed;
     if (row?.locked !== true) {
-      // After a stalled probe, a holder still naming this run is the run's
-      // own stalled backend, which outlived the poll: say which one.
-      const own = probe === "stalled" && row?.holder === holder;
+      // A holder pg_locks showed is this run's own stalled backend: say which one.
+      own = own && row?.holder === holder;
       emit({
         type: "lock.recovery_refused",
         name,
@@ -464,8 +516,11 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Taking the lock again says nothing about the gap: only a fencing row
     // still naming this holder proves no other run took it meanwhile. The
     // advisory lock just taken is not ours to keep, so it goes now.
+    holding = true;
     if (row.holder !== holder) {
       await unlock(stallMs);
+      holding = false;
+      if (released) return "released";
       emit({ type: "lock.recovery_refused", name, attempt, reason: "displaced" });
       return "failed";
     }
@@ -473,7 +528,8 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned before any further await, so a keepalive tick that reads the
     // new backend compares against it.
     pid = Number(row.pid);
-    if (probe === "rejected" && pid === before) {
+    // A rejected claim retried on a fresh session may have stacked a level too.
+    if ((probe === "rejected" && pid === before) || probe === "stalled") {
       const stall = await undoStackedLevel();
       if (released) return "released";
       if (stall !== undefined) return { stalled: stall };
@@ -522,7 +578,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   }
 
   function tick(): void {
-    if (released || terminal !== undefined) return;
+    if (released || terminal !== undefined || replacing) return;
     const done = begin();
     if (done === null) return;
     const asked = pid;
@@ -590,7 +646,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
       try {
         stopKeepalive();
         // A session a failed recovery already closed holds nothing to unlock.
-        if (session !== retired) await unlock(slice.endTimeoutSeconds * 1000);
+        if (holding) await unlock(slice.endTimeoutSeconds * 1000);
       } finally {
         // The turn goes as soon as L6 is done or out of time: a close that
         // hangs must not hold the next waiter (the database lock still does,
