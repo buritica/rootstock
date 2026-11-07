@@ -292,6 +292,7 @@ describe("RC1: the runs print", () => {
       prices: {
         "model-a": { inputPerMTok: 0.1, outputPerMTok: 0.4 },
         "model-b": { inputPerMTok: 1.25, outputPerMTok: 10 },
+        "model-c": { inputPerMTok: 0.7, outputPerMTok: 0 },
       },
       quarantine: null,
       retention: { keepDays: 30 },
