@@ -930,8 +930,12 @@ describe("runsSnapshot and pruneRuns", () => {
         newest_settled: JSON.stringify(row({ status: "failed", job: "delta:one" })),
         newest_ok: null,
         running: JSON.stringify([
-          { ...row({ status: "running", finishedAtMs: null }), live: true },
-          { ...row({ status: "running", finishedAtMs: null, id: "x" }), live: false },
+          { ...row({ status: "running", finishedAtMs: null }), live: true, heartbeatAtMs: "5000" },
+          {
+            ...row({ status: "running", finishedAtMs: null, id: "x" }),
+            live: false,
+            heartbeatAtMs: null,
+          },
         ]),
       },
       { job: "beta-sync", total: "0", newest_settled: null, newest_ok: null, running: null },
@@ -944,9 +948,9 @@ describe("runsSnapshot and pruneRuns", () => {
     expect(d?.newestSettled?.status).toBe("failed");
     expect(d?.newestSettled?.finishedAt).toEqual(new Date(2000));
     expect(d?.newestOk).toBeNull();
-    expect(d?.running.map((r) => [r.id, r.live, r.finishedAt])).toEqual([
-      [ID, true, null],
-      ["x", false, null],
+    expect(d?.running.map((r) => [r.id, r.live, r.finishedAt, r.heartbeatAt])).toEqual([
+      [ID, true, null, new Date(5000)],
+      ["x", false, null, null],
     ]);
     expect(snap.get("beta-sync")).toEqual({
       total: 0,
@@ -1071,6 +1075,7 @@ SELECT EXISTS (SELECT 1 FROM ins) AS inserted,
 WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status = 'running'
 RETURNING <P(r)>::text AS row`,
     R3: "DELETE FROM <R> WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok",
+    // R4 as amended by §20 A9: each running row also carries its fence's last beat.
     R4: `SELECT j.job,
   (SELECT count(*) FROM <R> r WHERE r.job = j.job)::text AS total,
   (SELECT <P(r)> FROM <R> r WHERE r.job = j.job AND r.status <> 'running'
@@ -1079,7 +1084,9 @@ RETURNING <P(r)>::text AS row`,
      ORDER BY r.started_at DESC, r.id DESC LIMIT 1)::text AS newest_ok,
   (SELECT jsonb_agg(<P(r)> || jsonb_build_object('live',
             EXISTS (SELECT 1 FROM <L> l WHERE l.name = r.lock_name AND l.holder = r.holder)
-            AND <HELD(r.lock_name)>)
+            AND <HELD(r.lock_name)>,
+            'heartbeatAtMs', (SELECT floor(extract(epoch FROM l.heartbeat_at) * 1000)::text
+              FROM <L> l WHERE l.name = r.lock_name AND l.holder = r.holder))
           ORDER BY r.started_at, r.id)
      FROM <R> r WHERE r.job = j.job AND r.status = 'running')::text AS running
 FROM jsonb_array_elements_text($1::text::jsonb) WITH ORDINALITY AS j(job, i)

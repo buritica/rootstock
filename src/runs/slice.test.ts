@@ -36,6 +36,7 @@ describe("runsSlice", () => {
       metered: true,
       maxAgeHours: 24,
       interruptedGraceHours: 2,
+      staleHeartbeatSeconds: 120,
       push: null,
       counters: { archived: "archived", written: "written" },
       spike: { share: 0.1, allowance: 50 },
@@ -123,6 +124,27 @@ describe("runsSlice", () => {
         [],
         -0.5,
         `${J}.interruptedGraceHours must be a finite number from 0 to maxAgeHours (24) — got -0.5`,
+      ],
+      [
+        "staleHeartbeatSeconds ≥ 10",
+        ["jobs", "alpha-sync", "staleHeartbeatSeconds"],
+        [10],
+        9,
+        `${J}.staleHeartbeatSeconds must be an integer from 10 to 86400 — got 9`,
+      ],
+      [
+        "staleHeartbeatSeconds ≤ 86400",
+        ["jobs", "alpha-sync", "staleHeartbeatSeconds"],
+        [86_400],
+        86_401,
+        `${J}.staleHeartbeatSeconds must be an integer from 10 to 86400 — got 86401`,
+      ],
+      [
+        "staleHeartbeatSeconds integer",
+        ["jobs", "alpha-sync", "staleHeartbeatSeconds"],
+        [],
+        60.5,
+        `${J}.staleHeartbeatSeconds must be an integer from 10 to 86400 — got 60.5`,
       ],
       [
         "push.maxAgeHours",
@@ -385,6 +407,7 @@ describe("runsSlice", () => {
       "metered",
       "maxAgeHours",
       "interruptedGraceHours",
+      "staleHeartbeatSeconds",
     ]) {
       test(`jobs.*.${key}`, () =>
         expect(refuses(["jobs", "beta-sync", key], undefined)).toBe(

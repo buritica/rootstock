@@ -1,3 +1,5 @@
+export { type Budget, proportionalBrake, scopeGuard, windowedBudget } from "./brakes.ts";
+export { type Breaker, consecutiveBreaker } from "./breaker.ts";
 export { RootstockRunsError, type RunsErrorCode, runsErrorCode } from "./errors.ts";
 export type {
   BrakeJudgement,
@@ -35,3 +37,4 @@ export {
   type RunsSliceInput,
   runsSlice,
 } from "./slice.ts";
+export { type PushVerdict, pushVerdictFor, type Verdict, verdictFor } from "./verdict.ts";

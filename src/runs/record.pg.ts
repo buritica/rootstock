@@ -218,8 +218,14 @@ describe("record", () => {
         overrides: [],
         reason: null,
         live: true,
+        heartbeatAt: expect.any(Date),
       },
     ]);
+    // heartbeatAt is the fencing row's last beat, read as epoch-ms text (§20 A9).
+    const [beat] = await sql.unsafe(
+      `SELECT floor(extract(epoch FROM heartbeat_at) * 1000)::text AS ms FROM ${env.L} WHERE name = 'alpha-sync'`,
+    );
+    expect(during?.running[0]?.heartbeatAt).toEqual(new Date(Number(beat?.ms)));
     run.count("seen", 10);
     run.count("archived", 2);
     run.meter("model-a", 1000, 2000, { estimated: true });
@@ -335,8 +341,8 @@ describe("record", () => {
     const live = async () =>
       (await runsSnapshot(sql, env.runs, ["alpha-sync"]))
         .get("alpha-sync")
-        ?.running.map((r) => [r.id, r.live]);
-    expect(await live()).toEqual([[run.id, true]]);
+        ?.running.map((r) => [r.id, r.live, r.heartbeatAt === null]);
+    expect(await live()).toEqual([[run.id, true, false]]);
     const pid = await holderPid("alpha-sync");
     expect(pid).toBeDefined();
     await killBackend(sql, pid as number);
@@ -346,12 +352,13 @@ describe("record", () => {
       `SELECT holder::text AS holder FROM ${env.L} WHERE name = 'alpha-sync'`,
     );
     expect(fence?.holder).toBe(first.holder);
-    expect(await live()).toEqual([[run.id, false]]);
+    // Not live, but the fence still names the holder, so its last beat is read.
+    expect(await live()).toEqual([[run.id, false, false]]);
     const second = await env.acquire("alpha-sync");
     expect((await locksHeld(sql, ["alpha-sync"])).get("alpha-sync")).toBe(true);
     expect(second.holder).not.toBe(first.holder);
-    // Held again, but the fence names the new holder.
-    expect(await live()).toEqual([[run.id, false]]);
+    // Held again, but the fence names the new holder: no beat of its own.
+    expect(await live()).toEqual([[run.id, false, true]]);
   });
 
   test("RD4: kill -9 mid-run; the next start settles the child's row; the batch never commits", async () => {
@@ -579,7 +586,9 @@ describe("record", () => {
     // shared-write is held and fenced by a live holder; the zero holder is still not live.
     await env.acquire("shared-write");
     const beta = (await runsSnapshot(sql, env.runs, ["beta-sync"])).get("beta-sync");
-    expect(beta?.running.map((r) => [r.id, r.live])).toEqual([[copiedRunning, false]]);
+    expect(beta?.running.map((r) => [r.id, r.live, r.heartbeatAt])).toEqual([
+      [copiedRunning, false, null],
+    ]);
     const before = (await runsSnapshot(sql, env.runs, ["alpha-sync"])).get("alpha-sync")?.newestOk;
     expect(before?.id).toBe(history);
     const lock = await env.acquire("alpha-sync");

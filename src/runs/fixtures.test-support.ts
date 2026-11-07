@@ -11,6 +11,7 @@ export const RUNS_INPUT: RunsSliceInput = {
       metered: true,
       maxAgeHours: 24,
       interruptedGraceHours: 2,
+      staleHeartbeatSeconds: 120,
       counters: { archived: "archived", written: "written" },
       spike: { share: 0.1, allowance: 50 },
     },
@@ -21,6 +22,7 @@ export const RUNS_INPUT: RunsSliceInput = {
       metered: false,
       maxAgeHours: null,
       interruptedGraceHours: null,
+      staleHeartbeatSeconds: 120,
     },
     "gamma-push": {
       lock: "shared-write",
@@ -29,6 +31,7 @@ export const RUNS_INPUT: RunsSliceInput = {
       metered: true,
       maxAgeHours: 6,
       interruptedGraceHours: 1,
+      staleHeartbeatSeconds: 120,
       push: { maxAgeHours: 6, heartbeat: true },
     },
     "delta:*": {
@@ -38,6 +41,7 @@ export const RUNS_INPUT: RunsSliceInput = {
       metered: false,
       maxAgeHours: null,
       interruptedGraceHours: null,
+      staleHeartbeatSeconds: 120,
     },
   },
   prices: {

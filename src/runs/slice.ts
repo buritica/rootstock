@@ -22,6 +22,12 @@ export interface JobDeclInput {
   maxAgeHours: number | null;
   /** Required non-null iff maxAgeHours is non-null; ≤ maxAgeHours. */
   interruptedGraceHours: number | null;
+  /**
+   * A running row whose fencing row has not beaten for longer than this reads
+   * interrupted in `verdictFor` (§20 A9); 10–86 400. The config invariant
+   * holds it at ≥ 2 × the lock slice's heartbeatSeconds.
+   */
+  staleHeartbeatSeconds: number;
   /** `heartbeat` is the consumer's paging rule (rootstock does not read it); printed. */
   push?: { maxAgeHours: number; heartbeat: boolean };
   /** rootstock reads `archived` only (the spike); the others are declared for the consumer's own rendering and printed. */
@@ -64,6 +70,7 @@ export interface JobDecl {
   readonly metered: boolean;
   readonly maxAgeHours: number | null;
   readonly interruptedGraceHours: number | null;
+  readonly staleHeartbeatSeconds: number;
   readonly push: { readonly maxAgeHours: number; readonly heartbeat: boolean } | null;
   /** {} when omitted; each key present only when declared. */
   readonly counters: {
@@ -145,6 +152,7 @@ const JOB_KEYS: ReadonlySet<string> = new Set([
   "metered",
   "maxAgeHours",
   "interruptedGraceHours",
+  "staleHeartbeatSeconds",
   "push",
   "counters",
   "spike",
@@ -156,6 +164,7 @@ const JOB_REQUIRED = [
   "metered",
   "maxAgeHours",
   "interruptedGraceHours",
+  "staleHeartbeatSeconds",
 ] as const;
 const PUSH_KEYS: ReadonlySet<string> = new Set(["maxAgeHours", "heartbeat"]);
 const COUNTER_KEYS = ["archived", "written", "coverage", "held"] as const;
@@ -343,6 +352,13 @@ function parseJob(key: string, raw: unknown, modes: readonly string[]): JobDecl 
     }
     interruptedGraceHours = rawGrace;
   }
+  const staleHeartbeatSeconds = bounded(
+    refuse,
+    `${at}.staleHeartbeatSeconds`,
+    own(f, "staleHeartbeatSeconds"),
+    10,
+    86_400,
+  );
   const rawPush = own(f, "push");
   let push: JobDecl["push"] = null;
   if (rawPush !== undefined) {
@@ -391,6 +407,7 @@ function parseJob(key: string, raw: unknown, modes: readonly string[]): JobDecl 
     metered,
     maxAgeHours,
     interruptedGraceHours,
+    staleHeartbeatSeconds,
     push,
     counters: Object.freeze(counters),
     spike,
