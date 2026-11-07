@@ -271,6 +271,17 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
     if (done === "timeout") throw stalled(what, stall);
     return done.value;
   };
+  /** L6 on the session, bounded by the stall; a failure or stall is reported, never thrown. */
+  const unlockBounded = async (): Promise<void> => {
+    try {
+      const unlocked = await within(deps, (session as LockSession).sql.unsafe(L6, [name]), stall);
+      if (unlocked === "timeout") {
+        emit({ type: "lock.unlock_failed", name, ...failure(stalled(`unlocking ${name}`, stall)) });
+      }
+    } catch (error) {
+      emit({ type: "lock.unlock_failed", name, ...failure(error) });
+    }
+  };
   try {
     const queued = await awaitTurn(a, turn.ahead, deadline, signal);
     if (queued === "aborted") throw refused(a, refusals.abandoned(name, report("aborted")));
@@ -295,8 +306,7 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
       } catch (err) {
         // Off Linux the server refuses the connection check (22023): block
         // without it; an abort still ends the backend through destroy().
-        const code = pgCode(err);
-        if (code !== "22023" && code !== "42704") throw err;
+        if (pgCode(err) !== "22023") throw err;
         checked = false;
         emit({ type: "lock.connection_check_unavailable", name });
         await bounded(B1L, [`${remainingMs}ms`], `the settings for ${name}`);
@@ -324,8 +334,10 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
       throw refused(a, refusals.abandoned(name, report("aborted")));
     }
     if (blocked === "timeout") {
-      // The server did not honour lock_timeout.
-      return await giveUp("timeout", (ms) => refusals.heldAfterWait(name, ms));
+      // The server did not honour lock_timeout: B2 is still in flight, so the
+      // socket goes now rather than after it (§20 A33).
+      await destroyQuietly(a, take());
+      throw refused(a, refusals.heldAfterWait(name, report("timeout")));
     }
     const [row] = blocked.value;
     if (row?.locked !== true) {
@@ -337,11 +349,7 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
     }
     if (signal?.aborted) {
       // The last-grant race: never hand out a lock granted after the abort.
-      try {
-        await session.sql.unsafe(L6, [name]);
-      } catch (error) {
-        emit({ type: "lock.unlock_failed", name, ...failure(error) });
-      }
+      await unlockBounded();
       return await giveUp("aborted", (ms) => refusals.abandoned(name, ms));
     }
 
@@ -352,26 +360,24 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
         `restoring the settings for ${name}`,
       );
     } catch (err) {
-      try {
-        const unlocked = await within(deps, session.sql.unsafe(L6, [name]), stall);
-        if (unlocked === "timeout") {
-          emit({
-            type: "lock.unlock_failed",
-            name,
-            ...failure(stalled(`unlocking ${name}`, stall)),
-          });
-        }
-      } catch (error) {
-        emit({ type: "lock.unlock_failed", name, ...failure(error) });
-      }
-      return await fail(err);
+      await unlockBounded();
+      // A stalled B3 may still be in flight: the socket goes now (§20 A33).
+      await destroyQuietly(a, take());
+      report("error");
+      throw err;
     }
 
     report("acquired");
-    return await fence(a, take(), pid, {
+    const lock = await fence(a, take(), pid, {
       ms: () => stall,
       refusal: (_why, cause) => refusals.unfenced(slice, name, cause),
     });
+    if (signal?.aborted) {
+      // The abort landed during B3 or the fence: the lock goes back (§20 A31).
+      await lock.release();
+      throw refused(a, refusals.abandoned(name, deps.now() - start));
+    }
+    return lock;
   } catch (err) {
     // Any throw the paths above did not plan for (a throwing clock, a broken
     // hook into the driver) still closes the session and frees the turn.

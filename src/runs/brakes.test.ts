@@ -442,6 +442,20 @@ describe("scopeGuard", () => {
     );
   });
 
+  test("RB8: missing opts or an undefined previous refuse INPUT, not a TypeError", () => {
+    const missing = thrown(() =>
+      scopeGuard("alpha-sync", ROW, { items: ["a"] }, undefined as never),
+    );
+    expect(missing.code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
+    expect(missing.message).toBe(
+      "rootstock runs: scopeGuard(alpha-sync): opts must be { allowShrink, allowNewExclusions, firstRun } — got undefined",
+    );
+    const undef = thrown(() =>
+      scopeGuard("alpha-sync", undefined as never, { items: ["a"] }, NONE),
+    );
+    expect(undef.code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
+  });
+
   test("RB8: a non-ok previous row (running or failed) refuses INPUT", () => {
     for (const status of ["running", "failed"] as const) {
       const err = thrown(() =>

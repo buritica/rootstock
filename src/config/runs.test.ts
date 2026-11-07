@@ -25,11 +25,11 @@ type LockInput = NonNullable<RootstockConfigInput["lock"]>;
 const LOCK: LockInput = {
   profile: "lock",
   names: ["alpha-sync", "shared-write", "delta:*"],
-  heartbeatSeconds: 30,
-  // 60 + 2 × 30 = 120, the fixtures' staleHeartbeatSeconds: exactly the floor (A17).
-  probeStallSeconds: 60,
+  heartbeatSeconds: 10,
+  // 4 × 20 + 20 + 2 × 10 = 120, the fixtures' staleHeartbeatSeconds: exactly the floor (A30).
+  probeStallSeconds: 20,
   maxRecoveries: 5,
-  endTimeoutSeconds: 5,
+  endTimeoutSeconds: 20,
   wait: { maxMs: 30000, pollIntervalMs: 1000 },
 };
 
@@ -181,15 +181,22 @@ describe("RC2: the runs built-in invariants", () => {
     ).not.toThrow();
   });
 
-  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ probeStallSeconds + 2 × heartbeatSeconds (A17)", () => {
+  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ 4 × probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds (A30)", () => {
     expect(() =>
-      defineRootstockConfig(input({ lock: { heartbeatSeconds: 20, probeStallSeconds: 80 } })),
+      defineRootstockConfig(
+        input({ lock: { heartbeatSeconds: 5, probeStallSeconds: 25, endTimeoutSeconds: 10 } }),
+      ),
     ).not.toThrow();
     const { jobs } = withJob("beta-sync", { staleHeartbeatSeconds: 121 });
     expect(
-      failure(input({ lock: { heartbeatSeconds: 20, probeStallSeconds: 81 }, runs: { jobs } })),
+      failure(
+        input({
+          lock: { heartbeatSeconds: 5, probeStallSeconds: 25, endTimeoutSeconds: 11 },
+          runs: { jobs },
+        }),
+      ),
     ).toBe(
-      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted during a stalled probe",
+      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, 4 × the lock slice's probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds: a live run would read interrupted during a lock recovery",
     );
   });
 

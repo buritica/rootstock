@@ -69,3 +69,14 @@ export function runsInput(path: readonly string[] = [], value?: unknown): RunsSl
   else node[last] = value;
   return copy as unknown as RunsSliceInput;
 }
+
+/**
+ * RUNS_INPUT with every job's staleHeartbeatSeconds set to `seconds`, for a
+ * config whose lock slice puts the runs-stale-heartbeat floor above 120.
+ */
+export function runsInputWithStaleHeartbeat(seconds: number): RunsSliceInput {
+  const copy = runsInput();
+  const jobs = copy.jobs as unknown as Record<string, Record<string, unknown>>;
+  for (const job of Object.values(jobs)) job.staleHeartbeatSeconds = seconds;
+  return copy;
+}

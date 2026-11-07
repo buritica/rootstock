@@ -5,7 +5,7 @@ import { lockSlice } from "../lock/index.ts";
 import { migrateSlice } from "../migrate/index.ts";
 import { QUEUE_INPUT } from "../queue/fixtures.test-support.ts";
 import { queueSlice } from "../queue/index.ts";
-import { RUNS_INPUT } from "../runs/fixtures.test-support.ts";
+import { runsInputWithStaleHeartbeat } from "../runs/fixtures.test-support.ts";
 import { runsSlice } from "../runs/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
@@ -180,7 +180,10 @@ const exampleWithEverySlice: RootstockConfigInput = {
     ...(exampleWithLockAndQueue.lock as NonNullable<RootstockConfigInput["lock"]>),
     names: ["alpha-sync", "gamma-*", "shared-write", "delta:*"],
   },
-  runs: { ...RUNS_INPUT, quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 } },
+  runs: {
+    ...runsInputWithStaleHeartbeat(400),
+    quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 },
+  },
 };
 
 const EXAMPLE_LOCK_QUEUE_PRINT = `{

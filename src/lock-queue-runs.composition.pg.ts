@@ -19,7 +19,7 @@ import {
 import { schemaFactory } from "./migrate/fixtures.pg-support.ts";
 import { applyMigrations, migrationStatus, rootstockSource } from "./migrate/index.ts";
 import { ack, claim, enqueue, type QueueSlice } from "./queue/index.ts";
-import { RUNS_INPUT } from "./runs/fixtures.test-support.ts";
+import { runsInputWithStaleHeartbeat } from "./runs/fixtures.test-support.ts";
 import {
   jobDecl,
   pendingQuarantine,
@@ -128,7 +128,10 @@ describe("lock, queue and runs composed (§13.11)", () => {
         wait: { maxMs: 0, pollIntervalMs: 10 },
       },
       queue: QUEUE,
-      runs: { ...RUNS_INPUT, quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 } },
+      runs: {
+        ...runsInputWithStaleHeartbeat(400),
+        quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 },
+      },
     });
     expect(config.invariants).toEqual([
       "lock-profile-single",

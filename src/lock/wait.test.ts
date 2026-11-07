@@ -686,8 +686,8 @@ describe("block mode (w4d §8.1)", () => {
     expect([s.closes, s.destroys]).toEqual([1, 0]);
   });
 
-  test("A15: B1 refused 22023 or 42704 blocks without the connection check, emits once, restores lock_timeout only", async () => {
-    for (const code of ["22023", "42704"]) {
+  test("A15: B1 refused 22023 blocks without the connection check, emits once, restores lock_timeout only", async () => {
+    for (const code of ["22023"]) {
       const s = fakeSession();
       s.answer("B0", [{ lt: "5s", cc: "0" }]);
       s.answer("B1", pgError(code, "client_connection_check_interval must be set to 0"));
@@ -712,14 +712,16 @@ describe("block mode (w4d §8.1)", () => {
       });
       await lock.release();
     }
-    // Any other B1 failure is still an error, rethrown untouched.
-    const s = fakeSession();
-    const boom = pgError("42501");
-    s.answer("B1", boom);
-    const deps = fakeDeps();
-    expect(await blocker(deps, {}, s).acquire.catch((e) => e)).toBe(boom);
-    expect(s.seen).toEqual(["B0", "B1"]);
-    expect(outcomes(deps.events)).toEqual(["wait:block:error"]);
+    // Any other B1 failure, 42704 included (§20 A34), is still an error, rethrown untouched.
+    for (const code of ["42501", "42704"]) {
+      const s = fakeSession();
+      const boom = pgError(code);
+      s.answer("B1", boom);
+      const deps = fakeDeps();
+      expect(await blocker(deps, {}, s).acquire.catch((e) => e)).toBe(boom);
+      expect(s.seen).toEqual(["B0", "B1"]);
+      expect(outcomes(deps.events)).toEqual(["wait:block:error"]);
+    }
   });
 
   test("an abort during the settings refuses ABANDONED without sending B2", async () => {
@@ -894,7 +896,8 @@ describe("block mode (w4d §8.1)", () => {
     const err = await refusal(w.acquire);
     expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
     expect(err.waitedMs).toBe(500 + STALL);
-    expect([s.closes, s.destroys]).toEqual([1, 0]);
+    // B2 is still in flight, so the socket goes now (§20 A33).
+    expect([s.closes, s.destroys]).toEqual([0, 1]);
     expect(outcomes(deps.events)).toEqual(["wait:block:timeout", "ERR_ROOTSTOCK_LOCK_HELD"]);
   });
 
@@ -933,14 +936,14 @@ describe("block mode (w4d §8.1)", () => {
     }
   });
 
-  test("B3 rejecting or stalling unlocks, closes, reports error, and rethrows; nothing is fenced", async () => {
+  test("B3 rejecting or stalling unlocks, destroys, reports error, and rethrows; nothing is fenced (A33)", async () => {
     const s = fakeSession();
     const boom = pgError("08006");
     s.answer("B3", boom);
     const deps = fakeDeps();
     expect(await caught(blocker(deps, {}, s).acquire)).toBe(boom);
     expect(s.seen).toEqual(["B0", "B1", "B2", "B3", "L6"]);
-    expect(s.closes).toBe(1);
+    expect([s.closes, s.destroys]).toEqual([0, 1]);
     expect(outcomes(deps.events)).toEqual(["wait:block:error"]);
 
     const hung = fakeSession();
@@ -955,8 +958,24 @@ describe("block mode (w4d §8.1)", () => {
       "rootstock lock: restoring the settings for alpha-sync did not settle within 60000 ms",
     );
     expect(hung.seen).toEqual(["B0", "B1", "B2", "B3", "L6"]);
-    expect(hung.closes).toBe(1);
+    expect([hung.closes, hung.destroys]).toEqual([0, 1]);
     expect(outcomes(md.events)).toEqual(["lock.unlock_failed", "wait:block:error"]);
+  });
+
+  test("an abort during B3 or the fence gives the lock back and refuses ABANDONED (A31)", async () => {
+    for (const at of ["B3", "L2"] as const) {
+      const s = fakeSession();
+      const ac = new AbortController();
+      s.answer(at, () => {
+        ac.abort();
+        return at === "B3" ? [{ lt: "", cc: "" }] : [{ pid: PID }];
+      });
+      const deps = fakeDeps();
+      const err = await refusal(blocker(deps, { signal: ac.signal }, s).acquire);
+      expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+      expect(s.seen.slice(-2)).toEqual(["L2", "L6"]);
+      expect(s.closes).toBe(1);
+    }
   });
 
   test("the fence is bounded by the stall: a hung L2 refuses UNFENCED", async () => {

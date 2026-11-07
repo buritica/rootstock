@@ -172,7 +172,12 @@ forward on 0.8.x only: an older line can never ship a migration there.
   waiter whose client vanished stays queued until `lock_timeout`. A
   role-level `statement_timeout` shorter than the wait ends the wait as an
   error, not `HELD`. A session wrapper that spreads a shipped session and
-  overrides only `close` is skipped on abort: wrap `destroy` too.
+  overrides only `close` is skipped on abort: wrap `destroy` too. Block
+  mode needs PostgreSQL 14 or later. On a server that refuses the connection
+  check, `lock.connection_check_unavailable` fires on every block wait; that
+  is expected there. An abort that lands while the session is still opening
+  or setting up is honoured once that step returns (bounded by
+  `probeStallSeconds`), not at once.
 - **`open` must make a new client each call.** It runs once for the acquire
   and once more for each stalled-probe recovery, which closes the session it
   replaces. An `open` that wraps one shared client makes that recovery claim
@@ -237,9 +242,18 @@ forward on 0.8.x only: an older line can never ship a migration there.
   it. A running row whose fencing row has not beaten for
   `staleHeartbeatSeconds` reads `interrupted` in `verdictFor`, so a run
   without `lock.startKeepalive()` turns red once it outlives that bound. The
-  config holds `staleHeartbeatSeconds` at no less than the lock's
-  `probeStallSeconds` plus twice its `heartbeatSeconds` (150 for 30 s beats
-  and a 90 s stall); the age is read on the database's clock.
+  config holds `staleHeartbeatSeconds` at no less than 4 × the lock's
+  `probeStallSeconds` + `endTimeoutSeconds` + 2 × `heartbeatSeconds` (365 for
+  30 s beats, a 60 s stall and a 5 s end timeout), so a run that survives a
+  stalled-probe recovery never reads red; the age is read on the database's
+  clock.
+- **Two kinds of `interrupted`.** `verdictFor` reads `interrupted` both for a
+  settled `interrupted` row and for a row still `running` whose heartbeat
+  went stale (its `at` is the last beat). Looking for the second with
+  `status = 'interrupted'` finds nothing: look at the job's `running` rows.
+  A running row whose fencing row was taken by something that never calls
+  `startRun` has no heartbeat to judge and is not counted; only the next
+  `startRun` under that lock settles it.
 - **A refused run records no buckets.** `finish("refused")` writes NULL
   buckets and `reconciled` even after `account()`; counters, tokens and cost
   are still recorded.

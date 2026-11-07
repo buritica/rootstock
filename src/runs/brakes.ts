@@ -200,7 +200,19 @@ export function scopeGuard(
   deps?: Pick<RunsDeps, "onEvent">,
 ): ScopeJudgement {
   const fn = `scopeGuard(${job})`;
-  if (previous !== null && previous?.status !== "ok") {
+  if (typeof opts !== "object" || opts === null) {
+    throw refusals.input(
+      `${fn}: opts must be { allowShrink, allowNewExclusions, firstRun } — got ${q(opts)}`,
+      job,
+    );
+  }
+  if (previous === undefined) {
+    throw refusals.input(
+      `${fn}: previous must be the job's newest ok row or null — got undefined`,
+      job,
+    );
+  }
+  if (previous !== null && previous.status !== "ok") {
     throw refusals.input(
       `${fn}: previous must be the job's newest ok row — got status ${previous?.status}`,
       job,
