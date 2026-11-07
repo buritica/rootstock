@@ -14,14 +14,13 @@ import {
   type MigrateEvent,
 } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
+import { ROOTSTOCK_FILES } from "./fixtures.pg-support.ts";
 import type { MigrationKind } from "./marker.ts";
-import { rootstockMigrations } from "./migrations.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { drizzleTracker, filenameTracker, type TrackedSource } from "./tracked.ts";
 
 // rootstock's own files, then the three app files every world carries.
-const ROOTSTOCK_FILES = rootstockMigrations().map((m) => m.filename);
 const TOTAL = ROOTSTOCK_FILES.length + 3;
 
 // applyMigrations against a real Postgres, once per transactor kind. Every

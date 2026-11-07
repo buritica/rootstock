@@ -1,5 +1,6 @@
-// The pieces every slice parser shares: refusal texts, own-property reads and
-// the brand registry. Internal: no package.json subpath exports this file.
+// The pieces the subpaths share: refusal texts, own-property reads, the brand
+// registry, integer bounds, the identifier rule and the safe hook call.
+// Internal: no package.json subpath exports this file.
 
 /**
  * The `got …` part of a refusal: `JSON.stringify(value)`, except that NaN and
@@ -24,7 +25,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 // Own properties only, so an inherited key can neither satisfy a required
 // field nor slip past the unknown-key check.
-export function own(record: Record<string, unknown>, key: string): unknown {
+export function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
   return Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
@@ -91,16 +92,111 @@ export function sliceBrand<T extends object>(type: string, parser: string): Bran
   };
 }
 
+/** True when `v` is an integer from `min` to `max`. */
+export function intIn(v: unknown, min: number, max: number): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/** `value` when it is an integer from `min` to `max`, else the refusal naming both. */
+export function bounded(
+  refuse: SliceRefusals,
+  path: string,
+  value: unknown,
+  min: number,
+  max: number,
+): number {
+  if (!intIn(value, min, max)) {
+    throw refuse.invalid(path, `an integer from ${min} to ${max}`, value);
+  }
+  return value;
+}
+
+/**
+ * Calls `hook` with `arg`, if there is one. What it throws is dropped, and so
+ * is the rejection of a thenable it returns, so a hook can never change what
+ * its caller does, nor become an unhandled rejection.
+ */
+export function safeHook<A>(hook: ((arg: A) => unknown) | undefined, arg: A): void {
+  try {
+    const out: unknown = hook?.(arg);
+    if (typeof (out as PromiseLike<unknown> | undefined)?.then === "function") {
+      (out as PromiseLike<unknown>).then(undefined, () => undefined);
+    }
+  } catch {
+    // Dropped, as above.
+  }
+}
+
+/**
+ * `err.code` when it is one of `codes`, else undefined. By `code`, so it
+ * survives two module copies; a `code` getter that throws reads as none.
+ */
+export function codeIn<C extends string>(codes: ReadonlySet<C>, err: unknown): C | undefined {
+  try {
+    const code = (err as { code?: unknown } | null)?.code;
+    return typeof code === "string" && codes.has(code as C) ? (code as C) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `build(slice)` once per slice object, after `assert(fn, slice)`: the brand
+ * check runs on every call, the build on the first.
+ */
+export function perSlice<S extends object, T>(
+  assert: (fn: string, value: unknown) => asserts value is S,
+  build: (slice: S) => T,
+): (fn: string, slice: S) => T {
+  const built = new WeakMap<S, T>();
+  return (fn, slice) => {
+    assert(fn, slice);
+    let out = built.get(slice);
+    if (out === undefined) {
+      out = build(slice);
+      built.set(slice, out);
+    }
+    return out;
+  };
+}
+
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
+// Postgres truncates a longer identifier with only a NOTICE. The rule is
+// ASCII-only, so characters are bytes.
 const MAX_IDENTIFIER_BYTES = 63;
+
+/** True when `value` matches `[a-z_][a-z0-9_]*` and is at most 63 bytes. */
+export function isIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" && IDENTIFIER.test(value) && value.length <= MAX_IDENTIFIER_BYTES
+  );
+}
+
+/**
+ * Returns the identifier double-quoted, for splicing into `unsafe` text. Throws
+ * unless it matches `[a-z_][a-z0-9_]*` and is at most 63 bytes, so no quote,
+ * case fold or truncation can change what it names. `db` exports it.
+ */
+export function quoteIdentifier(name: string): string {
+  if (!isIdentifier(name)) {
+    throw new Error(
+      `rootstock: identifier must match [a-z_][a-z0-9_]* and be at most 63 bytes — got ${q(name)}`,
+    );
+  }
+  return `"${name}"`;
+}
+
+/** `<schema>.<name>`, each part through quoteIdentifier. */
+export function quoteTable(table: { readonly schema: string; readonly name: string }): string {
+  return `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.name)}`;
+}
+
 const E_IDENTIFIER = "an identifier matching [a-z_][a-z0-9_]* of at most 63 bytes";
 const TABLE_KEYS: ReadonlySet<string> = new Set(["schema", "name"]);
 
 /** A Postgres identifier a slice splices through quoteIdentifier, or the refusal. */
 export function identifier(refuse: SliceRefusals, path: string, value: unknown): string {
-  if (typeof value !== "string" || !IDENTIFIER.test(value) || value.length > MAX_IDENTIFIER_BYTES) {
-    throw refuse.invalid(path, E_IDENTIFIER, value);
-  }
+  if (!isIdentifier(value)) throw refuse.invalid(path, E_IDENTIFIER, value);
   return value;
 }
 

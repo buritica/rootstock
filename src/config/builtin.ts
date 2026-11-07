@@ -1,4 +1,4 @@
-import { q } from "../internal/slice.ts";
+import { own, q } from "../internal/slice.ts";
 import type { Invariant, RootstockConfig } from "./define.ts";
 
 type Profile = RootstockConfig["client"]["profiles"][string];
@@ -25,7 +25,7 @@ export const lockProfileSingle: Invariant = Object.freeze({
     const name = config.lock?.profile;
     if (name === undefined) return null;
     const profiles = config.client.profiles;
-    const profile = Object.hasOwn(profiles, name) ? profiles[name] : undefined;
+    const profile = own(profiles, name);
     if (profile === undefined) {
       return `lock.profile names no connection profile ${q(name)} — declared: ${Object.keys(profiles).join(", ")}`;
     }

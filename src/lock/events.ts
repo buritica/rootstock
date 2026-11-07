@@ -1,4 +1,5 @@
 import { pgCode } from "../db/index.ts";
+import { safeHook } from "../internal/slice.ts";
 import type { LockErrorCode } from "./errors.ts";
 
 type Err = { error: unknown; code: string | undefined };
@@ -40,16 +41,9 @@ export type LockEvent =
 
 export type Emit = (e: LockEvent) => void;
 
-/** The hook, made safe: one that throws is ignored. */
+/** The hook, made safe: one that throws or rejects is ignored, so it can never change what the lock does. */
 export function emitter(onEvent: ((e: LockEvent) => void) | undefined): Emit {
-  return (e) => {
-    if (onEvent === undefined) return;
-    try {
-      onEvent(e);
-    } catch {
-      // A hook can never change what the lock does.
-    }
-  };
+  return (e) => safeHook(onEvent, e);
 }
 
 /** `{ error, code }` for a failure event. */

@@ -1,4 +1,4 @@
-import { quoteIdentifier } from "../db/index.ts";
+import { quoteTable } from "../internal/slice.ts";
 
 /**
  * Every statement the lock sends, frozen text, built once per table. The
@@ -56,7 +56,7 @@ export interface TableStatements {
 
 /** The statements that name the fencing table, for `<schema>.<name>`. */
 export function tableStatements(table: { schema: string; name: string }): TableStatements {
-  const t = `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.name)}`;
+  const t = quoteTable(table);
   return Object.freeze({
     fence: `INSERT INTO ${t} (name, holder, acquired_at, heartbeat_at)
 VALUES ($1, $2::uuid, now(), now())

@@ -1,4 +1,4 @@
-import { quoteIdentifier } from "../db/index.ts";
+import { quoteTable } from "../internal/slice.ts";
 
 /**
  * Every statement the queue and the cursors send, frozen text, built once per
@@ -10,9 +10,6 @@ import { quoteIdentifier } from "../db/index.ts";
 
 export const LOCK_TIMEOUT_READ = "SELECT current_setting('lock_timeout') AS v";
 export const LOCK_TIMEOUT_SET = "SELECT set_config('lock_timeout', $1, true)";
-
-const splice = (table: { schema: string; name: string }) =>
-  `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.name)}`;
 
 export interface QueueStatements {
   /** Q1 (c), params [key, source, kind, json, debounce, slide, stickyKind]. */
@@ -32,7 +29,7 @@ export interface QueueStatements {
 }
 
 export function queueStatements(table: { schema: string; name: string }): QueueStatements {
-  const T = splice(table);
+  const T = quoteTable(table);
   return Object.freeze({
     enqueue: `INSERT INTO ${T} AS q (key, source, kind, payload, not_before, enqueued_at, updated_at)
 VALUES (
@@ -175,7 +172,7 @@ export function cursorStatements(
   table: { schema: string; name: string },
   value: "text" | "jsonb",
 ): CursorStatements {
-  const C = splice(table);
+  const C = quoteTable(table);
   const V = value === "text" ? "$2" : "$2::text::jsonb";
   return Object.freeze({
     get: `SELECT value::text AS value FROM ${C} WHERE name = $1`,

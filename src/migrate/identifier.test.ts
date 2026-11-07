@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { quoteIdentifier } from "../db/index.ts";
+import { identifier, sliceRefusals } from "../internal/slice.ts";
 import { checkIdentifier } from "./identifier.ts";
 
-// One table of names, judged by migrate's copy of the identifier rule and by
-// `db`'s `quoteIdentifier`. The two must accept and refuse the same names and
-// render the same `got …` for each refusal.
+// One table of names, judged by migrate's identifier check, by `db`'s
+// `quoteIdentifier` and by the slice parsers' `identifier()`. All three must
+// accept and refuse the same names and render the same `got …` for each
+// refusal.
 
 const hex = "0123456789abcdef0123456789abcdef";
 const NAMES: readonly [unknown, boolean][] = [
@@ -61,6 +63,16 @@ test("db's quoteIdentifier gives the same verdict for every name", () => {
   for (const [name] of NAMES) {
     expect(
       outcome(() => quoteIdentifier(name as string)),
+      String(name),
+    ).toEqual(outcome(() => checkIdentifier("identifier", name)));
+  }
+});
+
+test("the slice parsers' identifier() gives the same verdict for every name", () => {
+  const refuse = sliceRefusals("p");
+  for (const [name] of NAMES) {
+    expect(
+      outcome(() => identifier(refuse, "table.name", name)),
       String(name),
     ).toEqual(outcome(() => checkIdentifier("identifier", name)));
   }

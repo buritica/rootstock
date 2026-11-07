@@ -1,4 +1,9 @@
-export type QueueErrorCode = "ERR_ROOTSTOCK_QUEUE_INPUT" | "ERR_ROOTSTOCK_QUEUE_NOTABLE";
+import { pgCode } from "../db/index.ts";
+import { codeIn } from "../internal/slice.ts";
+
+const CODES = ["ERR_ROOTSTOCK_QUEUE_INPUT", "ERR_ROOTSTOCK_QUEUE_NOTABLE"] as const;
+export type QueueErrorCode = (typeof CODES)[number];
+const CODE_SET: ReadonlySet<QueueErrorCode> = new Set(CODES);
 
 export type QueueRefusalReason =
   | "key_invalid"
@@ -18,11 +23,6 @@ export type QueueRefusalReason =
   | "cursor_name_invalid"
   | "cursor_value_invalid"
   | "error_class_invalid";
-
-const CODES: ReadonlySet<string> = new Set([
-  "ERR_ROOTSTOCK_QUEUE_INPUT",
-  "ERR_ROOTSTOCK_QUEUE_NOTABLE",
-]);
 
 export class RootstockQueueError extends Error {
   readonly code: QueueErrorCode;
@@ -52,9 +52,7 @@ export class RootstockQueueError extends Error {
 
 /** The code of a queue refusal, by `code` (survives two module copies), or undefined. */
 export function queueErrorCode(err: unknown): QueueErrorCode | undefined {
-  if (typeof err !== "object" || err === null) return undefined;
-  const code = (err as { code?: unknown }).code;
-  return typeof code === "string" && CODES.has(code) ? (code as QueueErrorCode) : undefined;
+  return codeIn(CODE_SET, err);
 }
 
 /** The NOTABLE refusal for a missing table, with the server's error as cause. */
@@ -68,4 +66,17 @@ export function notable(
     `${t} does not exist — run the migrations (the table ships with rootstock 0.6.0, or is your own)`,
     { table: t, cause },
   );
+}
+
+/** Runs `run`, turning a missing table (42P01) into NOTABLE for `table`. */
+export async function guarded<T>(
+  table: { schema: string; name: string },
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (pgCode(err) === "42P01") throw notable(table, err);
+    throw err;
+  }
 }

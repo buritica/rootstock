@@ -1,5 +1,6 @@
-import { pgCode, type Sql } from "../db/index.ts";
-import { notable } from "./errors.ts";
+import type { Sql } from "../db/index.ts";
+import { perSlice } from "../internal/slice.ts";
+import { guarded } from "./errors.ts";
 import { type Emit, emitter, type QueueHooks } from "./events.ts";
 import { refuse, text } from "./input.ts";
 import { assertCursorTable, type CursorTable } from "./slice.ts";
@@ -8,26 +9,11 @@ import { type CursorStatements, cursorStatements } from "./statements.ts";
 /** A string for a text table; any JSON value for a jsonb table. */
 export type CursorValue = unknown;
 
-const built = new WeakMap<CursorTable, CursorStatements>();
-
-function statementsOf(fn: string, t: CursorTable): CursorStatements {
-  assertCursorTable(fn, t);
-  let st = built.get(t);
-  if (st === undefined) {
-    st = cursorStatements(t.table, t.value);
-    built.set(t, st);
-  }
-  return st;
-}
-
-async function guarded<T>(t: CursorTable, run: () => Promise<T>): Promise<T> {
-  try {
-    return await run();
-  } catch (err) {
-    if (pgCode(err) === "42P01") throw notable(t.table, err);
-    throw err;
-  }
-}
+/** The table's statements, after the brand check, built once per table. */
+const statementsOf = perSlice(
+  assertCursorTable,
+  (t: CursorTable): CursorStatements => cursorStatements(t.table, t.value),
+);
 
 /** The value as the text bound to `$2`: the string itself, or its JSON. */
 function bound(emit: Emit, t: CursorTable, value: CursorValue): string {
@@ -75,7 +61,7 @@ export async function getCursor(
   const st = statementsOf("getCursor", t);
   const emit = emitter(hooks);
   const n = text(emit, name, t.maxNameChars, "cursor name", "cursor_name_invalid");
-  const [row] = await guarded(t, () => sql.unsafe(st.get, [n]));
+  const [row] = await guarded(t.table, () => sql.unsafe(st.get, [n]));
   const value = row === undefined || row.value === null ? undefined : read(t, row.value);
   emit({ type: "queue.cursor_read", name: n, value: value ?? null });
   return value;
@@ -93,7 +79,7 @@ export async function setCursor(
   const emit = emitter(hooks);
   const n = text(emit, name, t.maxNameChars, "cursor name", "cursor_name_invalid");
   const v = bound(emit, t, value);
-  const [row] = await guarded(t, () => sql.unsafe(st.set, [n, v]));
+  const [row] = await guarded(t.table, () => sql.unsafe(st.set, [n, v]));
   const previous = row?.previous;
   emit({
     type: "queue.cursor_written",
@@ -117,5 +103,5 @@ export async function touchCursor(
   const emit = emitter(undefined);
   const n = text(emit, name, t.maxNameChars, "cursor name", "cursor_name_invalid");
   const v = bound(emit, t, initial);
-  await guarded(t, () => sql.unsafe(st.touch, [n, v]));
+  await guarded(t.table, () => sql.unsafe(st.touch, [n, v]));
 }

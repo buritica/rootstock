@@ -1,5 +1,6 @@
 import { pgCode, type Sql, type Transactor, type TxSql } from "../db/index.ts";
-import { notable } from "./errors.ts";
+import { perSlice } from "../internal/slice.ts";
+import { guarded } from "./errors.ts";
 import { emitter, type QueueHooks } from "./events.ts";
 import { checkEnqueue, clampLimit, type EnqueueArgs, text } from "./input.ts";
 import { assertQueueSlice, type QueueSlice } from "./slice.ts";
@@ -49,28 +50,21 @@ export interface QueueDepth {
   oldestDeadHours: number | null;
 }
 
-const built = new WeakMap<QueueSlice, QueueStatements>();
-
-/** The slice's statements, after the brand check, built once per slice. */
-function statementsOf(fn: string, s: QueueSlice): QueueStatements {
-  assertQueueSlice(fn, s);
-  let st = built.get(s);
-  if (st === undefined) {
-    st = queueStatements(s.table);
-    built.set(s, st);
-  }
-  return st;
+interface Built {
+  readonly statements: QueueStatements;
+  /** Q4's backoff parameter. */
+  readonly backoffJson: string;
 }
 
-/** Runs `run`, turning a missing table (42P01) into NOTABLE. */
-async function guarded<T>(s: QueueSlice, run: () => Promise<T>): Promise<T> {
-  try {
-    return await run();
-  } catch (err) {
-    if (pgCode(err) === "42P01") throw notable(s.table, err);
-    throw err;
-  }
-}
+/** What each call needs from the slice, after the brand check. */
+const builtOf = perSlice(
+  assertQueueSlice,
+  (s: QueueSlice): Built => ({
+    statements: queueStatements(s.table),
+    backoffJson: JSON.stringify(s.backoffMinutes),
+  }),
+);
+const statementsOf = (fn: string, s: QueueSlice): QueueStatements => builtOf(fn, s).statements;
 
 /** A text column read as a number, or null for NULL (the C1 rule). */
 const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
@@ -117,14 +111,13 @@ export async function enqueue(
   };
   let row: Row | undefined;
   try {
-    row = await ("savepoint" in scope ? scope.savepoint(work) : scope.begin(work));
+    row = await guarded(s.table, () =>
+      "savepoint" in scope ? scope.savepoint(work) : scope.begin(work),
+    );
   } catch (err) {
-    if (pgCode(err) === "55P03") {
-      emit({ type: "queue.contended", key: c.key, source: c.source, kind: c.kind });
-      return "contended";
-    }
-    if (pgCode(err) === "42P01") throw notable(s.table, err);
-    throw err;
+    if (pgCode(err) !== "55P03") throw err;
+    emit({ type: "queue.contended", key: c.key, source: c.source, kind: c.kind });
+    return "contended";
   }
   const result =
     row?.on_dead === true ? "on_dead" : row?.inserted === true ? "inserted" : "coalesced";
@@ -156,7 +149,7 @@ export async function claim(
     source: typeof a.source === "string" ? a.source : null,
   });
   const limit = clampLimit(a.limit, s.maxClaimLimit, 1);
-  const rows = await guarded(s, () =>
+  const rows = await guarded(s.table, () =>
     sql.unsafe(st.claim, [
       a.source,
       s.claimTimeoutMinutes,
@@ -226,7 +219,7 @@ export async function ack(
 ): Promise<AckResult> {
   const st = statementsOf("ack", s);
   const emit = emitter(hooks);
-  const [row] = await guarded(s, () => sql.unsafe(st.ack, [a.key, a.worker]));
+  const [row] = await guarded(s.table, () => sql.unsafe(st.ack, [a.key, a.worker]));
   if (row === undefined) {
     emit({ type: "queue.lost", key: a.key, worker: a.worker, operation: "ack" });
     return "missing";
@@ -256,7 +249,7 @@ export async function fail(
   a: { key: string; worker: string; errorClass: string },
   hooks?: QueueHooks,
 ): Promise<FailResult> {
-  const st = statementsOf("fail", s);
+  const { statements: st, backoffJson } = builtOf("fail", s);
   const emit = emitter(hooks);
   const errorClass = text(
     emit,
@@ -266,12 +259,12 @@ export async function fail(
     "error_class_invalid",
     { key: typeof a.key === "string" ? a.key : null },
   );
-  const [row] = await guarded(s, () =>
+  const [row] = await guarded(s.table, () =>
     sql.unsafe(st.fail, [
       a.key,
       a.worker,
       errorClass,
-      JSON.stringify(s.backoffMinutes),
+      backoffJson,
       s.backoffMinutes.length,
       s.maxAttempts,
     ]),
@@ -322,7 +315,7 @@ export async function retryDead(
 ): Promise<boolean> {
   const st = statementsOf("retryDead", s);
   const emit = emitter(hooks);
-  const [row] = await guarded(s, () => sql.unsafe(st.retryDead, [key]));
+  const [row] = await guarded(s.table, () => sql.unsafe(st.retryDead, [key]));
   if (row === undefined) {
     emit({ type: "queue.retry_noop", key });
     return false;
@@ -339,7 +332,7 @@ export async function listDead(
 ): Promise<DeadRow[]> {
   const st = statementsOf("listDead", s);
   const limit = clampLimit(a?.limit ?? 50, s.maxClaimLimit, 50);
-  const rows = await guarded(s, () => sql.unsafe(st.listDead, [a?.source ?? null, limit]));
+  const rows = await guarded(s.table, () => sql.unsafe(st.listDead, [a?.source ?? null, limit]));
   return rows.map((r) => ({
     key: String(r.key),
     source: String(r.source),
@@ -354,7 +347,7 @@ export async function listDead(
 /** Q7. Per source: live, due, claimed and dead counts, and how old the oldest of each is. */
 export async function depth(sql: Sql, s: QueueSlice): Promise<QueueDepth[]> {
   const st = statementsOf("depth", s);
-  const rows = await guarded(s, () => sql.unsafe(st.depth, [s.claimTimeoutMinutes]));
+  const rows = await guarded(s.table, () => sql.unsafe(st.depth, [s.claimTimeoutMinutes]));
   return rows.map((r) => ({
     source: String(r.source),
     queued: Number(r.queued),
@@ -367,5 +360,3 @@ export async function depth(sql: Sql, s: QueueSlice): Promise<QueueDepth[]> {
     oldestDeadHours: num(r.oldest_dead_hours),
   }));
 }
-
-export type { EnqueueArgs };

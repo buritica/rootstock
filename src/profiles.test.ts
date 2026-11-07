@@ -6,10 +6,13 @@ const OFFICE_PEERS = new Set(["jszip", "mammoth", "unpdf"]);
 // Unit tests, DB suites (`*.pg.ts`) and their support modules (`*.pg-support.ts`,
 // `*.test-support.ts`) import drivers and read the environment by design; every
 // scan skips them.
-const TEST_FILE = /\.(test|pg|pg-support|test-support)\.ts$/;
+const SUFFIXES = ["test", "pg", "pg-support", "test-support"] as const;
+const TEST_FILE = new RegExp(`\\.(${SUFFIXES.join("|")})\\.ts$`);
+// A specifier naming a test file; bundler resolution lets it drop its `.ts`.
+const TEST_SPECIFIER = new RegExp(`\\.(${SUFFIXES.join("|")})(\\.ts)?$`);
 
 test("the published files exclude every test-file suffix", () => {
-  for (const suffix of ["test", "pg", "pg-support", "test-support"]) {
+  for (const suffix of SUFFIXES) {
     expect(TEST_FILE.test(`x.${suffix}.ts`)).toBe(true);
     expect(pkg.files).toContain(`!src/**/*.${suffix}.ts`);
   }
@@ -103,13 +106,49 @@ const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
 };
 // A name read as a value. A property access (`deps.setInterval(...)`) and a
 // key (`setInterval: …`, `setInterval?: …`) are not the global, and an
-// injected dependency is declared and called exactly that way. AbortSignal is
-// a type the injected `sleep` takes, so it is a value only outside a type
-// annotation (`signal?: AbortSignal`, `| AbortSignal`).
+// injected dependency is declared and called exactly that way. A ternary
+// branch (`slow ? setTimeout : noop`) looks like a key but is a read, so a
+// name right after `?` is a read whatever follows it. AbortSignal is a type
+// the injected `sleep` takes, so it is a value only outside a type annotation
+// (`signal?: AbortSignal`, `| AbortSignal`); a regex cannot tell an annotation
+// from a ternary's `: AbortSignal` branch, which is why shipped code spells
+// the name in pieces where it needs the text.
 // `Date` is a clock only when read: `Date.now()`, `new Date()` and `Date()`.
 // `new Date(ms)`, `instanceof Date` and the type are not.
-const FORBIDDEN_GLOBALS =
-  /(?<![.\w$])\b(fetch|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|crypto|process|console|Bun|globalThis|require)\b(?!\s*\??:)|(?<![.\w$]|:\s?|\|\s?)\bAbortSignal\b|(?<![.\w$]|new\s)\bDate\s*(\.\s*now\b|\()|\bnew\s+Date\s*(\(\s*\)|(?!\s*\())/;
+const GLOBAL_NAMES =
+  "fetch|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\\.random|crypto|process|console|Bun|globalThis|require";
+const FORBIDDEN_GLOBALS = new RegExp(
+  [
+    `(?<![.\\w$])\\b(${GLOBAL_NAMES})\\b(?!\\s*\\??:)`,
+    `(?<=\\?\\s*)(?<![.\\w$])\\b(${GLOBAL_NAMES})\\b`,
+    "(?<![.\\w$]|:\\s?|\\|\\s?)\\bAbortSignal\\b",
+    "(?<![.\\w$]|new\\s)\\bDate\\s*(\\.\\s*now\\b|\\()",
+    "\\bnew\\s+Date\\s*(\\(\\s*\\)|(?!\\s*\\())",
+  ].join("|"),
+);
+
+test("the purity scan tells a read from a key", () => {
+  const reads = [
+    "const t = slow ? setTimeout : noop;",
+    "const t = slow?setTimeout:noop;",
+    "const t = slow ? noop : setTimeout;",
+    "setInterval(fn, 1);",
+    "const r = Math.random();",
+    "x instanceof AbortSignal",
+    "const now = Date.now();",
+    "const d = new Date();",
+  ];
+  const keys = [
+    "setInterval: (fn: () => void, ms: number) => unknown;",
+    "  setTimeout?: typeof noop,",
+    "deps.setInterval(tick, 5);",
+    "a?.setTimeout(fn)",
+    "sleep: (ms: number, signal?: AbortSignal) => Promise<void>;",
+    "const d = new Date(ms);",
+  ];
+  expect(reads.filter((line) => !FORBIDDEN_GLOBALS.test(line))).toEqual([]);
+  expect(keys.filter((line) => FORBIDDEN_GLOBALS.test(line))).toEqual([]);
+});
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
@@ -228,9 +267,7 @@ test("no non-test file imports a test file", async () => {
   for (const path of await sourceFiles()) {
     if (TEST_FILE.test(path)) continue;
     for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
-      // Bundler resolution lets a specifier drop its `.ts`, so match the stem too.
-      if (/\.(test|pg|pg-support|test-support)(\.ts)?$/.test(spec))
-        offenders.push(`${path} imports ${spec}`);
+      if (TEST_SPECIFIER.test(spec)) offenders.push(`${path} imports ${spec}`);
     }
   }
   expect(offenders).toEqual([]);

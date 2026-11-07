@@ -27,7 +27,7 @@ export async function locksHeld(
   if (unique.length === 0) return held;
   const rows = await sql.unsafe<{ name: string; held: unknown }>(L7, [JSON.stringify(unique)]);
   const byName = new Map(rows.map((r) => [r.name, r.held === true]));
-  for (const name of unique) held.set(name, byName.get(name) === true);
+  for (const name of unique) held.set(name, byName.get(name) ?? false);
   return held;
 }
 

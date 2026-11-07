@@ -6,13 +6,13 @@ export {
   RootstockQueueError,
 } from "./errors.ts";
 export type { QueueEvent, QueueHooks } from "./events.ts";
+export type { EnqueueArgs } from "./input.ts";
 export {
   type AckResult,
   ack,
   claim,
   type DeadRow,
   depth,
-  type EnqueueArgs,
   type EnqueueResult,
   enqueue,
   type FailResult,

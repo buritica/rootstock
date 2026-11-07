@@ -1,3 +1,4 @@
+import { safeHook } from "../internal/slice.ts";
 import type { QueueRefusalReason } from "./errors.ts";
 
 /** What the queue reports. No event carries a payload. */
@@ -83,15 +84,8 @@ export interface QueueHooks {
 
 export type Emit = (e: QueueEvent) => void;
 
-/** The hook, made safe: one that throws is ignored. */
+/** The hook, made safe: one that throws or rejects is ignored, so it can never change what the queue does. */
 export function emitter(hooks: QueueHooks | undefined): Emit {
   const onEvent = hooks?.onEvent;
-  return (e) => {
-    if (onEvent === undefined) return;
-    try {
-      onEvent(e);
-    } catch {
-      // A hook can never change what the queue does.
-    }
-  };
+  return (e) => safeHook(onEvent, e);
 }

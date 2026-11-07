@@ -1,6 +1,7 @@
 import { SQL } from "bun";
 import postgres from "postgres";
 import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/index.ts";
+import { required, testTransactorKind } from "../db/test-client.pg-support.ts";
 
 /**
  * Lock-session fixtures for the lock DB suites. Under kind `bun-sql` the lock
@@ -10,26 +11,12 @@ import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/i
 
 export type LockDriver = "postgres-js" | "bun-sql";
 
-function env(name: string): string {
-  const value = process.env[name];
-  if (value === undefined || value === "") {
-    throw new Error(`${name} is not set — run DB suites through \`bun run test:db\``);
-  }
-  return value;
-}
-
 export function testUrl(): string {
-  return env("ROOTSTOCK_TEST_DATABASE_URL");
+  return required("ROOTSTOCK_TEST_DATABASE_URL");
 }
 
 /** The transactor kind under test. */
-export function testKind(): "postgres-js" | "bun-sql" | "drizzle" {
-  const kind = env("ROOTSTOCK_TEST_TRANSACTOR");
-  if (kind !== "postgres-js" && kind !== "bun-sql" && kind !== "drizzle") {
-    throw new Error(`unknown ROOTSTOCK_TEST_TRANSACTOR ${JSON.stringify(kind)}`);
-  }
-  return kind;
-}
+export const testKind = testTransactorKind;
 
 /** The driver the lock session uses under the kind under test. */
 export function lockDriver(): LockDriver {

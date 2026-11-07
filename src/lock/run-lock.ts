@@ -1,4 +1,5 @@
 import type { Sql } from "../db/index.ts";
+import { perSlice } from "../internal/slice.ts";
 import { type RootstockLockError, refusals } from "./errors.ts";
 import { type Emit, emitter, failure, type LockEvent } from "./events.ts";
 import { lockOwnershipLost } from "./probe.ts";
@@ -45,16 +46,8 @@ export interface Attempt {
   releaseTurn: () => void;
 }
 
-export function attempt(slice: LockSlice, name: string, deps: LockDeps): Attempt {
-  return {
-    slice,
-    name,
-    deps,
-    emit: emitter(deps.onEvent),
-    statements: tableStatements(slice.table),
-    releaseTurn: () => {},
-  };
-}
+/** The fencing table's statements, after the brand check, built once per slice. */
+const statementsOf = perSlice(assertLockSlice, (slice: LockSlice) => tableStatements(slice.table));
 
 /** Emits `lock.refused`, releases any held turn, and returns the error to throw. */
 export function refused(a: Attempt, err: RootstockLockError): RootstockLockError {
@@ -77,9 +70,16 @@ export async function closeQuietly(
 }
 
 /** Step 0's checks that need no I/O: the brand, then the name. */
-export function validate(slice: LockSlice, name: string, deps: LockDeps): Attempt {
-  assertLockSlice("acquireRunLock", slice);
-  const a = attempt(slice, name, deps);
+function validate(slice: LockSlice, name: string, deps: LockDeps): Attempt {
+  const statements = statementsOf("acquireRunLock", slice);
+  const a: Attempt = {
+    slice,
+    name,
+    deps,
+    emit: emitter(deps.onEvent),
+    statements,
+    releaseTurn: () => {},
+  };
   if (!admits(slice, name)) throw refused(a, refusals.name(slice, name));
   return a;
 }

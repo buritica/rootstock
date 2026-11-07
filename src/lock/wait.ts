@@ -1,5 +1,5 @@
-import { isRecord } from "../internal/slice.ts";
-import { ABORT_SIGNAL, refusals } from "./errors.ts";
+import { intIn, isRecord } from "../internal/slice.ts";
+import { ABORT_SIGNAL, type RootstockLockError, refusals } from "./errors.ts";
 import { failure } from "./events.ts";
 import { type Attempt, closeQuietly, fence, type RunLock, refused } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
@@ -19,9 +19,7 @@ export function checkWait(a: Attempt, wait: unknown): LockWait {
   const ok =
     w !== undefined &&
     w.mode === "poll" &&
-    Number.isInteger(ms) &&
-    (ms as number) >= 0 &&
-    (ms as number) <= a.slice.wait.maxMs &&
+    intIn(ms, 0, a.slice.wait.maxMs) &&
     isTurnQueue(w.turns) &&
     (w.signal === undefined || isAbortSignal(w.signal));
   if (!ok) {
@@ -77,6 +75,15 @@ export async function pollAcquire(
     emit({ type: "lock.wait", name, mode: "poll", outcome, waitedMs });
     return waitedMs;
   };
+  /** Closes the session, reports the wait, then refuses: the order every refusal after open keeps. */
+  const giveUp = async (
+    session: LockSession,
+    outcome: "timeout" | "aborted" | "error",
+    refusal: (waitedMs: number) => RootstockLockError,
+  ): Promise<never> => {
+    await closeQuietly(a, session, "refusal");
+    throw refused(a, refusal(report(outcome)));
+  };
 
   const turn = enqueueTurn(wait.turns, name);
   a.releaseTurn = turn.done;
@@ -110,25 +117,20 @@ export async function pollAcquire(
         } catch (error) {
           emit({ type: "lock.unlock_failed", name, ...failure(error) });
         }
-        await closeQuietly(a, session, "refusal");
-        throw refused(a, refusals.abandoned(name, report("aborted")));
+        return giveUp(session, "aborted", (ms) => refusals.abandoned(name, ms));
       }
       report("acquired");
       return fence(a, session, Number(row?.pid));
     }
     if (locked !== false) {
-      await closeQuietly(a, session, "refusal");
-      report("error");
-      throw refused(a, refusals.malfunction(name, locked));
+      return giveUp(session, "error", () => refusals.malfunction(name, locked));
     }
     if (deps.now() >= deadline) {
-      await closeQuietly(a, session, "refusal");
-      throw refused(a, refusals.heldAfterWait(name, report("timeout")));
+      return giveUp(session, "timeout", (ms) => refusals.heldAfterWait(name, ms));
     }
     await deps.sleep(Math.min(slice.wait.pollIntervalMs, deadline - deps.now()), signal);
     if (signal?.aborted) {
-      await closeQuietly(a, session, "refusal");
-      throw refused(a, refusals.abandoned(name, report("aborted")));
+      return giveUp(session, "aborted", (ms) => refusals.abandoned(name, ms));
     }
   }
 }

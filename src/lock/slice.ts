@@ -1,5 +1,7 @@
 import {
   type Brand,
+  bounded,
+  intIn,
   isRecord,
   own,
   sliceBrand,
@@ -61,8 +63,8 @@ const REQUIRED = [
 ] as const;
 const WAIT_KEYS: ReadonlySet<string> = new Set(["maxMs", "pollIntervalMs"]);
 
-const PROFILE = /^[a-z][a-z0-9-]*$/;
-const GROUP = PROFILE;
+// A profile name and a group name follow the same rule.
+const DASHED_NAME = /^[a-z][a-z0-9-]*$/;
 const ENTRY = /^[a-z0-9][a-z0-9:._-]*\*?$/;
 const NAME = /^[a-z0-9][a-z0-9:._-]*$/;
 // The rules are ASCII-only, so characters are bytes.
@@ -76,9 +78,6 @@ const E_GROUP_ENTRY = "an exact lock name the names admit, once";
 
 const refuse = sliceRefusals(PARSER);
 const brand: Brand<LockSlice> = sliceBrand("LockSlice", PARSER);
-
-const intIn = (v: unknown, min: number, max: number): v is number =>
-  Number.isInteger(v) && (v as number) >= min && (v as number) <= max;
 
 /** True when the entry `entry` (exact, or `prefix*`) admits the name `name`. */
 function entryAdmits(entry: string, name: string): boolean {
@@ -134,7 +133,7 @@ function parseGroups(
   const out: Record<string, readonly string[]> = {};
   for (const group of Object.keys(groups)) {
     const path = `groups.${group}`;
-    if (!GROUP.test(group)) {
+    if (!DASHED_NAME.test(group)) {
       throw refuse.invalid(path, "a group name matching [a-z][a-z0-9-]*", group);
     }
     const list = groups[group];
@@ -161,20 +160,10 @@ function parseWait(raw: unknown): { maxMs: number; pollIntervalMs: number } {
   const pollIntervalMs = own(wait, "pollIntervalMs");
   if (maxMs === undefined) throw refuse.required("wait.maxMs");
   if (pollIntervalMs === undefined) throw refuse.required("wait.pollIntervalMs");
-  if (!intIn(maxMs, 0, 3_600_000)) {
-    throw refuse.invalid("wait.maxMs", "an integer from 0 to 3600000", maxMs);
-  }
-  if (!intIn(pollIntervalMs, 10, 60_000)) {
-    throw refuse.invalid("wait.pollIntervalMs", "an integer from 10 to 60000", pollIntervalMs);
-  }
-  return Object.freeze({ maxMs, pollIntervalMs });
-}
-
-function bounded(path: string, value: unknown, min: number, max: number): number {
-  if (!intIn(value, min, max)) {
-    throw refuse.invalid(path, `an integer from ${min} to ${max}`, value);
-  }
-  return value;
+  return Object.freeze({
+    maxMs: bounded(refuse, "wait.maxMs", maxMs, 0, 3_600_000),
+    pollIntervalMs: bounded(refuse, "wait.pollIntervalMs", pollIntervalMs, 10, 60_000),
+  });
 }
 
 /**
@@ -198,12 +187,18 @@ export function lockSlice(input: LockSliceInput, defaults?: { schema?: string })
     "run_locks",
   );
   const profile = own(fields, "profile");
-  if (typeof profile !== "string" || !PROFILE.test(profile)) {
+  if (typeof profile !== "string" || !DASHED_NAME.test(profile)) {
     throw refuse.invalid("profile", "a profile name matching [a-z][a-z0-9-]*", profile);
   }
   const names = parseNames(own(fields, "names"));
   const groups = parseGroups(own(fields, "groups"), names);
-  const heartbeatSeconds = bounded("heartbeatSeconds", own(fields, "heartbeatSeconds"), 5, 300);
+  const heartbeatSeconds = bounded(
+    refuse,
+    "heartbeatSeconds",
+    own(fields, "heartbeatSeconds"),
+    5,
+    300,
+  );
   const probeStallSeconds = own(fields, "probeStallSeconds");
   if (!intIn(probeStallSeconds, heartbeatSeconds + 1, 600)) {
     throw refuse.invalid(
@@ -212,8 +207,14 @@ export function lockSlice(input: LockSliceInput, defaults?: { schema?: string })
       probeStallSeconds,
     );
   }
-  const maxRecoveries = bounded("maxRecoveries", own(fields, "maxRecoveries"), 0, 20);
-  const endTimeoutSeconds = bounded("endTimeoutSeconds", own(fields, "endTimeoutSeconds"), 1, 60);
+  const maxRecoveries = bounded(refuse, "maxRecoveries", own(fields, "maxRecoveries"), 0, 20);
+  const endTimeoutSeconds = bounded(
+    refuse,
+    "endTimeoutSeconds",
+    own(fields, "endTimeoutSeconds"),
+    1,
+    60,
+  );
   const wait = parseWait(own(fields, "wait"));
   return brand.mark(
     Object.freeze({
@@ -238,15 +239,11 @@ export function lockSlice(input: LockSliceInput, defaults?: { schema?: string })
 export function withNames(slice: LockSlice, extra: readonly string[]): LockSlice {
   brand.assert("withNames", slice);
   if (!Array.isArray(extra)) throw refuse.invalid("names", E_NAMES, extra);
+  // The brand is membership, not a key, so the spread carries only fields.
   return lockSlice({
+    ...slice,
     table: { ...slice.table },
-    profile: slice.profile,
     names: [...slice.names, ...extra],
-    groups: slice.groups,
-    heartbeatSeconds: slice.heartbeatSeconds,
-    probeStallSeconds: slice.probeStallSeconds,
-    maxRecoveries: slice.maxRecoveries,
-    endTimeoutSeconds: slice.endTimeoutSeconds,
     wait: { ...slice.wait },
   });
 }

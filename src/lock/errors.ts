@@ -1,18 +1,7 @@
-import { q } from "../internal/slice.ts";
+import { codeIn, q } from "../internal/slice.ts";
 import type { LockSlice } from "./slice.ts";
 
-export type LockErrorCode =
-  | "ERR_ROOTSTOCK_LOCK_NAME"
-  | "ERR_ROOTSTOCK_LOCK_WAIT"
-  | "ERR_ROOTSTOCK_LOCK_HELD"
-  | "ERR_ROOTSTOCK_LOCK_MALFUNCTION"
-  | "ERR_ROOTSTOCK_LOCK_CONN"
-  | "ERR_ROOTSTOCK_LOCK_UNFENCED"
-  | "ERR_ROOTSTOCK_LOCK_LOST"
-  | "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE"
-  | "ERR_ROOTSTOCK_LOCK_ABANDONED";
-
-const CODES: ReadonlySet<string> = new Set<LockErrorCode>([
+const CODES = [
   "ERR_ROOTSTOCK_LOCK_NAME",
   "ERR_ROOTSTOCK_LOCK_WAIT",
   "ERR_ROOTSTOCK_LOCK_HELD",
@@ -22,7 +11,9 @@ const CODES: ReadonlySet<string> = new Set<LockErrorCode>([
   "ERR_ROOTSTOCK_LOCK_LOST",
   "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE",
   "ERR_ROOTSTOCK_LOCK_ABANDONED",
-]);
+] as const;
+export type LockErrorCode = (typeof CODES)[number];
+const CODE_SET: ReadonlySet<LockErrorCode> = new Set(CODES);
 
 interface Extras {
   readonly waitedMs?: number;
@@ -63,12 +54,7 @@ export class RootstockLockError extends Error {
 
 /** The code of a lock refusal, by `code` (survives two module copies), or undefined. */
 export function lockErrorCode(err: unknown): LockErrorCode | undefined {
-  try {
-    const code = (err as { code?: unknown } | null)?.code;
-    return typeof code === "string" && CODES.has(code) ? (code as LockErrorCode) : undefined;
-  } catch {
-    return undefined;
-  }
+  return codeIn(CODE_SET, err);
 }
 
 // The global's name, in pieces: the purity scan reads string text too.

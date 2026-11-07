@@ -1,5 +1,7 @@
 import {
   type Brand,
+  bounded,
+  intIn,
   isRecord,
   own,
   type SliceRefusals,
@@ -7,6 +9,7 @@ import {
   sliceRefusals,
   tableRef,
 } from "../internal/slice.ts";
+import { textProblem } from "./input.ts";
 
 export interface CursorTableInput {
   /** Default { schema: <default schema>, name: "cursors" }. */
@@ -117,15 +120,6 @@ const queueRefuse = sliceRefusals("queueSlice");
 const cursorRefuse = sliceRefusals("cursorTable");
 const queueBrand: Brand<QueueSlice> = sliceBrand("QueueSlice", "queueSlice");
 const cursorBrand: Brand<CursorTable> = sliceBrand("CursorTable", "cursorTable");
-
-const intIn = (v: unknown, min: number, max: number): v is number =>
-  Number.isInteger(v) && (v as number) >= min && (v as number) <= max;
-
-function bounded(refuse: SliceRefusals, path: string, value: unknown, min: number, max: number) {
-  if (!intIn(value, min, max))
-    throw refuse.invalid(path, `an integer from ${min} to ${max}`, value);
-  return value;
-}
 
 function names(path: string, raw: unknown): readonly string[] {
   if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_LIST) {
@@ -245,12 +239,8 @@ export function queueSlice(input: QueueSliceInput, defaults?: { schema?: string 
   const maxKeyChars = bounded(r, "maxKeyChars", own(fields, "maxKeyChars"), 1, 512);
   const maxNameChars = bounded(r, "maxNameChars", own(fields, "maxNameChars"), 1, 512);
   const expiredClaimClass = own(fields, "expiredClaimClass");
-  if (
-    typeof expiredClaimClass !== "string" ||
-    expiredClaimClass.length < 1 ||
-    expiredClaimClass.length > maxNameChars ||
-    expiredClaimClass.includes("\0")
-  ) {
+  // The same three checks a worker or error class passes at call time.
+  if (textProblem(expiredClaimClass, maxNameChars, "expiredClaimClass") !== undefined) {
     throw r.invalid(
       "expiredClaimClass",
       "a non-empty string of at most maxNameChars characters with no NUL",

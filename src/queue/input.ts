@@ -61,22 +61,15 @@ export function text(
   return value as string;
 }
 
-/** The UTF-8 byte length of a string, counted without an encoder. */
-export function utf8Bytes(s: string): number {
-  let bytes = 0;
-  for (const ch of s) {
-    const c = ch.codePointAt(0) as number;
-    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
-  }
-  return bytes;
-}
+// Pure: an encoder reads no clock and does no I/O.
+const UTF8 = new TextEncoder();
 
 /**
  * §4.3.1: the payload as the JSON text the queue stores. NUL is stripped from
  * strings, a Date becomes its ISO string, a nested null or undefined becomes
  * null; everything else that JSON cannot carry faithfully refuses.
  */
-export function serializePayload(
+function serializePayload(
   emit: Emit,
   s: QueueSlice,
   key: string,
@@ -157,7 +150,7 @@ export function serializePayload(
     );
   };
   const json = JSON.stringify(walk(payload, 0));
-  const bytes = utf8Bytes(json);
+  const bytes = UTF8.encode(json).length;
   if (bytes > s.maxPayloadBytes) {
     throw refuse(
       emit,

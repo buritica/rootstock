@@ -6,6 +6,7 @@ import {
   type TestTransactor,
 } from "../db/transactor.pg-support.ts";
 import { applyMigrationList, applyRootstockMigrations } from "./apply.ts";
+import { ROOTSTOCK_FILES } from "./fixtures.pg-support.ts";
 import { parseMigration, type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { migrateSlice } from "./slice.ts";
 import { rootstockMigrationStatus } from "./status.ts";
@@ -15,7 +16,7 @@ import { rootstockMigrationStatus } from "./status.ts";
 
 const FILE = "20261020000000_schema_migrations.sql";
 const SHIPPED = rootstockMigrations();
-const NAMES = SHIPPED.map((m) => m.filename);
+const NAMES = ROOTSTOCK_FILES;
 
 function fixture(filename: string, text: string): RootstockMigration {
   return parseMigration(filename, new TextEncoder().encode(text));
