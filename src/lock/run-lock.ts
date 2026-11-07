@@ -1,4 +1,3 @@
-import type { Sql } from "../db/index.ts";
 import { perSlice } from "../internal/slice.ts";
 import { pause, stalled, within } from "./bound.ts";
 import { RootstockLockError, refusals } from "./errors.ts";
@@ -63,7 +62,7 @@ export function refused(a: Attempt, err: RootstockLockError): RootstockLockError
 export async function closeQuietly(
   a: Attempt,
   session: LockSession,
-  phase: "acquire-error" | "refusal" | "release",
+  phase: "acquire-error" | "refusal" | "release" | "recovery",
 ): Promise<void> {
   try {
     await session.close();
@@ -119,7 +118,7 @@ export async function acquireRunLock(
   opts?: { wait?: LockWait },
 ): Promise<RunLock> {
   const a = validate(open, slice, name, deps);
-  if (opts?.wait !== undefined) return pollAcquire(a, open, checkWait(a, opts.wait));
+  if (opts?.wait !== undefined) return pollAcquire(a, checkWait(a, opts.wait));
   const session = open();
   let row: Row | undefined;
   try {
@@ -233,7 +232,6 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   const { name, slice, deps, emit, statements } = a;
   /** The session every statement goes to; a recovery after a stalled probe replaces it. */
   let session = firstSession;
-  let sql: Sql = session.sql;
   const stallMs = slice.probeStallSeconds * 1000;
   let pid = firstPid;
   let recoveries = 0;
@@ -257,7 +255,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     if (rest > 0) await pause(deps, rest);
     if (released && text !== L6) throw new AfterRelease();
     try {
-      return await sql.unsafe(text, params);
+      return await session.sql.unsafe(text, params);
     } catch (err) {
       restUntil = deps.now() + SETTLE_MS;
       throw err;
@@ -311,14 +309,9 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
    * server ends it (see outwaitStalledBackend).
    */
   async function reopen(attempt: number): Promise<"released" | "failed" | undefined> {
-    const stale = session;
     const endMs = slice.endTimeoutSeconds * 1000;
-    try {
-      if ((await within(deps, stale.close(), endMs)) === "timeout") {
-        const error = stalled(`closing the stalled session for ${name}`, endMs);
-        emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
-      }
-    } catch (error) {
+    if ((await within(deps, closeQuietly(a, session, "recovery"), endMs)) === "timeout") {
+      const error = stalled(`closing the stalled session for ${name}`, endMs);
       emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
     }
     if (released) return "released";
@@ -332,7 +325,6 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned in the same turn as the released check above, so release()
     // always closes whichever session is current.
     session = fresh;
-    sql = fresh.sql;
     restUntil = Number.NEGATIVE_INFINITY;
     return undefined;
   }
@@ -354,22 +346,46 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     while (row?.locked !== true && row?.holder === holder && deps.now() < until) {
       await pause(deps, slice.wait.pollIntervalMs);
       if (released) return "released";
-      let next: { row: Row | undefined } | { stalled: Error };
-      try {
-        next = await claimOnce();
-      } catch (error) {
-        if (released) return "released";
-        emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
-        return "failed";
-      }
-      if (released) return "released";
-      if ("stalled" in next) {
-        emit({ type: "lock.recovery_failed", name, attempt, ...failure(next.stalled) });
-        return next;
-      }
+      const next = await claim(attempt, false);
+      if (typeof next === "string" || "stalled" in next) return next;
       row = next.row;
     }
     return { row };
+  }
+
+  /**
+   * One recovery claim, with every way it can end that is not a row: released,
+   * failed (a rejection, retried once when `retry`), or stalled (never retried).
+   */
+  async function claim(
+    attempt: number,
+    retry: boolean,
+  ): Promise<{ row: Row | undefined } | { stalled: Error } | "released" | "failed"> {
+    let claimed: { row: Row | undefined } | { stalled: Error };
+    try {
+      claimed = await claimOnce();
+    } catch (first) {
+      if (released) return "released";
+      if (!retry) {
+        emit({ type: "lock.recovery_failed", name, attempt, ...failure(first) });
+        return "failed";
+      }
+      // The first query on a severed session may be the one that pays for
+      // the reconnect, so one retry, with no second increment.
+      emit({ type: "lock.recovery_retrying", name, attempt, ...failure(first) });
+      try {
+        claimed = await claimOnce();
+      } catch (second) {
+        if (released) return "released";
+        emit({ type: "lock.recovery_failed", name, attempt, ...failure(second) });
+        return "failed";
+      }
+    }
+    if (released) return "released";
+    if ("stalled" in claimed) {
+      emit({ type: "lock.recovery_failed", name, attempt, ...failure(claimed.stalled) });
+    }
+    return claimed;
   }
 
   /**
@@ -393,33 +409,12 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
       const reopened = await reopen(attempt);
       if (reopened !== undefined) return reopened;
     }
-    let claimed: { row: Row | undefined } | { stalled: Error };
-    try {
-      claimed = await claimOnce();
-    } catch (first) {
-      if (released) return "released";
-      // The first query on a severed session may be the one that pays for
-      // the reconnect, so one retry, with no second increment.
-      emit({ type: "lock.recovery_retrying", name, attempt, ...failure(first) });
-      try {
-        claimed = await claimOnce();
-      } catch (second) {
-        if (released) return "released";
-        emit({ type: "lock.recovery_failed", name, attempt, ...failure(second) });
-        return "failed";
-      }
+    let claimed = await claim(attempt, true);
+    if (probe === "stalled" && typeof claimed !== "string" && "row" in claimed) {
+      claimed = await outwaitStalledBackend(attempt, claimed.row);
     }
-    if (released) return "released";
-    if ("stalled" in claimed) {
-      emit({ type: "lock.recovery_failed", name, attempt, ...failure(claimed.stalled) });
-      return claimed;
-    }
-    let { row } = claimed;
-    if (probe === "stalled") {
-      const polled = await outwaitStalledBackend(attempt, row);
-      if (polled === "released" || polled === "failed" || "stalled" in polled) return polled;
-      row = polled.row;
-    }
+    if (typeof claimed === "string" || "stalled" in claimed) return claimed;
+    const { row } = claimed;
     if (row?.locked !== true) {
       emit({ type: "lock.recovery_refused", name, attempt, reason: "held" });
       return "failed";
@@ -460,18 +455,25 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     }
     // After release() the lock is not held, whatever the probe read.
     if (released) throw latch(refusals.lost(name));
-    const refusal =
+    const kind =
       probe === "timeout"
-        ? refusals.unverifiable(name, stalled(`the ownership probe for ${name}`, stallMs))
+        ? "stalled"
         : "error" in probe
-          ? refusals.unverifiable(name, probe.error)
+          ? "rejected"
           : lockOwnershipLost(probe.rows[0], pid)
-            ? refusals.lost(name)
+            ? "lost"
             : undefined;
-    if (refusal === undefined) return;
-    const outcome = await recover(
-      probe === "timeout" ? "stalled" : "error" in probe ? "rejected" : "lost",
-    );
+    if (kind === undefined) return;
+    const refusal =
+      kind === "lost"
+        ? refusals.lost(name)
+        : refusals.unverifiable(
+            name,
+            probe !== "timeout" && "error" in probe
+              ? probe.error
+              : stalled(`the ownership probe for ${name}`, stallMs),
+          );
+    const outcome = await recover(kind);
     if (outcome === "released") throw latch(refusals.lost(name));
     if (outcome === "recovered") return;
     throw latch(outcome === "failed" ? refusal : refusals.unverifiable(name, outcome.stalled));

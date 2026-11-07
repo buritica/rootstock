@@ -37,10 +37,9 @@ async function caught(p: Promise<unknown>): Promise<unknown> {
 /** Takes the lock on `first`; each later open (a recovery after a stalled probe) hands out the next of `rest`. */
 function takeOn(
   deps: LockDeps,
-  first: FakeSession,
-  ...rest: FakeSession[]
+  sessions: readonly FakeSession[],
+  slice: LockSlice = SLICE,
 ): { lock: Promise<RunLock>; opens: () => number } {
-  const sessions = [first, ...rest];
   let opens = 0;
   const open = () => {
     const s = sessions[opens];
@@ -48,7 +47,7 @@ function takeOn(
     if (s === undefined) throw new Error("fake: no session left to open");
     return s;
   };
-  return { lock: acquireRunLock(open, SLICE, "alpha-sync", deps), opens: () => opens };
+  return { lock: acquireRunLock(open, slice, "alpha-sync", deps), opens: () => opens };
 }
 
 /** A statement that never answers. */
@@ -1016,7 +1015,7 @@ describe("round 2: the gate never drops, outlives or outwaits the lock", () => {
     const deps = manualDeps();
     const lock = await take(s, deps);
     s.answer("L3", [{ pid: PID + 1, held: 0 }]);
-    s.answer("L4", () => new Promise<Row[]>(() => {}));
+    s.answer("L4", hang);
     const gate = caught(lock.ensureExclusive());
     await deps.advance(60_000);
     const err = (await gate) as RootstockLockError;
@@ -1073,7 +1072,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const { lock: taking, opens } = takeOn(deps, s1, s2);
+    const { lock: taking, opens } = takeOn(deps, [s1, s2]);
     const lock = await taking;
     s1.answer("L3", hang);
     s2.answer("L4", [{ locked: true, pid: PID + 7, holder: lock.holder }]);
@@ -1110,7 +1109,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     s2.answer("L4", [{ locked: false, pid: PID + 1, holder: "another-run" }]);
     const gate = caught(lock.ensureExclusive());
@@ -1132,7 +1131,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     const ours = { locked: false, pid: PID + 1, holder: lock.holder };
     s2.answer("L4", [ours], [ours], [{ locked: true, pid: PID + 1, holder: lock.holder }]);
@@ -1149,10 +1148,10 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
-    s2.answer("L4", ...Array.from({ length: 2_000 }, () => ours));
+    s2.answer("L4", ...Array.from({ length: 1 + 60_000 / SLICE.wait.pollIntervalMs }, () => ours));
     const gate = caught(lock.ensureExclusive());
     await deps.advance(60_000);
     let settled = false;
@@ -1171,7 +1170,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     s2.answer(
       "L4",
@@ -1190,7 +1189,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     {
       const s1 = fakeSession();
       const s2 = fakeSession();
-      const lock = await takeOn(deps, s1, s2).lock;
+      const lock = await takeOn(deps, [s1, s2]).lock;
       s1.answer("L3", hang);
       s2.answer("L4", [{ locked: false, pid: PID + 1, holder: lock.holder }], new Error("reset"));
       const gate = caught(lock.ensureExclusive());
@@ -1201,7 +1200,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     {
       const s1 = fakeSession();
       const s2 = fakeSession();
-      const lock = await takeOn(deps, s1, s2).lock;
+      const lock = await takeOn(deps, [s1, s2]).lock;
       s1.answer("L3", hang);
       s2.answer("L4", () => [{ locked: false, pid: PID + 1, holder: lock.holder }]);
       const gate = caught(lock.ensureExclusive());
@@ -1217,7 +1216,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     s2.answer("L4", [{ locked: true, pid: PID + 1, holder: "someone-else" }]);
     const gate = caught(lock.ensureExclusive());
@@ -1239,16 +1238,8 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     });
     const s = fakeSession();
     const deps = manualDeps();
-    let opens = 0;
-    const lock = await acquireRunLock(
-      () => {
-        opens += 1;
-        return s;
-      },
-      slice,
-      "alpha-sync",
-      deps,
-    );
+    const { lock: taking, opens } = takeOn(deps, [s], slice);
+    const lock = await taking;
     s.answer("L3", [{ pid: PID, held: 0 }], hang);
     s.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
     await lock.ensureExclusive();
@@ -1258,7 +1249,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
     expect((err.cause as Error).message).toBe(PROBE_STALL);
     expect(deps.events.at(-1)).toMatchObject({ type: "lock.recovery_exhausted", recoveries: 1 });
-    expect(opens).toBe(1);
+    expect(opens()).toBe(1);
     expect(s.closes).toBe(0);
   });
 
@@ -1266,7 +1257,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     s2.answer("L4", hang);
     const gate = caught(lock.ensureExclusive());
@@ -1282,7 +1273,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     s1.close = () => new Promise<void>(() => {});
     s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
@@ -1303,7 +1294,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     s1.answer("L3", hang);
     const closeErr = new Error("end failed");
     s1.failClose(closeErr);
@@ -1323,7 +1314,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
   test("an open that throws is a failed recovery: UNVERIFIABLE with the probe's stall", async () => {
     const s1 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1).lock;
+    const lock = await takeOn(deps, [s1]).lock;
     s1.answer("L3", hang);
     const gate = caught(lock.ensureExclusive());
     await deps.advance(60_000);
@@ -1342,7 +1333,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const { lock: taking, opens } = takeOn(deps, s1, s2);
+    const { lock: taking, opens } = takeOn(deps, [s1, s2]);
     const lock = await taking;
     s1.answer("L3", hang);
     let closed: () => void = () => {};
@@ -1366,7 +1357,7 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     const s1 = fakeSession();
     const s2 = fakeSession();
     const deps = manualDeps();
-    const lock = await takeOn(deps, s1, s2).lock;
+    const lock = await takeOn(deps, [s1, s2]).lock;
     let failTick: (err: Error) => void = () => {};
     s1.answer(
       "L3",

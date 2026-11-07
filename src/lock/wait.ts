@@ -81,11 +81,7 @@ async function awaitTurn(
 }
 
 /** §2.6: take the turn, then poll L1 until it is ours, then fence (§2.5 step 5 on). */
-export async function pollAcquire(
-  a: Attempt,
-  open: () => LockSession,
-  wait: LockWait,
-): Promise<RunLock> {
+export async function pollAcquire(a: Attempt, wait: LockWait): Promise<RunLock> {
   const { deps, name, slice, emit } = a;
   const { signal } = wait;
   const start = deps.now();
@@ -122,7 +118,7 @@ export async function pollAcquire(
     if (queued === "aborted") throw refused(a, refusals.abandoned(name, report("aborted")));
     if (queued === "timeout") throw refused(a, refusals.heldAfterWait(name, report("timeout")));
 
-    session = open();
+    session = a.open();
     for (;;) {
       let row: Record<string, unknown> | undefined;
       let polled: { value: Record<string, unknown>[] } | "timeout" | "aborted";

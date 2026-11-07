@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { type Socket, SQL } from "bun";
-import postgres from "postgres";
-import { bunSqlOptions, postgresJsOptions, type Sql } from "../db/index.ts";
+import type { Socket } from "bun";
+import type { Sql } from "../db/index.ts";
 import {
   openSecond,
   openTestTransactor,
@@ -10,7 +9,13 @@ import {
 import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
-import { killBackend, LOCK_CLIENT, lockDriver, testUrl } from "./fixtures.pg-support.ts";
+import {
+  killBackend,
+  lockDriver,
+  openBunSqlClient,
+  openPostgresJsClient,
+  testUrl,
+} from "./fixtures.pg-support.ts";
 import {
   acquireRunLock,
   type LockDeps,
@@ -110,15 +115,8 @@ function startProxy(): Proxy {
 function open(url: string): () => LockSession {
   return () =>
     driver === "bun-sql"
-      ? bunSqlLockSession(new SQL(url, { ...bunSqlOptions(LOCK_CLIENT, "lock"), max: 1 }), slice)
-      : postgresJsLockSession(
-          postgres(url, {
-            ...(postgresJsOptions(LOCK_CLIENT, "lock") as postgres.Options<Record<string, never>>),
-            max: 1,
-            onnotice: () => {},
-          }),
-          slice,
-        );
+      ? bunSqlLockSession(openBunSqlClient(1, url), slice)
+      : postgresJsLockSession(openPostgresJsClient(1, url), slice);
 }
 
 function deps(events: LockEvent[]): LockDeps {
@@ -142,7 +140,8 @@ function deps(events: LockEvent[]): LockDeps {
 
 const acquiredPid = (events: LockEvent[]) => {
   const e = events.find((x) => x.type === "lock.acquired");
-  return e?.type === "lock.acquired" ? e.pid : -1;
+  if (e?.type !== "lock.acquired") throw new Error("no lock.acquired event");
+  return e.pid;
 };
 
 async function backendAlive(pid: number): Promise<boolean> {

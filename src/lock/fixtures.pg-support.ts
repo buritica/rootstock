@@ -40,16 +40,16 @@ export const LOCK_CLIENT = clientSlice({
   },
 });
 
-export function openPostgresJsClient(max = 1): postgres.Sql {
-  return postgres(testUrl(), {
+export function openPostgresJsClient(max = 1, url = testUrl()): postgres.Sql {
+  return postgres(url, {
     ...(postgresJsOptions(LOCK_CLIENT, "lock") as postgres.Options<Record<string, never>>),
     max,
     onnotice: () => {},
   });
 }
 
-export function openBunSqlClient(max = 1): SQL {
-  return new SQL(testUrl(), { ...bunSqlOptions(LOCK_CLIENT, "lock"), max });
+export function openBunSqlClient(max = 1, url = testUrl()): SQL {
+  return new SQL(url, { ...bunSqlOptions(LOCK_CLIENT, "lock"), max });
 }
 
 /** `Sql` over a raw driver client: the tagged template and `unsafe`, as rows. */
