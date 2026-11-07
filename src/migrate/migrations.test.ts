@@ -132,6 +132,7 @@ CREATE TABLE runs (
 );
 CREATE INDEX runs_job_started_idx ON runs (job, started_at DESC);
 CREATE INDEX runs_running_idx ON runs (lock_name) WHERE status = 'running';
+CREATE INDEX runs_job_ok_idx ON runs (job, started_at DESC, id DESC) WHERE status = 'ok';
 `,
   "20261107145201_quarantine.sql": `-- rootstock-migration: additive
 -- Records a run could not load, one row per (job, external id). A repeat failure

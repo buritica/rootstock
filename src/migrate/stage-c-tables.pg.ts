@@ -259,6 +259,7 @@ describe("the Stage D tables (R-D1)", () => {
     expect(indexes.map((r) => r.def)).toEqual([
       `CREATE UNIQUE INDEX quarantine_job_external_idx ON ${s}.quarantine USING btree (job, external_id)`,
       `CREATE INDEX quarantine_pending_idx ON ${s}.quarantine USING btree (job) WHERE (status = 'pending'::text)`,
+      `CREATE INDEX runs_job_ok_idx ON ${s}.runs USING btree (job, started_at DESC, id DESC) WHERE (status = 'ok'::text)`,
       `CREATE INDEX runs_job_started_idx ON ${s}.runs USING btree (job, started_at DESC)`,
       `CREATE INDEX runs_running_idx ON ${s}.runs USING btree (lock_name) WHERE (status = 'running'::text)`,
     ]);

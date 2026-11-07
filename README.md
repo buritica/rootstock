@@ -220,13 +220,19 @@ forward on 0.8.x only: an older line can never ship a migration there.
   driver's `error`, and `runs.record_failed`) when the write failed. The work
   itself may have succeeded; only the record is lost, and the next run under
   the lock settles the row as interrupted. Alert on `runs.record_failed`.
-- **One retry on a lost connection.** When the settle fails with a
+- **Retries on a lost connection.** When the settle fails with a
   connection error (SQLSTATE class 08, 57P01–57P03, or a driver connection
-  error with no SQLSTATE), `finish` retries it once after
-  `deps.sleep(1000)`, at once when no `sleep` is given. If the first attempt
-  had committed before the connection dropped, the retry finds the row
-  settled and answers `settled-elsewhere`. Any other failure, or a second
-  one, is the result: later calls return it and send nothing.
+  error with no SQLSTATE), `finish` retries it up to twice, each after
+  `deps.sleep(1000)` (at once when no `sleep` is given). When a retry finds
+  no running row, it reads the run's own row back: if the first attempt had
+  committed before the connection dropped, the finish counts as written.
+  Any other failure, or a third one, is the result: later calls return it
+  and send nothing.
+- **Events and results carry the raw driver error.** `runs.record_failed`
+  and `finish`'s `error` are the driver's error, unchanged. Some drivers put
+  the statement's parameters in it (the scope, the reason), and a check
+  violation's detail can hold the whole row, so scrub it before shipping it
+  somewhere that should not see run data.
 - **Start the lock's keepalive for every run.** `startRun` does not start
   it. A running row whose fencing row has not beaten for
   `staleHeartbeatSeconds` reads `interrupted` in `verdictFor`, so a run

@@ -27,6 +27,8 @@ export interface RunsStatements {
   readonly finish: string;
   /** R3 discard, params [id, holder]. */
   readonly discard: string;
+  /** R2b: this run's own row once settled, read back after a retried R2 (§20 A25). */
+  readonly settledOwn: string;
   /** R4 snapshot, params [JSON.stringify(jobs)]. */
   readonly snapshot: string;
   /** R5 prune, params [keepDays]. */
@@ -77,6 +79,7 @@ SELECT EXISTS (SELECT 1 FROM ins) AS inserted,
 WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status = 'running'
 RETURNING ${P}::text AS row`,
     discard: `DELETE FROM ${R} WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,
+    settledOwn: `SELECT ${P}::text AS row FROM ${R} r WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status <> 'running'`,
     snapshot: `SELECT j.job,
   (SELECT count(*) FROM ${R} r WHERE r.job = j.job)::text AS total,
   (SELECT ${P} FROM ${R} r WHERE r.job = j.job AND r.status <> 'running'

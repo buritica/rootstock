@@ -577,6 +577,60 @@ describe("record", () => {
     expect(n?.n).toBe("1");
   });
 
+  test("A24: R2's backend killed mid-statement on a one-connection client still settles ok", async () => {
+    const env = await fresh();
+    const lock = await env.acquire("shared-write");
+    const client = lockDriver() === "bun-sql" ? openBunSqlClient() : openPostgresJsClient();
+    const blocker = lockDriver() === "bun-sql" ? openBunSqlClient() : openPostgresJsClient();
+    try {
+      const run = await startRun(
+        client as unknown as Sql,
+        env.runs,
+        { job: "beta-sync", mode: "incremental", lock },
+        { ...env.deps, sleep: (ms) => Bun.sleep(ms) },
+      );
+      // Hold the run's row so R2 blocks on it, then end R2's backend.
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+      let locked: () => void = () => {};
+      const isLocked = new Promise<void>((r) => {
+        locked = r;
+      });
+      const tx = (
+        blocker as unknown as { begin: (fn: (t: Sql) => Promise<void>) => Promise<void> }
+      ).begin(async (t) => {
+        await t.unsafe(`SELECT 1 FROM ${env.R} WHERE id = $1::uuid FOR UPDATE`, [run.id]);
+        locked();
+        await held;
+      });
+      await isLocked;
+      const finishing = run.finish("ok");
+      let pid: number | undefined;
+      for (let i = 0; i < 500 && pid === undefined; i += 1) {
+        const [r] = await sql.unsafe(
+          `SELECT pid FROM pg_stat_activity WHERE query LIKE 'UPDATE%AS r SET%' AND wait_event_type = 'Lock' AND datname = current_database()`,
+        );
+        if (r !== undefined) pid = Number(r.pid);
+        else await Bun.sleep(10);
+      }
+      expect(pid).toBeDefined();
+      await sql.unsafe("SELECT pg_terminate_backend($1::int)", [pid]);
+      release();
+      await tx;
+      expect(await finishing).toMatchObject({ written: true, status: "ok" });
+      const [row] = await sql.unsafe(`SELECT status FROM ${env.R} WHERE id = $1::uuid`, [run.id]);
+      expect(row?.status).toBe("ok");
+      expect(env.events.map((e) => e.type)).not.toContain("runs.record_failed");
+    } finally {
+      await (client as unknown as { end?: () => Promise<void>; close?: () => Promise<void> })
+        .end?.()
+        .catch(() => {});
+      await (blocker as unknown as { end?: () => Promise<void> }).end?.().catch(() => {});
+    }
+  }, 20_000);
+
   test("RD10: a copied history row (zero holder) is never live; R1 under its own lock settles a copied running one", async () => {
     const env = await fresh();
     const history = await seed(env, {

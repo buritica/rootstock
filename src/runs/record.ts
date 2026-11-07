@@ -216,6 +216,8 @@ const E_COUNT = `a non-negative integer of at most ${COUNT_MAX}`;
 const PHASE = /^[a-z0-9_.:-]{1,32}$/;
 const NOTE_MODELS_MAX = 200;
 const MICRO = 1_000_000n;
+/** R2's retries after a lost connection (§20 A24). */
+const R2_RETRIES = 2;
 /**
  * A JSON escape jsonb refuses: NUL, or a surrogate (JSON.stringify writes a
  * paired one as the character itself, so an escaped one is lone). The escape
@@ -352,7 +354,7 @@ function identityOf(
 }
 
 /** `account`'s argument checked and copied (INPUT on the first bad field). */
-function checkAccounting(input: unknown, job: string): Accounting {
+function checkAccounting(input: unknown, job: string, maxBytes: number): Accounting {
   const fail = (detail: string) => refusals.input(`account(): ${detail}`, job);
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw fail(`the accounting must be an object — got ${q(input)}`);
@@ -384,6 +386,10 @@ function checkAccounting(input: unknown, job: string): Accounting {
   }
   if (sum !== out.excluded) {
     throw fail(`excludedReasons sum to ${sum}, not excluded ${out.excluded}`);
+  }
+  const size = bytes(JSON.stringify(Object.fromEntries(reasons)));
+  if (size > maxBytes) {
+    throw fail(`excludedReasons is ${size} bytes of JSON, over maxScopeBytes ${maxBytes}`);
   }
   return { ...(out as unknown as Accounting), excludedReasons: Object.fromEntries(reasons) };
 }
@@ -537,12 +543,27 @@ function makeRun(
       ]);
     let rows: Row[];
     try {
-      try {
-        rows = await r2();
-      } catch (error) {
-        if (!connectionLost(error)) throw error;
-        await sleep?.(1000);
-        rows = await r2();
+      let retries = 0;
+      for (;;) {
+        try {
+          rows = await r2();
+          break;
+        } catch (error) {
+          // Up to two retries, on a lost connection only (§20 A13, A24): on
+          // one postgres.js connection the first retry can read the dead
+          // socket's stale 57P01.
+          if (retries >= R2_RETRIES || !connectionLost(error)) throw error;
+          retries += 1;
+          await sleep?.(1000);
+        }
+      }
+      // A retry finding no running row may follow a first attempt that
+      // committed before its reply was lost: R2b reads the row back (A25).
+      if (rows.length === 0 && retries > 0) {
+        const [own] = await sql.unsafe(statements.settledOwn, [id, holder]);
+        if (own !== undefined && JSON.parse(String(own.row)).status !== "interrupted") {
+          rows = [own];
+        }
       }
     } catch (error) {
       emit({ type: "runs.record_failed", id, job, operation: "finish", ...failure(error) });
@@ -617,7 +638,7 @@ function makeRun(
     account(a: Accounting) {
       open("account");
       if (!decl.reconciles) throw input(`account(): ${job} is declared reconciles: false`);
-      accounting = checkAccounting(a, job);
+      accounting = checkAccounting(a, job, slice.maxScopeBytes);
     },
     override(flag: string) {
       open("override");

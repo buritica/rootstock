@@ -10,7 +10,7 @@ import { PROJECTION, runsStatements } from "./statements.ts";
 // R-D2 (contract §13.2): the run record against a fake Sql that records every
 // statement it is sent and answers from a script.
 
-type Id = "R1" | "R2" | "R3" | "R4" | "R5";
+type Id = "R1" | "R2" | "R2b" | "R3" | "R4" | "R5";
 type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[]);
 
 const HOLDER = "00000000-0000-4000-8000-0000000000aa";
@@ -66,10 +66,12 @@ function fakeSql(slice: RunsSlice): Fake {
     [s.discard, "R3"],
     [s.snapshot, "R4"],
     [s.prune, "R5"],
+    [s.settledOwn, "R2b"],
   ]);
   const defaults: Record<Id, Answer> = {
     R1: [{ inserted: true, started_at_ms: String(STARTED_MS), settled: "[]" }],
     R2: finishedRow,
+    R2b: [],
     R3: [{ ok: 1 }],
     R4: [],
     R5: [{ deleted: "0" }],
@@ -480,6 +482,16 @@ describe("RR1: count, meter, account, override and scope validation", () => {
       );
     }
     expect(() => run.account({ ...ACC, excludedReasons: { "😀": 1 } })).not.toThrow();
+    // The reasons' JSON is held to maxScopeBytes like a scope (§20 A28).
+    const small = await setup("alpha-sync", {
+      slice: runsSlice({ ...runsInput(), maxScopeBytes: 1024 }),
+    });
+    const many = Object.fromEntries(
+      Array.from({ length: 200 }, (_, i) => [`reason-${i}`, i === 0 ? 1 : 0]),
+    );
+    expect(caught(() => small.run.account({ ...ACC, excludedReasons: many })).message).toMatch(
+      /^rootstock runs: account\(\): excludedReasons is \d+ bytes of JSON, over maxScopeBytes 1024$/,
+    );
   });
 
   test("RR4: a non-reconciling job: account throws INPUT", async () => {
@@ -893,15 +905,56 @@ describe("finish", () => {
     }
   });
 
-  test("A13: a second connection failure is cached; without deps.sleep the retry runs at once", async () => {
+  test("A24: two connection failures still settle; a third is cached; without deps.sleep the retries run at once", async () => {
+    const lost = (code: string) => Object.assign(new Error("conn"), { code });
+    const twice = await setup("beta-sync");
+    twice.fake.answer("R2", lost("08006"), lost("57P01"));
+    expect(await twice.run.finish("ok")).toMatchObject({ written: true, status: "ok" });
+    expect(r2(twice.fake)).toHaveLength(3);
+
     const { run, fake, events } = await setup("beta-sync");
-    const first = Object.assign(new Error("conn"), { code: "08006" });
-    const second = Object.assign(new Error("conn"), { code: "08003" });
-    fake.answer("R2", first, second);
-    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: second });
-    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: second });
-    expect(r2(fake)).toHaveLength(2);
+    const third = lost("08003");
+    fake.answer("R2", lost("08006"), lost("57P01"), third);
+    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: third });
+    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: third });
+    expect(r2(fake)).toHaveLength(3);
     expect(events.slice(1).map((e) => e.type)).toEqual(["runs.record_failed"]);
+  });
+
+  test("A25: a retry finding no running row reads its own settled row back (R2b) and counts as written", async () => {
+    const after: RunRow[] = [];
+    const { run, fake, events } = await setup("beta-sync", { afterRun: (r) => void after.push(r) });
+    let committed: Row[] = [];
+    fake.answer(
+      "R2",
+      (p) => {
+        committed = finishedRow(p);
+        throw Object.assign(new Error("closed"), { code: "CONNECTION_CLOSED" });
+      },
+      [],
+    );
+    fake.answer("R2b", () => committed);
+    expect(await run.finish("ok")).toMatchObject({ written: true, status: "ok" });
+    expect(fake.calls.map((c) => c.id).slice(-3)).toEqual(["R2", "R2", "R2b"]);
+    expect(fake.calls.at(-1)?.params).toEqual([ID, HOLDER]);
+    expect(events.slice(1).map((e) => e.type)).toEqual(["runs.finished"]);
+    expect(after).toHaveLength(1);
+
+    // R2b finding the row settled interrupted by a successor: settled elsewhere.
+    const lost = await setup("beta-sync");
+    lost.fake.answer("R2", Object.assign(new Error("closed"), { code: "08006" }), []);
+    lost.fake.answer("R2b", (p) => {
+      const params: unknown[] = Array.from({ length: 19 }, () => null);
+      params.splice(0, 3, p[0], p[1], "interrupted");
+      const [r] = finishedRow(params);
+      return [r as Row];
+    });
+    expect(await lost.run.finish("ok")).toEqual({ written: false, why: "settled-elsewhere" });
+    // Without a retry, an empty R2 sends no R2b.
+    const plain = await setup("beta-sync");
+    plain.fake.answer("R2", []);
+    expect(await plain.run.finish("ok")).toEqual({ written: false, why: "settled-elsewhere" });
+    expect(plain.fake.calls.map((c) => c.id)).not.toContain("R2b");
   });
 
   test("RR8: finish with R2 returning no row → settled-elsewhere", async () => {
@@ -1075,6 +1128,7 @@ describe("RR9: statements", () => {
   const ALL: [string, string, number][] = [
     ["R1", T.start, 5],
     ["R2", T.finish, 19],
+    ["R2b", T.settledOwn, 2],
     ["R3", T.discard, 2],
     ["R4", T.snapshot, 1],
     ["R5", T.prune, 1],
@@ -1108,7 +1162,7 @@ describe("RR9: statements", () => {
     await d.run.discard();
     await runsSnapshot(fake.sql, SLICE, ["alpha-sync"]);
     await pruneRuns(fake.sql, SLICE);
-    const counts: Record<Id, number> = { R1: 5, R2: 19, R3: 2, R4: 1, R5: 1 };
+    const counts: Record<Id, number> = { R1: 5, R2: 19, R2b: 2, R3: 2, R4: 1, R5: 1 };
     const calls = [...fake.calls, ...d.fake.calls];
     expect(new Set(calls.map((c) => c.id))).toEqual(new Set(["R1", "R2", "R3", "R4", "R5"]));
     for (const c of calls) {
@@ -1208,6 +1262,11 @@ SELECT count(*)::text AS deleted FROM d`,
     expect(T.start).toBe(fill(FROZEN.R1));
     expect(T.finish).toBe(fill(FROZEN.R2));
     expect(T.discard).toBe(fill(FROZEN.R3));
+    expect(T.settledOwn).toBe(
+      fill(
+        "SELECT <P(r)>::text AS row FROM <R> r WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status <> 'running'",
+      ),
+    );
     expect(T.snapshot).toBe(fill(FROZEN.R4));
     expect(T.prune).toBe(fill(FROZEN.R5));
     expect(Object.isFrozen(T)).toBe(true);
