@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import * as concurrency from "../concurrency/index.ts";
 import * as db from "../db/index.ts";
+import * as lock from "../lock/index.ts";
 import * as migrate from "../migrate/index.ts";
+import * as queue from "../queue/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type RootstockConfigInput } from "./define.ts";
 import { printRootstockConfig } from "./print.ts";
@@ -29,6 +31,8 @@ const parsers: SliceParsers = {
   clientSlice: db.clientSlice,
   migrateSlice: migrate.migrateSlice,
   concurrencySlice: concurrency.concurrencySlice,
+  lockSlice: lock.lockSlice,
+  queueSlice: queue.queueSlice,
 };
 
 describe("defineRootstockConfig", () => {

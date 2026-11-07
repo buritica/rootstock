@@ -178,6 +178,9 @@ const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
     "../db/index.ts",
     "../migrate/index.ts",
     "../concurrency/index.ts",
+    "../lock/index.ts",
+    "../queue/index.ts",
+    "../internal/slice.ts",
     "../golden/canonical.ts",
   ],
 };

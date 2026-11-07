@@ -40,6 +40,8 @@ export const CAPABILITIES = [
   "transport.slack", // Slack Web API request construction, cursor pagination and error mapping
   // Data layer, concurrency and configuration
   "db.migrate", // migration discovery, ordering, tracking and apply decisions
+  "db.lock", // run locks: acquire, refuse, fence, probe, recover, release, and their events
+  "db.queue", // durable work queue: enqueue, claim, ack, fail, dead letters, cursors, and their events
   "concurrency.map", // bounded-concurrency map and for-each: dispatch order, width and bad-limit behavior, early stop, errors
   "config", // a consumer's composed, validated configuration
 ] as const;

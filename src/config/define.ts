@@ -1,10 +1,15 @@
+import { lockProfileSingle } from "./builtin.ts";
 import type {
   ClientInput,
   ClientSlice,
   ConcurrencyInput,
   ConcurrencySlice,
+  LockInput,
+  LockSlice,
   MigrateInput,
   MigrateSlice,
+  QueueInput,
+  QueueSlice,
   SliceParsers,
 } from "./slices.ts";
 
@@ -19,6 +24,8 @@ export interface RootstockConfigInput {
   client: ClientInput;
   migrate: MigrateInput;
   concurrency: ConcurrencyInput;
+  lock?: LockInput;
+  queue?: QueueInput;
   invariants?: readonly Invariant[];
 }
 
@@ -28,13 +35,25 @@ export interface RootstockConfig {
   readonly client: ClientSlice;
   readonly migrate: MigrateSlice;
   readonly concurrency: ConcurrencySlice;
-  /** Every invariant id, in input order; all of them held, or define threw. */
+  readonly lock: LockSlice | null;
+  readonly queue: QueueSlice | null;
+  /**
+   * Every invariant id, in input order, after the built-in ones that apply
+   * (`lock-profile-single` when there is a lock); all held, or define threw.
+   */
   readonly invariants: readonly string[];
 }
 
 const built = new WeakSet<object>();
 
-const INPUT_KEYS: readonly string[] = ["client", "migrate", "concurrency", "invariants"];
+const INPUT_KEYS: readonly string[] = [
+  "client",
+  "migrate",
+  "concurrency",
+  "lock",
+  "queue",
+  "invariants",
+];
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
 /**
@@ -60,6 +79,10 @@ export function composeRootstockConfig(
   const client = parsers.clientSlice(input.client);
   const migrate = parsers.migrateSlice(input.migrate);
   const concurrency = parsers.concurrencySlice(input.concurrency);
+  // An omitted table schema is the schema rootstock's own migrations run in.
+  const defaults = { schema: migrate.schema };
+  const lock = input.lock === undefined ? null : parsers.lockSlice(input.lock, defaults);
+  const queue = input.queue === undefined ? null : parsers.queueSlice(input.queue, defaults);
 
   // A misspelled key would otherwise drop its slice or its invariants and
   // still build green. The value is never echoed, as in every slice parser.
@@ -74,7 +97,9 @@ export function composeRootstockConfig(
     );
   }
   // Copied once, so a getter-backed entry is read the same in both passes.
-  const invariants = [...(input.invariants ?? [])];
+  // The built-in checks run first and their ids come first, so a consumer
+  // invariant reusing one is refused as a duplicate.
+  const invariants = [...(lock === null ? [] : [lockProfileSingle]), ...(input.invariants ?? [])];
   const ids: string[] = [];
   for (const inv of invariants) {
     const id = (inv as { id?: unknown } | null)?.id;
@@ -92,6 +117,8 @@ export function composeRootstockConfig(
     client,
     migrate,
     concurrency,
+    lock,
+    queue,
     invariants: ids,
   } satisfies Omit<RootstockConfig, typeof rootstockConfigBrand>);
   built.add(config);
