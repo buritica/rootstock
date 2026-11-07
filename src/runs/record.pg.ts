@@ -568,7 +568,7 @@ describe("record", () => {
     expect(n?.n).toBe("1");
   });
 
-  test("RD10: a copied history row (zero holder) is never live and never settled", async () => {
+  test("RD10: a copied history row (zero holder) is never live; R1 under its own lock settles a copied running one", async () => {
     const env = await fresh();
     const history = await seed(env, {
       job: "alpha-sync",
@@ -584,7 +584,7 @@ describe("record", () => {
       status: "running",
     });
     // shared-write is held and fenced by a live holder; the zero holder is still not live.
-    await env.acquire("shared-write");
+    const shared = await env.acquire("shared-write");
     const beta = (await runsSnapshot(sql, env.runs, ["beta-sync"])).get("beta-sync");
     expect(beta?.running.map((r) => [r.id, r.live, r.heartbeatAt])).toEqual([
       [copiedRunning, false, null],
@@ -602,5 +602,23 @@ describe("record", () => {
     const after = (await runsSnapshot(sql, env.runs, ["alpha-sync"])).get("alpha-sync");
     expect(after?.newestOk).toEqual(before as RunRow);
     expect(after?.running.map((r) => [r.id, r.live])).toEqual([[run.id, true]]);
+
+    // The zero holder is never the acquiring holder, so a start under
+    // shared-write settles the copied running row like any other ghost.
+    const beta2 = await startRun(
+      sql,
+      env.runs,
+      { job: "beta-sync", mode: "incremental", lock: shared },
+      env.deps,
+    );
+    expect(env.events).toContainEqual({
+      type: "runs.settled_interrupted",
+      id: copiedRunning,
+      job: "beta-sync",
+      by: beta2.id,
+    });
+    const settled = (await runsSnapshot(sql, env.runs, ["beta-sync"])).get("beta-sync");
+    expect(settled?.newestSettled?.id).toBe(copiedRunning);
+    expect(settled?.newestSettled?.status).toBe("interrupted");
   });
 });

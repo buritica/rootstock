@@ -8,6 +8,11 @@ export interface RunsDeps {
   now: () => number;
   /** Lowercased by rootstock. */
   randomUUID: () => string;
+  /**
+   * Waits `ms`. `finish` sleeps 1000 ms before its one retry of R2 after a
+   * connection failure (§20 A13); without it the retry runs at once.
+   */
+  sleep?: (ms: number) => Promise<void>;
   onEvent?: (e: RunsEvent) => void;
 }
 

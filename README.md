@@ -199,6 +199,25 @@ forward on 0.8.x only: an older line can never ship a migration there.
   two writers race and the last one wins. Hold the run lock for the source
   whose cursor you advance.
 
+### Run record
+
+- **`finish` never throws for the database.** It returns `{ written: true }`
+  when its row settled, `why: "settled-elsewhere"` when a later run under the
+  same lock already settled it as interrupted, and `why: "error"` (with the
+  driver's `error`, and `runs.record_failed`) when the write failed. The work
+  itself may have succeeded; only the record is lost, and the next run under
+  the lock settles the row as interrupted. Alert on `runs.record_failed`.
+- **One retry on a lost connection.** When the settle fails with a
+  connection error (SQLSTATE class 08, 57P01–57P03, or a driver connection
+  error with no SQLSTATE), `finish` retries it once after
+  `deps.sleep(1000)`, at once when no `sleep` is given. If the first attempt
+  had committed before the connection dropped, the retry finds the row
+  settled and answers `settled-elsewhere`. Any other failure, or a second
+  one, is the result: later calls return it and send nothing.
+- **A refused run records no buckets.** `finish("refused")` writes NULL
+  buckets and `reconciled` even after `account()`; counters, tokens and cost
+  are still recorded.
+
 ## Rules
 
 - Inject dependencies (SQL client, `fetch`, clock, logger). Modules never read

@@ -47,6 +47,7 @@ export const RUNS_INPUT: RunsSliceInput = {
   prices: {
     "model-a": { inputPerMTok: 0.1, outputPerMTok: 0.4 },
     "model-b": { inputPerMTok: 1.25, outputPerMTok: 10 },
+    "model-c": { inputPerMTok: 0.7, outputPerMTok: 0 },
   },
   brakes: { "alpha-archive": { share: 0.1, allowance: 50, armAt: 0, rounding: "ceil" } },
   budgets: { "alpha-calls": { limit: 100, windowMinutes: 60 } },

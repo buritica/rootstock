@@ -211,6 +211,43 @@ const E_COUNT = `a non-negative integer of at most ${COUNT_MAX}`;
 const PHASE = /^[a-z0-9_.:-]{1,32}$/;
 const NOTE_MODELS_MAX = 200;
 const MICRO = 1_000_000n;
+/**
+ * A JSON escape jsonb refuses: NUL, or a surrogate (JSON.stringify writes a
+ * paired one as the character itself, so an escaped one is lone). The escape
+ * must start an odd run of backslashes: "\\\\u0000" is a literal backslash.
+ */
+const UNSTORABLE = /(?<!\\)(?:\\\\)*\\u(0000|d[89a-f][0-9a-f]{2})/;
+/** A lone surrogate: with the u flag a paired one is a single code point. */
+const LONE_SURROGATE = /\p{Cs}/u;
+/** SQLSTATEs of a lost connection (§20 A13). */
+const CONNECTION_STATE = /^(08...|57P0[123])$/;
+/** postgres.js and Bun.SQL codes, and socket errnos, of a lost connection with no SQLSTATE. */
+const CONNECTION_CODE =
+  /^(CONNECTION_(CLOSED|ENDED|DESTROYED)|CONNECT_TIMEOUT|ERR_POSTGRES_(CONNECTION_CLOSED|CONNECTION_TIMEOUT|IDLE_TIMEOUT|LIFETIME_TIMEOUT)|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTCONN|EHOSTUNREACH|ENETUNREACH)$/;
+
+/** Whether `err` is a lost connection: R2 is retried once on one (§20 A13). */
+function connectionLost(err: unknown): boolean {
+  const state = pgCode(err);
+  if (state !== undefined) return CONNECTION_STATE.test(state);
+  let current: unknown = err;
+  for (let hop = 0; hop < 5; hop += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    try {
+      const { code, errno, cause } = current as {
+        code?: unknown;
+        errno?: unknown;
+        cause?: unknown;
+      };
+      if (typeof code === "string" && CONNECTION_CODE.test(code)) return true;
+      if (typeof errno === "string" && CONNECTION_CODE.test(errno)) return true;
+      if (cause === undefined || cause === current) return false;
+      current = cause;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
 
 /** `s` cut to its first `max` characters (code points, so no surrogate is split). */
 function cut(s: string, max: number): string {
@@ -274,7 +311,7 @@ function identityOf(
   a: Accounting | null,
 ): Identity {
   const none = [null, null, null, null, null] as Identity["buckets"];
-  if (!decl.reconciles || (a === null && status === "refused")) {
+  if (!decl.reconciles || status === "refused") {
     return {
       status,
       buckets: none,
@@ -329,8 +366,10 @@ function checkAccounting(input: unknown, job: string): Accounting {
   let sum = 0;
   const reasons: [string, number][] = [];
   for (const [reason, n] of Object.entries(raw)) {
-    if (reason.length === 0 || reason.includes("\0")) {
-      throw fail(`excludedReasons keys must be non-empty with no NUL — got ${q(reason)}`);
+    if (reason.length === 0 || reason.includes("\0") || LONE_SURROGATE.test(reason)) {
+      throw fail(
+        `excludedReasons keys must be non-empty with no NUL or lone surrogate — got ${q(reason)}`,
+      );
     }
     if (!intIn(n, 0, COUNT_MAX))
       throw fail(`excludedReasons[${q(reason)}] must be ${E_COUNT} — got ${q(n)}`);
@@ -389,7 +428,7 @@ export async function startRun(
     emit({ type: "runs.settled_interrupted", id: s.id, job: s.job, by: id });
   }
   emit({ type: "runs.started", id, job, mode, lockName, settled: settled.length });
-  return makeRun(sql, slice, statements, decl, emit, args.afterRun, {
+  return makeRun(sql, slice, statements, decl, emit, args.afterRun, deps.sleep, {
     id,
     job,
     mode,
@@ -415,6 +454,7 @@ function makeRun(
   decl: JobDecl,
   emit: Emit,
   afterRun: ((row: RunRow) => void | Promise<void>) | undefined,
+  sleep: RunsDeps["sleep"],
   ids: Identifiers,
 ): Run {
   const { id, job, holder } = ids;
@@ -446,8 +486,13 @@ function makeRun(
         `scope(): ${what} is ${size} bytes of JSON, over maxScopeBytes ${slice.maxScopeBytes}`,
       );
     }
-    // jsonb refuses the NUL escape, which would lose the whole record at finish.
-    if (text.includes("\\u0000")) throw input(`scope(): ${what} contains a NUL character`);
+    // jsonb refuses these escapes, which would lose the whole record at finish.
+    const bad = UNSTORABLE.exec(text);
+    if (bad !== null) {
+      throw input(
+        `scope(): ${what} contains ${bad[1] === "0000" ? "a NUL character" : "a lone UTF-16 surrogate"}`,
+      );
+    }
     return text;
   };
 
@@ -466,9 +511,8 @@ function makeRun(
           ? identity.failed
           : `${identity.failed}; ${given}`;
     const reason = composed === undefined ? null : cut(composed, slice.maxReasonChars);
-    let rows: Row[];
-    try {
-      rows = await sql.unsafe(statements.finish, [
+    const r2 = () =>
+      sql.unsafe(statements.finish, [
         id,
         holder,
         identity.status,
@@ -485,6 +529,15 @@ function makeRun(
         JSON.stringify(overrides),
         reason,
       ]);
+    let rows: Row[];
+    try {
+      try {
+        rows = await r2();
+      } catch (error) {
+        if (!connectionLost(error)) throw error;
+        await sleep?.(1000);
+        rows = await r2();
+      }
     } catch (error) {
       emit({ type: "runs.record_failed", id, job, operation: "finish", ...failure(error) });
       return { written: false, why: "error", error };

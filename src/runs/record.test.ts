@@ -367,7 +367,7 @@ describe("startRun", () => {
     }
   });
 
-  test("RR12: the fence is read after the gate, in the same R1 (deterministic order)", async () => {
+  test("the fence is read after the gate, in the same R1 (deterministic order)", async () => {
     // The fake session rewrites the fence inside the gate; R1 is sent only after it resolves.
     const order: string[] = [];
     const fake = fakeSql(SLICE);
@@ -472,6 +472,14 @@ describe("RR1: count, meter, account, override and scope validation", () => {
       expect((err as { code?: string }).code).toBe(INPUT);
       expect(err.message).toBe(`rootstock runs: account(): ${text}`);
     }
+    for (const key of ["", "a\u0000", "\ud800x"]) {
+      const err = caught(() => run.account({ ...ACC, excludedReasons: { [key]: 1 } }));
+      expect((err as { code?: string }).code).toBe(INPUT);
+      expect(err.message).toStartWith(
+        "rootstock runs: account(): excludedReasons keys must be non-empty with no NUL or lone surrogate — got ",
+      );
+    }
+    expect(() => run.account({ ...ACC, excludedReasons: { "😀": 1 } })).not.toThrow();
   });
 
   test("RR4: a non-reconciling job: account throws INPUT", async () => {
@@ -516,6 +524,14 @@ describe("RR1: count, meter, account, override and scope validation", () => {
     expect(caught(() => run.scope(["a\u0000b"])).message).toBe(
       "rootstock runs: scope(): value contains a NUL character",
     );
+    expect(caught(() => run.scope(["a", "\ud800"])).message).toBe(
+      "rootstock runs: scope(): value contains a lone UTF-16 surrogate",
+    );
+    expect(caught(() => run.scope(["a"], { k: "\udc00x" })).message).toBe(
+      "rootstock runs: scope(): excluded contains a lone UTF-16 surrogate",
+    );
+    // A literal backslash before "u0000" is not an escape; a paired surrogate is fine.
+    expect(() => run.scope(["a\\u0000", "\\\\u0000", "😀"])).not.toThrow();
   });
 });
 
@@ -648,6 +664,23 @@ describe("finish", () => {
     expect(events.some((e) => e.type === "runs.identity_failed")).toBe(false);
   });
 
+  test("RR6c: a refused finish after account(): buckets and reconciled NULL, counts, tokens and cost kept (A11)", async () => {
+    const { run, fake, events } = await setup();
+    run.account({ listed: 3, written: 1, unchanged: 0, quarantined: 0, excluded: 0 });
+    run.count("pages", 2);
+    run.meter("model-a", 1_000_000, 0);
+    expect(await run.finish("refused")).toMatchObject({
+      status: "refused",
+      reconciled: null,
+      costUsd: "0.100000",
+    });
+    const p = r2(fake)[0] ?? [];
+    expect(p.slice(2, 11)).toEqual(["refused", null, null, null, null, null, null, null, null]);
+    expect(p[11]).toBe('{"pages":2}');
+    expect(p[12]).toBe('{"model-a":{"input":1000000,"output":0}}');
+    expect(events.some((e) => e.type === "runs.identity_failed")).toBe(false);
+  });
+
   test("RR5: cost", async () => {
     const unmetered = await setup("beta-sync");
     expect(await unmetered.run.finish("ok")).toMatchObject({
@@ -663,6 +696,11 @@ describe("finish", () => {
     for (let i = 0; i < 3; i++) drift.run.meter("model-a", 1, 0);
     drift.run.meter("model-a", 999_999, 0);
     expect(await drift.run.finish("ok")).toMatchObject({ costUsd: "0.100000", costNote: null });
+    // 0.7 $/MTok × 45 tokens is 31.5 micro: half up gives 32, while the float
+    // product 31.499999999999996 would round to 31.
+    const divergent = await setup("gamma-push");
+    divergent.run.meter("model-c", 45, 0);
+    expect(await divergent.run.finish("ok")).toMatchObject({ costUsd: "0.000032" });
     const exact = await setup("gamma-push");
     exact.run.meter("model-a", 3_000_000, 0);
     expect(await exact.run.finish("ok")).toMatchObject({ costUsd: "0.300000" });
@@ -803,9 +841,10 @@ describe("finish", () => {
 
   test("RR7: finish with R2 rejecting → { written: false, why: error }, runs.record_failed, never throws", async () => {
     const { run, fake, events } = await setup("beta-sync");
-    const boom = Object.assign(new Error("conn"), { code: "08006" });
+    const boom = Object.assign(new Error("check"), { code: "23514" });
     fake.answer("R2", boom);
     expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: boom });
+    expect(r2(fake)).toHaveLength(1);
     expect(events.slice(1)).toEqual([
       {
         type: "runs.record_failed",
@@ -813,12 +852,54 @@ describe("finish", () => {
         job: "beta-sync",
         operation: "finish",
         error: boom,
-        code: "08006",
+        code: "23514",
       },
     ]);
     const missing = await setup("beta-sync");
     missing.fake.answer("R2", Object.assign(new Error("no table"), { code: "42P01" }));
     expect(await missing.run.finish("ok")).toMatchObject({ written: false, why: "error" });
+  });
+
+  test("A13: one connection failure on R2 is retried once after sleep(1000) and the row settles ok", async () => {
+    const lost = [
+      Object.assign(new Error("admin shutdown"), { code: "57P01" }),
+      Object.assign(new Error("socket"), { code: "08006" }),
+      Object.assign(new Error("closed"), { code: "CONNECTION_CLOSED" }),
+      Object.assign(new Error("closed"), { code: "ERR_POSTGRES_CONNECTION_CLOSED" }),
+      new Error("wrapped", { cause: Object.assign(new Error("reset"), { errno: "ECONNRESET" }) }),
+    ];
+    for (const failure of lost) {
+      const fake = fakeSql(SLICE);
+      const events: RunsEvent[] = [];
+      const slept: number[] = [];
+      const run = await startRun(
+        fake.sql,
+        SLICE,
+        { job: "beta-sync", mode: "incremental", lock: fakeLock("shared-write") },
+        {
+          now: () => STARTED_MS,
+          randomUUID: () => ID,
+          sleep: async (ms) => void slept.push(ms),
+          onEvent: (e) => events.push(e),
+        },
+      );
+      fake.answer("R2", failure);
+      expect(await run.finish("ok")).toMatchObject({ written: true, status: "ok" });
+      expect(slept).toEqual([1000]);
+      expect(r2(fake)).toHaveLength(2);
+      expect(events.map((e) => e.type)).toEqual(["runs.started", "runs.finished"]);
+    }
+  });
+
+  test("A13: a second connection failure is cached; without deps.sleep the retry runs at once", async () => {
+    const { run, fake, events } = await setup("beta-sync");
+    const first = Object.assign(new Error("conn"), { code: "08006" });
+    const second = Object.assign(new Error("conn"), { code: "08003" });
+    fake.answer("R2", first, second);
+    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: second });
+    expect(await run.finish("ok")).toEqual({ written: false, why: "error", error: second });
+    expect(r2(fake)).toHaveLength(2);
+    expect(events.slice(1).map((e) => e.type)).toEqual(["runs.record_failed"]);
   });
 
   test("RR8: finish with R2 returning no row → settled-elsewhere", async () => {
