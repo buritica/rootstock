@@ -301,11 +301,14 @@ async function put(
   st: QuarantineStatements,
   args: PutArgs,
   json: string,
-  emit: Emit,
 ): Promise<void> {
   const params: (string | null)[] = [args.job, args.externalId, json, args.reason];
   if (st.putTakesRunId) params.push(args.runId);
   await guarded(t.table, () => tx.unsafe(st.put, params), args.job);
+}
+
+/** `runs.quarantined`, sent once the write (and its savepoint, if any) settled. */
+function quarantined(emit: Emit, st: QuarantineStatements, args: PutArgs): void {
   // The run id the row stores: none on a table without a run column.
   const runId = st.putTakesRunId ? args.runId : null;
   emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId });
@@ -328,7 +331,8 @@ export async function quarantine(
   const st = statementsOf("quarantine", t);
   const args = putArgs("quarantine", t, a);
   const json = payloadJson("quarantine", t, args, a.payload);
-  await put(tx, t, st, args, json, emitter(deps?.onEvent));
+  await put(tx, t, st, args, json);
+  quarantined(emitter(deps?.onEvent), st, args);
 }
 
 const isNoTable = (err: unknown): boolean => runsErrorCode(err) === "ERR_ROOTSTOCK_RUNS_NOTABLE";
@@ -354,10 +358,11 @@ export async function quarantineSafe(
   const emit = emitter(deps?.onEvent);
   const attempt = (payload: string): Promise<void> =>
     "savepoint" in scope
-      ? scope.savepoint((sp) => put(sp, t, st, args, payload, emit))
-      : put(scope.sql, t, st, args, payload, emit);
+      ? scope.savepoint((sp) => put(sp, t, st, args, payload))
+      : put(scope.sql, t, st, args, payload);
   try {
     await attempt(payloadJson("quarantineSafe", t, args, a.payload));
+    quarantined(emit, st, args);
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;
@@ -367,6 +372,7 @@ export async function quarantineSafe(
     await attempt(
       payloadJson("quarantineSafe", t, args, { externalId: args.externalId, truncated: true }),
     );
+    quarantined(emit, st, args);
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;

@@ -178,6 +178,15 @@ forward on 0.8.x only: an older line can never ship a migration there.
 - **`"contended"` means retry.** `enqueue` returns `"contended"` when another
   writer held the row past `enqueueLockTimeoutMs`. Nothing was written, so
   the caller retries (or drops the event knowingly).
+- **A contended ack leaves the row claimed.** `ack`, `fail` and
+  `extendClaim` (0.8.0) wait at most `ackLockTimeoutMs` for the row; past
+  that they emit `queue.ack_contended` and rethrow the 55P03. The row stays
+  claimed and is reclaimed when the claim expires, with an attempt charged.
+- **Present the claim.** `ack`, `fail` and `extendClaim` take the `claim`
+  the row came back with from `claim`; a stale holder whose row was
+  reclaimed matches nothing and gets `missing`. `extendClaim` answering
+  `"changed"` means new work arrived since the claim: keep going, and the
+  ack releases the row for its next run instead of deleting it.
 - **An enqueue on a dead key is parked.** When the key is dead-lettered, the
   enqueue coalesces into the dead row and reports `queue.enqueued` with
   `result: "on_dead"`. Nothing claims it until someone calls `retryDead`, so

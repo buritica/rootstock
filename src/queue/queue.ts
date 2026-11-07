@@ -371,6 +371,7 @@ export async function extendClaim(
 ): Promise<ExtendResult> {
   const st = statementsOf("extendClaim", s);
   const emit = emitter(hooks);
+  // The whole claim is validated (§9.2), though Q8 sends only its token.
   const c = checkClaim(emit, a.key, a.claim);
   const row = await underAckLock(scope, s, emit, { ...a, operation: "extend" }, st.extendClaim, [
     a.key,

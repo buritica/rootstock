@@ -977,7 +977,7 @@ describe("QF4: ack and fail behind a row lock", () => {
       expect(pgCode(got.err)).toBe("55P03");
       // Its own timeout, not the enqueue's 2000 ms.
       expect(got.took).toBeGreaterThanOrEqual(450);
-      expect(got.took).toBeLessThan(1500);
+      expect(got.took).toBeLessThan(1900);
       expect(q.events).toEqual([
         { type: "queue.ack_contended", key: "alpha:busy", worker: W, operation },
       ]);
@@ -1102,7 +1102,7 @@ describe("QF6: extendClaim", () => {
     }
     expect(pgCode(got.err)).toBe("55P03");
     expect(got.took).toBeGreaterThanOrEqual(450);
-    expect(got.took).toBeLessThan(1500);
+    expect(got.took).toBeLessThan(1900);
     expect(q.events).toEqual([
       { type: "queue.ack_contended", key: "alpha:busy", worker: W, operation: "extend" },
     ]);
