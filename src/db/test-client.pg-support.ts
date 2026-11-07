@@ -25,7 +25,8 @@ export type TestClient =
       close: () => Promise<void>;
     };
 
-function required(name: string): string {
+/** An environment variable the DB suites need, or a throw naming how to run them. */
+export function required(name: string): string {
   const value = process.env[name];
   if (value === undefined || value === "") {
     throw new Error(`${name} is not set — run DB suites through \`bun run test:db\``);
@@ -33,7 +34,8 @@ function required(name: string): string {
   return value;
 }
 
-function testTransactorKind(): TestTransactorKind {
+/** The transactor kind under test. */
+export function testTransactorKind(): TestTransactorKind {
   const kind = required("ROOTSTOCK_TEST_TRANSACTOR");
   const known = TEST_TRANSACTOR_KINDS.find((k) => k === kind);
   if (known === undefined) {

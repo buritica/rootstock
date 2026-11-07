@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { concurrencySlice } from "../concurrency/index.ts";
 import { clientSlice } from "../db/index.ts";
+import { lockSlice } from "../lock/index.ts";
 import { migrateSlice } from "../migrate/index.ts";
+import { QUEUE_INPUT } from "../queue/fixtures.test-support.ts";
+import { queueSlice } from "../queue/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
@@ -34,6 +37,8 @@ const unfrozen = {
     ({
       widths: Object.fromEntries(Object.entries(input.widths).map(([k, w]) => [k, { ...w }])),
     }) as unknown as ConcurrencySlice,
+  lockSlice,
+  queueSlice,
 } satisfies SliceParsers;
 
 const define = defineRootstockConfig;
@@ -130,6 +135,170 @@ const EXAMPLE_PRINT = `{
 }
 `;
 
+// CF2: the example with a lock session profile, a lock slice and a queue
+// slice. The lock is the synthetic one of the contract; the queue carries
+// the queue suites' numbers.
+const exampleWithLockAndQueue: RootstockConfigInput = {
+  ...exampleInput,
+  client: {
+    profiles: {
+      ...exampleInput.client.profiles,
+      lock: {
+        max: 1,
+        maxCeiling: 1,
+        idleTimeoutSeconds: "driver-default",
+        maxLifetimeSeconds: "never",
+        connectTimeoutSeconds: "driver-default",
+        prepare: "driver-default",
+        keepAliveSeconds: "driver-default",
+        statementTimeoutMs: 0,
+        readOnly: false,
+      },
+    },
+  },
+  lock: {
+    profile: "lock",
+    names: ["alpha-sync", "gamma-*"],
+    groups: { writers: ["alpha-sync"] },
+    heartbeatSeconds: 30,
+    probeStallSeconds: 60,
+    maxRecoveries: 5,
+    endTimeoutSeconds: 5,
+    wait: { maxMs: 30000, pollIntervalMs: 1000 },
+  },
+  queue: QUEUE_INPUT,
+};
+
+const EXAMPLE_LOCK_QUEUE_PRINT = `{
+  "client": {
+    "profiles": {
+      "app": {
+        "connectTimeoutSeconds": 30,
+        "idleTimeoutSeconds": 20,
+        "keepAliveSeconds": "driver-default",
+        "max": 5,
+        "maxCeiling": 20,
+        "maxLifetimeSeconds": 600,
+        "prepare": "driver-default",
+        "readOnly": false,
+        "statementTimeoutMs": 0
+      },
+      "lock": {
+        "connectTimeoutSeconds": "driver-default",
+        "idleTimeoutSeconds": "driver-default",
+        "keepAliveSeconds": "driver-default",
+        "max": 1,
+        "maxCeiling": 1,
+        "maxLifetimeSeconds": "never",
+        "prepare": "driver-default",
+        "readOnly": false,
+        "statementTimeoutMs": 0
+      },
+      "reader": {
+        "connectTimeoutSeconds": "driver-default",
+        "idleTimeoutSeconds": "driver-default",
+        "keepAliveSeconds": 60,
+        "max": "driver-default",
+        "maxCeiling": 4,
+        "maxLifetimeSeconds": "never",
+        "prepare": false,
+        "readOnly": true,
+        "statementTimeoutMs": 30000
+      }
+    }
+  },
+  "concurrency": {
+    "widths": {
+      "fetch": {
+        "default": 4,
+        "max": 4
+      },
+      "write": {
+        "default": 2,
+        "max": 8
+      }
+    }
+  },
+  "embed": "absent",
+  "invariants": [
+    "lock-profile-single",
+    "width-below-pool.fetch.app",
+    "app-pool-sane"
+  ],
+  "lock": {
+    "endTimeoutSeconds": 5,
+    "groups": {
+      "writers": [
+        "alpha-sync"
+      ]
+    },
+    "heartbeatSeconds": 30,
+    "maxRecoveries": 5,
+    "names": [
+      "alpha-sync",
+      "gamma-*"
+    ],
+    "probeStallSeconds": 60,
+    "profile": "lock",
+    "table": {
+      "name": "run_locks",
+      "schema": "rootstock"
+    },
+    "wait": {
+      "maxMs": 30000,
+      "pollIntervalMs": 1000
+    }
+  },
+  "migrate": {
+    "accepted": [],
+    "schema": "rootstock"
+  },
+  "queue": {
+    "backoffMinutes": [
+      1,
+      5,
+      30,
+      120,
+      240,
+      480
+    ],
+    "claimTimeoutMinutes": 30,
+    "cursors": {
+      "maxNameChars": 128,
+      "maxValueChars": 512,
+      "table": {
+        "name": "cursors",
+        "schema": "rootstock"
+      },
+      "value": "jsonb"
+    },
+    "enqueueLockTimeoutMs": 2000,
+    "expiredClaimClass": "ExpiredClaim",
+    "kinds": [
+      "put",
+      "drop"
+    ],
+    "maxAttempts": 8,
+    "maxClaimLimit": 500,
+    "maxDebounceSeconds": 900,
+    "maxDebounceSlideMinutes": 15,
+    "maxKeyChars": 512,
+    "maxNameChars": 128,
+    "maxPayloadBytes": 65536,
+    "sources": [
+      "alpha",
+      "beta"
+    ],
+    "stickyKind": "drop",
+    "table": {
+      "name": "work_queue",
+      "schema": "rootstock"
+    }
+  },
+  "runner": "absent"
+}
+`;
+
 /** The whole message of what `fn` throws, so a test can pin it with toBe. */
 function messageOf(fn: () => unknown): string {
   try {
@@ -149,6 +318,10 @@ const fails = (id: string, message: string): Invariant => ({ id, check: () => me
 describe("print", () => {
   test("example-print-pinned", () => {
     expect(printRootstockConfig(define(exampleInput))).toBe(EXAMPLE_PRINT);
+  });
+
+  test("example-with-lock-and-queue-print-pinned", () => {
+    expect(printRootstockConfig(define(exampleWithLockAndQueue))).toBe(EXAMPLE_LOCK_QUEUE_PRINT);
   });
 
   test("absent-slices-printed", () => {
@@ -208,6 +381,8 @@ describe("print", () => {
         for (const w of Object.values(slice.widths)) Object.assign(w, { secret: "token" });
         return slice;
       },
+      lockSlice,
+      queueSlice,
     } satisfies SliceParsers;
     expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
   });
@@ -251,6 +426,14 @@ describe("define", () => {
       concurrencySlice: (i) => {
         calls.push("concurrency");
         return concurrencySlice(i);
+      },
+      lockSlice: (i, d) => {
+        calls.push("lock");
+        return lockSlice(i, d);
+      },
+      queueSlice: (i, d) => {
+        calls.push("queue");
+        return queueSlice(i, d);
       },
     };
     let caught: unknown;
@@ -417,6 +600,8 @@ describe("brand and failure paths", () => {
       clientSlice: (i: ClientInput) => (made.client = clientSlice(i)),
       migrateSlice: (i: MigrateInput) => (made.migrate = migrateSlice(i)),
       concurrencySlice: (i: ConcurrencyInput) => (made.concurrency = concurrencySlice(i)),
+      lockSlice,
+      queueSlice,
     } satisfies SliceParsers;
     const config = composeRootstockConfig(recording, exampleInput);
     expect(config.client).toBe(made.client as typeof config.client);
@@ -590,6 +775,8 @@ describe("brand and failure paths", () => {
       concurrencySlice: () => {
         throw boom;
       },
+      lockSlice,
+      queueSlice,
     } satisfies SliceParsers;
     let caught: unknown;
     try {

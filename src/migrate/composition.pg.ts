@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sql } from "../db/index.ts";
 import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-support.ts";
-import { schemaFactory } from "./fixtures.pg-support.ts";
+import { ROOTSTOCK_COUNT, schemaFactory } from "./fixtures.pg-support.ts";
 import {
   drizzleJournal,
   drizzleTracker,
@@ -116,7 +116,7 @@ describe("composition (B-O3)", () => {
     expect((await cli(["apply", "--manual"], slice, v1)).code).toBe(0);
     expect(await cli(["status"], slice, v1)).toEqual({
       code: 0,
-      lines: ["rootstock: ok (1 applied)", "app: ok (3 applied)"],
+      lines: [`rootstock: ok (${ROOTSTOCK_COUNT} applied)`, "app: ok (3 applied)"],
     });
 
     // The next release adds one additive file: the deploy applies it alone.
@@ -189,7 +189,11 @@ describe("composition (B-O3)", () => {
     expect(rows.map((r) => r.filename)).toEqual(["0000_init.sql", "20261020000000_add.sql"]);
     expect(await cli(["status"], slice, sources)).toEqual({
       code: 0,
-      lines: ["rootstock: ok (1 applied)", "domain: ok (2 applied)", "auth: ok (1 applied)"],
+      lines: [
+        `rootstock: ok (${ROOTSTOCK_COUNT} applied)`,
+        "domain: ok (2 applied)",
+        "auth: ok (1 applied)",
+      ],
     });
   });
 

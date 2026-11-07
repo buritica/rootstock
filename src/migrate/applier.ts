@@ -1,5 +1,5 @@
 import { pgCode, quoteIdentifier, type Transactor, type TxSql } from "../db/index.ts";
-import { own, q, sliceRefusals } from "../internal/slice.ts";
+import { own, q, safeHook, sliceRefusals } from "../internal/slice.ts";
 import { fail, failAs, reason, refusalCode } from "./errors.ts";
 import type { MigrationKind } from "./marker.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
@@ -462,18 +462,9 @@ export async function runMigrations(
 ): Promise<ApplyOutcome> {
   const opts = validateOptions(slice, rawOpts);
   const hook = opts.onEvent;
-  const emit = (e: MigrateEvent): void => {
-    // A hook never changes what a run does, and an async one that rejects
-    // must not become an unhandled rejection mid-deploy.
-    try {
-      const out: unknown = hook?.(e);
-      if (typeof (out as PromiseLike<unknown> | undefined)?.then === "function") {
-        (out as PromiseLike<unknown>).then(undefined, () => undefined);
-      }
-    } catch {
-      // ignored, as above
-    }
-  };
+  // A hook never changes what a run does, and an async one that rejects
+  // must not become an unhandled rejection mid-deploy.
+  const emit = (e: MigrateEvent): void => safeHook(hook, e);
   const texts = stageA ? stageATexts(slice.schema) : SOURCE_TEXTS;
   const run: Run = { slice, sources, opts, texts, emit };
   try {

@@ -3,7 +3,57 @@ import { isRootstockConfig, type RootstockConfig } from "./define.ts";
 
 // Slices later stages add. Each prints as "absent" until its stage lands, so
 // a config golden shows what a repo has not adopted yet.
-const ABSENT = ["embed", "lock", "queue", "runner"] as const;
+const ABSENT = ["embed", "runner"] as const;
+
+const table = (t: { name: string; schema: string }) => ({ name: t.name, schema: t.schema });
+
+function lockView(lock: RootstockConfig["lock"]): unknown {
+  if (lock === null) return "absent";
+  const groups: Record<string, unknown> = {};
+  for (const [name, list] of Object.entries(lock.groups)) groups[name] = [...list];
+  return {
+    endTimeoutSeconds: lock.endTimeoutSeconds,
+    groups,
+    heartbeatSeconds: lock.heartbeatSeconds,
+    maxRecoveries: lock.maxRecoveries,
+    names: [...lock.names],
+    probeStallSeconds: lock.probeStallSeconds,
+    profile: lock.profile,
+    table: table(lock.table),
+    wait: { maxMs: lock.wait.maxMs, pollIntervalMs: lock.wait.pollIntervalMs },
+  };
+}
+
+function queueView(queue: RootstockConfig["queue"]): unknown {
+  if (queue === null) return "absent";
+  const c = queue.cursors;
+  return {
+    backoffMinutes: [...queue.backoffMinutes],
+    claimTimeoutMinutes: queue.claimTimeoutMinutes,
+    cursors:
+      c === null
+        ? "absent"
+        : {
+            maxNameChars: c.maxNameChars,
+            maxValueChars: c.maxValueChars,
+            table: table(c.table),
+            value: c.value,
+          },
+    enqueueLockTimeoutMs: queue.enqueueLockTimeoutMs,
+    expiredClaimClass: queue.expiredClaimClass,
+    kinds: [...queue.kinds],
+    maxAttempts: queue.maxAttempts,
+    maxClaimLimit: queue.maxClaimLimit,
+    maxDebounceSeconds: queue.maxDebounceSeconds,
+    maxDebounceSlideMinutes: queue.maxDebounceSlideMinutes,
+    maxKeyChars: queue.maxKeyChars,
+    maxNameChars: queue.maxNameChars,
+    maxPayloadBytes: queue.maxPayloadBytes,
+    sources: [...queue.sources],
+    stickyKind: queue.stickyKind,
+    table: table(queue.table),
+  };
+}
 
 /**
  * The config as canonical JSON, every field spelled out, for a repo to pin
@@ -40,7 +90,9 @@ export function printRootstockConfig(config: RootstockConfig): string {
     client: { profiles },
     concurrency: { widths },
     invariants: [...config.invariants],
+    lock: lockView(config.lock),
     migrate: { accepted: config.migrate.accepted, schema: config.migrate.schema },
+    queue: queueView(config.queue),
   };
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;

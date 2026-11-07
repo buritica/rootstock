@@ -6,6 +6,7 @@ import {
   type TestTransactor,
 } from "../db/transactor.pg-support.ts";
 import { applyMigrationList, applyRootstockMigrations } from "./apply.ts";
+import { ROOTSTOCK_FILES } from "./fixtures.pg-support.ts";
 import { parseMigration, type RootstockMigration, rootstockMigrations } from "./migrations.ts";
 import { migrateSlice } from "./slice.ts";
 import { rootstockMigrationStatus } from "./status.ts";
@@ -15,6 +16,7 @@ import { rootstockMigrationStatus } from "./status.ts";
 
 const FILE = "20261020000000_schema_migrations.sql";
 const SHIPPED = rootstockMigrations();
+const NAMES = ROOTSTOCK_FILES;
 
 function fixture(filename: string, text: string): RootstockMigration {
   return parseMigration(filename, new TextEncoder().encode(text));
@@ -84,13 +86,13 @@ describe("applyRootstockMigrations", () => {
     const slice = migrateSlice({ schema: schema() });
     const before = await rootstockMigrationStatus(sql, slice);
     expect(before).toMatchObject({ schemaExists: false, tracked: false, applied: [], red: true });
-    expect(before.pending.map((m) => m.filename)).toEqual([FILE]);
+    expect(before.pending.map((m) => m.filename)).toEqual(NAMES);
 
     const report = await applyMigrationList(main.transactor, slice, SHIPPED);
     expect(report).toEqual({
       schema: slice.schema,
       schemaCreated: true,
-      applied: [FILE],
+      applied: NAMES,
       alreadyApplied: 0,
       ahead: [],
     });
@@ -98,14 +100,15 @@ describe("applyRootstockMigrations", () => {
       schema: slice.schema,
       schemaExists: true,
       tracked: true,
-      applied: [FILE],
+      applied: NAMES,
       pending: [],
       ahead: [],
       tampered: [],
       red: false,
     });
     const row = await one<{ sha256: string; stamped: boolean }>(
-      `select sha256, applied_at is not null as stamped from "${slice.schema}".schema_migrations`,
+      `select sha256, applied_at is not null as stamped from "${slice.schema}".schema_migrations where filename = $1`,
+      [FILE],
     );
     expect(row).toEqual({ sha256: SHIPPED[0]?.sha256 ?? "", stamped: true });
   });
@@ -118,10 +121,10 @@ describe("applyRootstockMigrations", () => {
       schema: slice.schema,
       schemaCreated: false,
       applied: [],
-      alreadyApplied: 1,
+      alreadyApplied: SHIPPED.length,
       ahead: [],
     });
-    expect(await rowsOf(slice.schema)).toHaveLength(1);
+    expect(await rowsOf(slice.schema)).toHaveLength(SHIPPED.length);
   });
 
   test("parallel-isolation: two schemas on two backends each hold only their own row", async () => {
@@ -133,10 +136,10 @@ describe("applyRootstockMigrations", () => {
         applyMigrationList(main.transactor, a, SHIPPED),
         applyMigrationList(second.transactor, b, SHIPPED),
       ]);
-      expect(ra.applied).toEqual([FILE]);
-      expect(rb.applied).toEqual([FILE]);
-      expect((await rowsOf(a.schema)).map((r) => r.filename)).toEqual([FILE]);
-      expect((await rowsOf(b.schema)).map((r) => r.filename)).toEqual([FILE]);
+      expect(ra.applied).toEqual(NAMES);
+      expect(rb.applied).toEqual(NAMES);
+      expect((await rowsOf(a.schema)).map((r) => r.filename)).toEqual(NAMES);
+      expect((await rowsOf(b.schema)).map((r) => r.filename)).toEqual(NAMES);
       for (const s of [sql, second.transactor.sql]) {
         const [row] = await s<{ seen: boolean }>`
           select to_regclass('schema_migrations') is not null as "seen"`;
@@ -160,8 +163,9 @@ describe("applyRootstockMigrations", () => {
         const reports = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
         const ok =
           reports.length === 2 &&
-          reports.filter((r) => r.applied.length === 1 && r.applied[0] === FILE).length === 1 &&
-          reports.filter((r) => r.applied.length === 0 && r.alreadyApplied === 1).length === 1;
+          reports.filter((r) => r.applied.join() === NAMES.join()).length === 1 &&
+          reports.filter((r) => r.applied.length === 0 && r.alreadyApplied === SHIPPED.length)
+            .length === 1;
         if (!ok) failures++;
       }
       expect(`${failures}/50 iterations failed`).toBe("0/50 iterations failed");
@@ -177,7 +181,7 @@ describe("applyRootstockMigrations", () => {
       (e: unknown) => e,
     );
     expect(pgCode(err)).toBe("22012");
-    expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual([FILE]);
+    expect((await rowsOf(slice.schema)).map((r) => r.filename)).toEqual(NAMES);
     const leaked = await one<{ t: boolean }>(
       `select to_regclass('"${slice.schema}".ok_t') is not null or to_regclass('ok_t') is not null as t`,
     );
@@ -187,7 +191,7 @@ describe("applyRootstockMigrations", () => {
       schema: slice.schema,
       schemaCreated: false,
       applied: [],
-      alreadyApplied: 1,
+      alreadyApplied: SHIPPED.length,
       ahead: [],
     });
   });
@@ -196,12 +200,20 @@ describe("applyRootstockMigrations", () => {
     const slice = migrateSlice({ schema: schema() });
     await applyMigrationList(main.transactor, slice, SHIPPED);
     const zeros = "0".repeat(64);
-    await sql.unsafe(`update "${slice.schema}".schema_migrations set sha256 = $1`, [zeros]);
+    await sql.unsafe(
+      `update "${slice.schema}".schema_migrations set sha256 = $1 where filename = $2`,
+      [zeros, FILE],
+    );
     const message = await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, EXTRA]));
     expect(message).toBe(
       `applyRootstockMigrations: ${slice.schema}.schema_migrations records ${FILE} with sha256 ${zeros}, but this package ships ${SHIPPED[0]?.sha256} — an applied migration changed after it ran; refusing, and re-running will not fix this`,
     );
-    expect(await rowsOf(slice.schema)).toEqual([{ filename: FILE, sha256: zeros }]);
+    expect(await rowsOf(slice.schema)).toEqual(
+      SHIPPED.map((m) => ({
+        filename: m.filename,
+        sha256: m.filename === FILE ? zeros : m.sha256,
+      })),
+    );
     const status = await rootstockMigrationStatus(sql, slice);
     expect(status.tampered).toEqual([
       { filename: FILE, recorded: zeros, shipped: SHIPPED[0]?.sha256 ?? "" },
@@ -245,7 +257,7 @@ describe("applyRootstockMigrations", () => {
     expect(await refusal(applyMigrationList(main.transactor, slice, [...SHIPPED, EXTRA]))).toBe(
       `applyRootstockMigrations: schema "${name}" has applied ${FUTURE}, which this package does not ship, and is missing ${EXTRA.filename} — the database and this package have diverged; refusing`,
     );
-    expect(await rowsOf(name)).toHaveLength(2);
+    expect(await rowsOf(name)).toHaveLength(SHIPPED.length + 1);
   });
 
   test("heavy: refused without allowHeavy, applied with it", async () => {
@@ -262,7 +274,7 @@ describe("applyRootstockMigrations", () => {
     const report = await applyMigrationList(main.transactor, slice, [...SHIPPED, HEAVY], {
       allowHeavy: true,
     });
-    expect(report.applied).toEqual([FILE, HEAVY.filename]);
+    expect(report.applied).toEqual([...NAMES, HEAVY.filename]);
     const row = await one<{ n: number }>(
       `select count(*)::int as n from "${slice.schema}".heavy_t`,
     );
@@ -303,7 +315,7 @@ describe("applyRootstockMigrations", () => {
       const slice = migrateSlice({ schema: schema() });
       await sql.unsafe(`CREATE SCHEMA "${slice.schema}" AUTHORIZATION rs_app`);
       const report = await asApp(() => applyMigrationList(main.transactor, slice, SHIPPED));
-      expect(report).toMatchObject({ schemaCreated: false, applied: [FILE] });
+      expect(report).toMatchObject({ schemaCreated: false, applied: NAMES });
     });
 
     test("a schema without USAGE or CREATE names what is missing", async () => {
@@ -343,10 +355,10 @@ describe("applyRootstockMigrations", () => {
       const before = await snapshot();
       const slice = migrateSlice({});
       expect(slice.schema).toBe("rootstock");
-      expect((await applyRootstockMigrations(main.transactor, slice)).applied).toEqual([FILE]);
+      expect((await applyRootstockMigrations(main.transactor, slice)).applied).toEqual(NAMES);
       expect(await snapshot()).toEqual(before);
       const status = await rootstockMigrationStatus(sql, slice);
-      expect(status).toMatchObject({ applied: [FILE], ahead: [], red: false });
+      expect(status).toMatchObject({ applied: NAMES, ahead: [], red: false });
     } finally {
       await sql.unsafe("DROP TABLE public.schema_migrations");
     }
@@ -355,7 +367,7 @@ describe("applyRootstockMigrations", () => {
   test("search-path-restored: the same session's search_path is unchanged after commit", async () => {
     const [before] = await sql<{ search_path: string }>`show search_path`;
     const slice = migrateSlice({ schema: schema() });
-    expect((await applyMigrationList(main.transactor, slice, SHIPPED)).applied).toEqual([FILE]);
+    expect((await applyMigrationList(main.transactor, slice, SHIPPED)).applied).toEqual(NAMES);
     const [after] = await sql<{ search_path: string }>`show search_path`;
     expect(after).toEqual(before);
   });

@@ -1,5 +1,5 @@
 import { quoteIdentifier, type Sql, type TxSql } from "../db/index.ts";
-import { q } from "../internal/slice.ts";
+import { q, quoteTable } from "../internal/slice.ts";
 import { fail } from "./errors.ts";
 import { checkIdentifier } from "./identifier.ts";
 import type { MigrateSlice } from "./slice.ts";
@@ -84,7 +84,7 @@ function resolve(tracker: Tracker, slice: MigrateSlice): Resolved {
     tracker,
     schema,
     name: `${schema}.${table}`,
-    sql: `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`,
+    sql: quoteTable({ schema, name: table }),
     // created_at is bigint: ::text keeps it exact and a string on every driver.
     keyExpr: tracker.kind === "drizzle" ? "created_at::text" : "filename",
     hashCol: tracker.kind === "drizzle" ? "hash" : "sha256",

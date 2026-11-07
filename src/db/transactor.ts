@@ -1,3 +1,4 @@
+import { safeHook } from "../internal/slice.ts";
 import { pgCode } from "./pg-code.ts";
 
 export type Row = Record<string, unknown>;
@@ -87,8 +88,9 @@ export interface TransactorScopeInfo {
 }
 
 /**
- * Optional observers. Each is called synchronously; one that throws is
- * ignored, so an observer can never change what a transaction does. They are
+ * Optional observers. Each is called synchronously; one that throws, or
+ * returns a promise that rejects, is ignored, so an observer can never change
+ * what a transaction does. They are
  * handed no error object and no message: a driver's message can carry bound
  * values, so only the SQLSTATE is passed on.
  */
@@ -265,7 +267,7 @@ function enter<N, T>(
         close();
         if (scope.pending.size > 0) {
           const savepointOpen = scope.childOpen;
-          observe(driver.hooks.onWait, {
+          safeHook(driver.hooks.onWait, {
             ...where,
             queries: scope.pending.size - (savepointOpen ? 1 : 0),
             savepointOpen,
@@ -293,7 +295,7 @@ function enter<N, T>(
   } catch (err) {
     // A driver entry that throws instead of rejecting.
     close();
-    observe(driver.hooks.onRollback, { ...where, cause: "driver", code: pgCode(err) });
+    safeHook(driver.hooks.onRollback, { ...where, cause: "driver", code: pgCode(err) });
     return Promise.reject(err);
   }
   return Promise.resolve(settled as PromiseLike<T>)
@@ -310,7 +312,7 @@ function enter<N, T>(
       // A savepoint that failed after its parent's fn settled: nobody in that
       // fn could handle it, so its work is not committed without it.
       if (parent?.closed) fail(parent, err, "savepoint-failed-late");
-      observe(driver.hooks.onRollback, { ...where, cause: cause ?? "driver", code: pgCode(err) });
+      safeHook(driver.hooks.onRollback, { ...where, cause: cause ?? "driver", code: pgCode(err) });
       throw err;
     });
 }
@@ -333,15 +335,6 @@ function track(scope: Scope, err: unknown, by: TransactorRollbackCause): void {
   // pgCode also matches a few socket errors (EPIPE); those leave the
   // transaction dead anyway, so tracking them is harmless.
   if (pgCode(err) !== undefined) fail(scope, err, by);
-}
-
-/** Calls an observer, if there is one; what it throws is dropped. */
-function observe<I>(hook: ((info: I) => void) | undefined, info: I): void {
-  try {
-    hook?.(info);
-  } catch {
-    // An observer must never change what the transaction does.
-  }
 }
 
 /** An error the transactor raises itself, carrying its code. */

@@ -4,7 +4,7 @@ import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-sup
 import { sha256Hex } from "../hash/index.ts";
 import { applyMigrations } from "./applier.ts";
 import { rootstockSource } from "./apply.ts";
-import { mig, schemaFactory } from "./fixtures.pg-support.ts";
+import { mig, ROOTSTOCK_COUNT, schemaFactory } from "./fixtures.pg-support.ts";
 import { type MigrateSlice, migrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
 import { migrationStatus, renderMigrationStatus } from "./status.ts";
@@ -69,7 +69,7 @@ describe("migrationStatus", () => {
     const w = world();
     const before = await migrationStatus(sql, w.slice, sources(w));
     expect(before.sources.map((s) => [s.source, s.tracked, s.pending.length])).toEqual([
-      ["rootstock", false, 1],
+      ["rootstock", false, ROOTSTOCK_COUNT],
       ["app", false, 2],
       ["auth", false, 1],
     ]);
@@ -81,7 +81,7 @@ describe("migrationStatus", () => {
     const after = await migrationStatus(sql, w.slice, sources(w));
     expect(after.red).toBe(false);
     expect(renderMigrationStatus(after, { fix: "bun run migrate" })).toBe(
-      "rootstock: ok (1 applied)\napp: ok (2 applied)\nauth: ok (1 applied)\n",
+      `rootstock: ok (${ROOTSTOCK_COUNT} applied)\napp: ok (2 applied)\nauth: ok (1 applied)\n`,
     );
   });
 
