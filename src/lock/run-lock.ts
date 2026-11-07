@@ -43,6 +43,8 @@ export interface Attempt {
   readonly deps: LockDeps;
   readonly emit: Emit;
   readonly statements: TableStatements;
+  /** Opens a fresh session: the acquire's, and a recovery's after a stalled probe. */
+  readonly open: () => LockSession;
   /** Releases a held wait turn; a no-op without one. Called at most once. */
   releaseTurn: () => void;
 }
@@ -84,7 +86,12 @@ export function pidIn(row: Row | undefined): number | undefined {
 }
 
 /** Step 0's checks that need no I/O: the brand, then the name. */
-function validate(slice: LockSlice, name: string, deps: LockDeps): Attempt {
+function validate(
+  open: () => LockSession,
+  slice: LockSlice,
+  name: string,
+  deps: LockDeps,
+): Attempt {
   const statements = statementsOf("acquireRunLock", slice);
   const a: Attempt = {
     slice,
@@ -92,6 +99,7 @@ function validate(slice: LockSlice, name: string, deps: LockDeps): Attempt {
     deps,
     emit: emitter(deps.onEvent),
     statements,
+    open,
     releaseTurn: () => {},
   };
   if (!admits(slice, name)) throw refused(a, refusals.name(slice, name));
@@ -110,7 +118,7 @@ export async function acquireRunLock(
   deps: LockDeps,
   opts?: { wait?: LockWait },
 ): Promise<RunLock> {
-  const a = validate(slice, name, deps);
+  const a = validate(open, slice, name, deps);
   if (opts?.wait !== undefined) return pollAcquire(a, open, checkWait(a, opts.wait));
   const session = open();
   let row: Row | undefined;
@@ -221,9 +229,11 @@ class AfterRelease extends Error {}
 /** How a recovery ended: `stalled` carries the timeout that made it unverifiable. */
 type Recovery = "recovered" | "failed" | "released" | { stalled: Error };
 
-function held(a: Attempt, session: LockSession, firstPid: number, holder: string): RunLock {
+function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: string): RunLock {
   const { name, slice, deps, emit, statements } = a;
-  const sql: Sql = session.sql;
+  /** The session every statement goes to; a recovery after a stalled probe replaces it. */
+  let session = firstSession;
+  let sql: Sql = session.sql;
   const stallMs = slice.probeStallSeconds * 1000;
   let pid = firstPid;
   let recoveries = 0;
@@ -293,8 +303,80 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     return undefined;
   }
 
-  /** `probeRejected`: the gate's L3 rejected, so an L4 on the same pid may have stacked a level. */
-  async function recover(probeRejected: boolean): Promise<Recovery> {
+  /**
+   * After a probe that stalled: a claim on the same session would queue
+   * behind the hung probe, so the stalled session is closed (which frees the
+   * advisory lock if its backend still hears it) and a fresh one takes its
+   * place. The closed session's backend may still hold the lock until the
+   * server ends it (see outwaitStalledBackend).
+   */
+  async function reopen(attempt: number): Promise<"released" | "failed" | undefined> {
+    const stale = session;
+    const endMs = slice.endTimeoutSeconds * 1000;
+    try {
+      if ((await within(deps, stale.close(), endMs)) === "timeout") {
+        const error = stalled(`closing the stalled session for ${name}`, endMs);
+        emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
+      }
+    } catch (error) {
+      emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
+    }
+    if (released) return "released";
+    let fresh: LockSession;
+    try {
+      fresh = a.open();
+    } catch (error) {
+      emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
+      return "failed";
+    }
+    // Assigned in the same turn as the released check above, so release()
+    // always closes whichever session is current.
+    session = fresh;
+    sql = fresh.sql;
+    restUntil = Number.NEGATIVE_INFINITY;
+    return undefined;
+  }
+
+  /**
+   * After a stalled probe, a fresh claim that reads the lock held while the
+   * fencing row still names this holder is most likely reading this run's own
+   * stalled backend, which the server has not ended yet. The claim is polled
+   * every `wait.pollIntervalMs` until the stall bound has passed. Polling is
+   * safe: a try-lock never takes a lock another backend holds, and a run that
+   * takes it meanwhile fences its own holder, which ends the poll.
+   */
+  async function outwaitStalledBackend(
+    attempt: number,
+    first: Row | undefined,
+  ): Promise<{ row: Row | undefined } | { stalled: Error } | "released" | "failed"> {
+    let row = first;
+    const until = deps.now() + stallMs;
+    while (row?.locked !== true && row?.holder === holder && deps.now() < until) {
+      await pause(deps, slice.wait.pollIntervalMs);
+      if (released) return "released";
+      let next: { row: Row | undefined } | { stalled: Error };
+      try {
+        next = await claimOnce();
+      } catch (error) {
+        if (released) return "released";
+        emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
+        return "failed";
+      }
+      if (released) return "released";
+      if ("stalled" in next) {
+        emit({ type: "lock.recovery_failed", name, attempt, ...failure(next.stalled) });
+        return next;
+      }
+      row = next.row;
+    }
+    return { row };
+  }
+
+  /**
+   * `probe`: how the gate's L3 failed. `rejected`: an L4 on the same pid may
+   * have stacked a level. `stalled`: the claim goes on a fresh session.
+   */
+  async function recover(probe: "lost" | "rejected" | "stalled"): Promise<Recovery> {
     if (released) return "released";
     if (recoveries >= slice.maxRecoveries) {
       emit({
@@ -307,6 +389,10 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     }
     recoveries += 1;
     const attempt = recoveries;
+    if (probe === "stalled") {
+      const reopened = await reopen(attempt);
+      if (reopened !== undefined) return reopened;
+    }
     let claimed: { row: Row | undefined } | { stalled: Error };
     try {
       claimed = await claimOnce();
@@ -328,7 +414,12 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
       emit({ type: "lock.recovery_failed", name, attempt, ...failure(claimed.stalled) });
       return claimed;
     }
-    const { row } = claimed;
+    let { row } = claimed;
+    if (probe === "stalled") {
+      const polled = await outwaitStalledBackend(attempt, row);
+      if (polled === "released" || polled === "failed" || "stalled" in polled) return polled;
+      row = polled.row;
+    }
     if (row?.locked !== true) {
       emit({ type: "lock.recovery_refused", name, attempt, reason: "held" });
       return "failed";
@@ -345,7 +436,7 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     // Assigned before any further await, so a keepalive tick that reads the
     // new backend compares against it.
     pid = Number(row.pid);
-    if (probeRejected && pid === before) {
+    if (probe === "rejected" && pid === before) {
       const stall = await undoStackedLevel();
       if (released) return "released";
       if (stall !== undefined) return { stalled: stall };
@@ -369,17 +460,18 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     }
     // After release() the lock is not held, whatever the probe read.
     if (released) throw latch(refusals.lost(name));
-    if (probe === "timeout") {
-      throw latch(refusals.unverifiable(name, stalled(`the ownership probe for ${name}`, stallMs)));
-    }
     const refusal =
-      "error" in probe
-        ? refusals.unverifiable(name, probe.error)
-        : lockOwnershipLost(probe.rows[0], pid)
-          ? refusals.lost(name)
-          : undefined;
+      probe === "timeout"
+        ? refusals.unverifiable(name, stalled(`the ownership probe for ${name}`, stallMs))
+        : "error" in probe
+          ? refusals.unverifiable(name, probe.error)
+          : lockOwnershipLost(probe.rows[0], pid)
+            ? refusals.lost(name)
+            : undefined;
     if (refusal === undefined) return;
-    const outcome = await recover("error" in probe);
+    const outcome = await recover(
+      probe === "timeout" ? "stalled" : "error" in probe ? "rejected" : "lost",
+    );
     if (outcome === "released") throw latch(refusals.lost(name));
     if (outcome === "recovered") return;
     throw latch(outcome === "failed" ? refusal : refusals.unverifiable(name, outcome.stalled));
@@ -390,10 +482,12 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     const done = begin();
     if (done === null) return;
     const asked = pid;
+    const on = session;
     void (async () => {
       try {
         const [row] = await run(L3);
-        if (released) return;
+        // A recovery replaced the session this probe went to: the gate owns the answer.
+        if (released || session !== on) return;
         if (lockOwnershipLost(row, pid)) {
           // A gate in flight owns this answer (it may be moving the lock to
           // a new backend right now), so the tick reports nothing then.
@@ -410,7 +504,9 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
         }
         await run(statements.heartbeat, [name, holder]);
       } catch (error) {
-        if (!released) emit({ type: "lock.keepalive_failed", name, ...failure(error) });
+        if (!released && session === on) {
+          emit({ type: "lock.keepalive_failed", name, ...failure(error) });
+        }
       } finally {
         done();
       }

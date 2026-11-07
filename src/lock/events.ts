@@ -36,7 +36,8 @@ export type LockEvent =
   | ({
       type: "lock.end_failed";
       name: string;
-      phase: "acquire-error" | "refusal" | "release";
+      /** `recovery`: closing the session a stalled probe left behind. */
+      phase: "acquire-error" | "refusal" | "release" | "recovery";
     } & Err);
 
 export type Emit = (e: LockEvent) => void;

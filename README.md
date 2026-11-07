@@ -104,9 +104,16 @@ through. Fix forward with a release, not by reverting the migrations.
   the advisory lock and its fencing row can land on backends other runs
   share, so a lock can be shared or stranded and the lock cannot tell.
 - **Bounded waits.** Every statement the gate sends (the ownership probe and
-  each recovery claim) is bounded by `probeStallSeconds`; one that does not
-  answer in time makes the gate throw `UNVERIFIABLE`, and every later gate
-  rethrows it. A waited acquire bounds its try-lock and fence by what is left
+  each recovery claim) is bounded by `probeStallSeconds`. A probe that does
+  not answer in time (a silently dropped socket, a stalled server) spends one
+  of `maxRecoveries`: the lock closes the stalled session (bounded by
+  `endTimeoutSeconds`), opens a fresh one, and claims there. While that claim
+  reads the lock held and the fencing row still names this run, the holder is
+  most likely the run's own stalled backend, so the claim is retried every
+  `wait.pollIntervalMs` for up to `probeStallSeconds` more. A recovery that
+  fails or stalls makes the gate throw `UNVERIFIABLE`, and every later gate
+  rethrows it. A server that keeps a dead connection's backend for longer
+  than that still ends the run (its TCP keepalive settings decide how long). A waited acquire bounds its try-lock and fence by what is left
   of the wait (never less than `probeStallSeconds`) and by its signal.
   `release()` bounds its unlock by `endTimeoutSeconds` and frees the
   in-process turn before closing, so a close that hangs never holds the next
