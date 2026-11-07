@@ -29,7 +29,16 @@ export type LockEvent =
   | ({ type: "lock.keepalive_failed"; name: string } & Err)
   | ({ type: "lock.recovery_retrying"; name: string; attempt: number } & Err)
   | ({ type: "lock.recovery_failed"; name: string; attempt: number } & Err)
-  | { type: "lock.recovery_refused"; name: string; attempt: number; reason: "held" | "displaced" }
+  | {
+      type: "lock.recovery_refused";
+      name: string;
+      attempt: number;
+      reason: "held" | "displaced";
+      /** After a stalled probe: the run's own stalled backend still holds the lock (#41). */
+      stalledPid?: number;
+    }
+  /** A stalled probe's recovery closed the session and opened a fresh one (#41). */
+  | { type: "lock.session_replaced"; name: string; attempt: number; previousPid: number }
   | { type: "lock.recovered"; name: string; attempt: number; max: number; pid: number }
   | { type: "lock.recovery_exhausted"; name: string; recoveries: number; max: number }
   | ({ type: "lock.unlock_failed"; name: string } & Err)

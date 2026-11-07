@@ -107,17 +107,27 @@ through. Fix forward with a release, not by reverting the migrations.
   each recovery claim) is bounded by `probeStallSeconds`. A probe that does
   not answer in time (a silently dropped socket, a stalled server) spends one
   of `maxRecoveries`: the lock closes the stalled session (bounded by
-  `endTimeoutSeconds`), opens a fresh one, and claims there. While that claim
-  reads the lock held and the fencing row still names this run, the holder is
-  most likely the run's own stalled backend, so the claim is retried every
-  `wait.pollIntervalMs` for up to `probeStallSeconds` more. A recovery that
-  fails or stalls makes the gate throw `UNVERIFIABLE`, and every later gate
-  rethrows it. A server that keeps a dead connection's backend for longer
-  than that still ends the run (its TCP keepalive settings decide how long). A waited acquire bounds its try-lock and fence by what is left
+  `endTimeoutSeconds` plus one second), opens a fresh one, emits
+  `lock.session_replaced`, and claims there. While that claim reads the lock
+  held and the fencing row still names this run, the holder is most likely
+  the run's own stalled backend, so the claim is retried every
+  `wait.pollIntervalMs` (even without `opts.wait`) for up to
+  `probeStallSeconds` more. A recovery that fails or stalls makes the gate
+  throw `UNVERIFIABLE`, and every later gate rethrows it; when the run's own
+  backend outlived the poll, `lock.recovery_refused` carries its pid as
+  `stalledPid`. How long a server keeps a dead connection's backend is its
+  TCP keepalive's business, not the lock's. A gate call can now block for
+  about four `probeStallSeconds` plus `endTimeoutSeconds` (probe, close, a
+  claim and its retry, the poll window, its last claim), where 0.6.0 refused
+  after one. A waited acquire bounds its try-lock and fence by what is left
   of the wait (never less than `probeStallSeconds`) and by its signal.
   `release()` bounds its unlock by `endTimeoutSeconds` and frees the
   in-process turn before closing, so a close that hangs never holds the next
   waiter (the database lock does, until that session ends).
+- **`open` must make a new client each call.** It runs once for the acquire
+  and once more for each stalled-probe recovery, which closes the session it
+  replaces. An `open` that wraps one shared client makes that recovery claim
+  on a closed client, and the gate refuses `UNVERIFIABLE`.
 - **Events carry the raw driver error.** The `error` field of a lock event is
   the error the driver threw, unchanged. Some drivers put the server's
   `host:port` in its message, so scrub it before shipping events somewhere

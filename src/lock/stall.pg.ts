@@ -184,6 +184,9 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
       await lock.ensureExclusive();
       const recovered = events.find((e) => e.type === "lock.recovered");
       expect(recovered?.type === "lock.recovered" && recovered.pid).not.toBe(old);
+      // A backend frees its locks before it leaves pg_stat_activity.
+      const deadline = Date.now() + 5_000;
+      while ((await backendAlive(old)) && Date.now() < deadline) await Bun.sleep(10);
       expect(await backendAlive(old)).toBe(false);
       await lock.ensureExclusive();
       expect((await locksHeld(adminSql, ["stall-a"])).get("stall-a")).toBe(true);
@@ -201,9 +204,18 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     try {
       const old = acquiredPid(events);
       proxy.freeze({ forwardClose: false });
-      const gate = lock.ensureExclusive();
-      // Probe stall (6 s) plus the bounded close (1 s), then the server reaps.
-      await Bun.sleep(7_500);
+      let settled = false;
+      const gate = lock.ensureExclusive().finally(() => {
+        settled = true;
+      });
+      // Wait until the fresh session's claim has read the lock held by the
+      // stalled backend, so the poll is what recovers, then the server reaps.
+      const deadline = Date.now() + 15_000;
+      while (!events.some((e) => e.type === "lock.session_replaced") && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      await Bun.sleep(300);
+      expect(settled).toBe(false);
       expect(await backendAlive(old)).toBe(true);
       await killBackend(adminSql, old);
       await gate;
@@ -230,7 +242,11 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
       }
       expect(err).toBeInstanceOf(RootstockLockError);
       expect((err as RootstockLockError).code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
-      expect(events.at(-1)).toMatchObject({ type: "lock.recovery_refused", reason: "held" });
+      expect(events.at(-1)).toMatchObject({
+        type: "lock.recovery_refused",
+        reason: "held",
+        stalledPid: old,
+      });
       // The run never held a second level anywhere: only the stalled backend holds it.
       expect((await locksHeld(adminSql, ["stall-c"])).get("stall-c")).toBe(true);
     } finally {

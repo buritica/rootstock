@@ -62,7 +62,7 @@ export function refused(a: Attempt, err: RootstockLockError): RootstockLockError
 export async function closeQuietly(
   a: Attempt,
   session: LockSession,
-  phase: "acquire-error" | "refusal" | "release" | "recovery",
+  phase: "acquire-error" | "refusal" | "release",
 ): Promise<void> {
   try {
     await session.close();
@@ -107,8 +107,10 @@ function validate(
 
 /**
  * Takes the lock with one try-lock, or with `opts.wait` by waiting for the
- * turn and polling (§2.6), then fences it (§2.5). The session is opened once
- * and closed on every refusal; the keepalive is not started.
+ * turn and polling (§2.6), then fences it (§2.5). The session is closed on
+ * every refusal; the keepalive is not started. `open` is called once for the
+ * acquire and once more for each recovery after a stalled probe, so each call
+ * must return a session on a new dedicated client, never a shared one.
  */
 export async function acquireRunLock(
   open: () => LockSession,
@@ -225,6 +227,13 @@ function probeGuard(stallMs: number, now: () => number): () => (() => void) | nu
 /** Thrown by a statement the lock was about to send after release() began; never escapes. */
 class AfterRelease extends Error {}
 
+/**
+ * How much longer than the driver's own bounded close a recovery waits for
+ * the stalled session to close, so a driver that ends on time is not
+ * reported as a stalled close.
+ */
+export const CLOSE_MARGIN_MS = 1000;
+
 /** How a recovery ended: `stalled` carries the timeout that made it unverifiable. */
 type Recovery = "recovered" | "failed" | "released" | { stalled: Error };
 
@@ -232,6 +241,8 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   const { name, slice, deps, emit, statements } = a;
   /** The session every statement goes to; a recovery after a stalled probe replaces it. */
   let session = firstSession;
+  /** The session a stalled-probe recovery is closing: nothing on it reports, nothing goes to it. */
+  let retired: LockSession | undefined;
   const stallMs = slice.probeStallSeconds * 1000;
   let pid = firstPid;
   let recoveries = 0;
@@ -254,10 +265,13 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     const rest = restUntil - deps.now();
     if (rest > 0) await pause(deps, rest);
     if (released && text !== L6) throw new AfterRelease();
+    // Bound once sent: a rejection from a session a recovery has since
+    // replaced does not make the new one rest.
+    const target = session;
     try {
-      return await session.sql.unsafe(text, params);
+      return await target.sql.unsafe(text, params);
     } catch (err) {
-      restUntil = deps.now() + SETTLE_MS;
+      if (target === session) restUntil = deps.now() + SETTLE_MS;
       throw err;
     }
   }
@@ -309,15 +323,32 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
    * server ends it (see outwaitStalledBackend).
    */
   async function reopen(attempt: number): Promise<"released" | "failed" | undefined> {
-    const endMs = slice.endTimeoutSeconds * 1000;
-    if ((await within(deps, closeQuietly(a, session, "recovery"), endMs)) === "timeout") {
-      const error = stalled(`closing the stalled session for ${name}`, endMs);
+    const stale = session;
+    retired = stale;
+    const ms = slice.endTimeoutSeconds * 1000 + CLOSE_MARGIN_MS;
+    // One end_failed at most, and none once the bound has fired or release() began.
+    let bounded = false;
+    const closing = Promise.resolve()
+      .then(() => stale.close())
+      .then(
+        () => {},
+        (error) => {
+          if (!bounded && !released) {
+            emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
+          }
+        },
+      );
+    const closed = await within(deps, closing, ms);
+    bounded = true;
+    if (released) return "released";
+    if (closed === "timeout") {
+      const error = stalled(`closing the stalled session for ${name}`, ms);
       emit({ type: "lock.end_failed", name, phase: "recovery", ...failure(error) });
     }
-    if (released) return "released";
+    const { open } = a;
     let fresh: LockSession;
     try {
-      fresh = a.open();
+      fresh = open();
     } catch (error) {
       emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
       return "failed";
@@ -325,7 +356,9 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned in the same turn as the released check above, so release()
     // always closes whichever session is current.
     session = fresh;
+    retired = undefined;
     restUntil = Number.NEGATIVE_INFINITY;
+    emit({ type: "lock.session_replaced", name, attempt, previousPid: pid });
     return undefined;
   }
 
@@ -344,7 +377,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     let row = first;
     const until = deps.now() + stallMs;
     while (row?.locked !== true && row?.holder === holder && deps.now() < until) {
-      await pause(deps, slice.wait.pollIntervalMs);
+      await pause(deps, Math.min(slice.wait.pollIntervalMs, until - deps.now()));
       if (released) return "released";
       const next = await claim(attempt, false);
       if (typeof next === "string" || "stalled" in next) return next;
@@ -416,7 +449,16 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     if (typeof claimed === "string" || "stalled" in claimed) return claimed;
     const { row } = claimed;
     if (row?.locked !== true) {
-      emit({ type: "lock.recovery_refused", name, attempt, reason: "held" });
+      // After a stalled probe, a holder still naming this run is the run's
+      // own stalled backend, which outlived the poll: say which one.
+      const own = probe === "stalled" && row?.holder === holder;
+      emit({
+        type: "lock.recovery_refused",
+        name,
+        attempt,
+        reason: "held",
+        ...(own ? { stalledPid: pid } : {}),
+      });
       return "failed";
     }
     // Taking the lock again says nothing about the gap: only a fencing row
@@ -485,11 +527,12 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     if (done === null) return;
     const asked = pid;
     const on = session;
+    /** A recovery is replacing, or has replaced, the session this tick went to: the gate owns the answer. */
+    const stale = () => released || terminal !== undefined || session !== on || on === retired;
     void (async () => {
       try {
         const [row] = await run(L3);
-        // A recovery replaced the session this probe went to: the gate owns the answer.
-        if (released || session !== on) return;
+        if (stale()) return;
         if (lockOwnershipLost(row, pid)) {
           // A gate in flight owns this answer (it may be moving the lock to
           // a new backend right now), so the tick reports nothing then.
@@ -506,9 +549,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
         }
         await run(statements.heartbeat, [name, holder]);
       } catch (error) {
-        if (!released && session === on) {
-          emit({ type: "lock.keepalive_failed", name, ...failure(error) });
-        }
+        if (!stale()) emit({ type: "lock.keepalive_failed", name, ...failure(error) });
       } finally {
         done();
       }
@@ -548,7 +589,8 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
       released = true;
       try {
         stopKeepalive();
-        await unlock(slice.endTimeoutSeconds * 1000);
+        // A session a failed recovery already closed holds nothing to unlock.
+        if (session !== retired) await unlock(slice.endTimeoutSeconds * 1000);
       } finally {
         // The turn goes as soon as L6 is done or out of time: a close that
         // hangs must not hold the next waiter (the database lock still does,

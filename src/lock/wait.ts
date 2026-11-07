@@ -118,7 +118,8 @@ export async function pollAcquire(a: Attempt, wait: LockWait): Promise<RunLock> 
     if (queued === "aborted") throw refused(a, refusals.abandoned(name, report("aborted")));
     if (queued === "timeout") throw refused(a, refusals.heldAfterWait(name, report("timeout")));
 
-    session = a.open();
+    const { open } = a;
+    session = open();
     for (;;) {
       let row: Record<string, unknown> | undefined;
       let polled: { value: Record<string, unknown>[] } | "timeout" | "aborted";
