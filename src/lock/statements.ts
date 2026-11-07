@@ -34,21 +34,6 @@ export const LOCK_HELD_PREDICATE = `EXISTS (
     AND objid = (hashtext($1)::bigint & 4294967295)::oid
 )`;
 
-/**
- * L9 end a stalled backend, params [name, pid]: terminates `pid` only while it
- * holds the one-key advisory lock hashtext($1) in this database. No row: that
- * backend does not hold it. A recovery sends it only for its own last backend.
- */
-export const L9 = `SELECT pg_terminate_backend(l.pid) AS terminated
-FROM pg_locks l
-WHERE l.pid = $2
-  AND l.locktype = 'advisory'
-  AND l.granted
-  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
-  AND l.objsubid = 1
-  AND l.classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
-  AND l.objid = (hashtext($1)::bigint & 4294967295)::oid`;
-
 /** L7 probe many, params [JSON.stringify(names)]. */
 export const L7 = `SELECT n AS name, ${LOCK_HELD_PREDICATE.replaceAll("$1", "n")} AS held
 FROM jsonb_array_elements_text($1::text::jsonb) AS n`;
@@ -67,6 +52,13 @@ export interface TableStatements {
   readonly claim: string;
   /** L5 heartbeat, params [name, holder]. */
   readonly heartbeat: string;
+  /**
+   * L9 end a stalled backend, params [name, pid, holder]: terminates `pid`
+   * only while it holds the one-key advisory lock hashtext($1) in this
+   * database and the fencing row still names `holder`, in one statement. No
+   * row: that backend does not hold it, or another run has fenced.
+   */
+  readonly terminate: string;
 }
 
 /** The statements that name the fencing table, for `<schema>.<name>`. */
@@ -80,5 +72,15 @@ RETURNING pg_backend_pid() AS pid`,
     claim: `SELECT pg_try_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid,
        (SELECT holder::text FROM ${t} WHERE name = $1) AS holder`,
     heartbeat: `UPDATE ${t} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid`,
+    terminate: `SELECT pg_terminate_backend(l.pid) AS terminated
+FROM pg_locks l
+WHERE l.pid = $2
+  AND l.locktype = 'advisory'
+  AND l.granted
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND l.objsubid = 1
+  AND l.classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
+  AND l.objid = (hashtext($1)::bigint & 4294967295)::oid
+  AND EXISTS (SELECT 1 FROM ${t} WHERE name = $1 AND holder = $3::uuid)`,
   });
 }

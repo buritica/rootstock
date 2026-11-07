@@ -2,7 +2,7 @@ import type { Row, Sql } from "../db/index.ts";
 import type { LockEvent } from "./events.ts";
 import type { LockDeps } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
-import { L1, L3, L6, L7, L8, L9, tableStatements } from "./statements.ts";
+import { L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
 
 /**
  * A scripted lock session for the unit suites: `unsafe` answers per
@@ -38,7 +38,7 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
     [L6, "L6"],
     [L7, "L7"],
     [L8, "L8"],
-    [L9, "L9"],
+    [t.terminate, "L9"],
   ]);
   const defaults: Record<StatementId, Answer> = {
     L1: [{ locked: true, pid: PID }],

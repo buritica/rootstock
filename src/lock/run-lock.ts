@@ -1,3 +1,4 @@
+import { pgCode } from "../db/index.ts";
 import { perSlice } from "../internal/slice.ts";
 import { pause, stalled, within } from "./bound.ts";
 import { RootstockLockError, refusals } from "./errors.ts";
@@ -5,7 +6,7 @@ import { type Emit, emitter, failure, type LockEvent } from "./events.ts";
 import { lockOwnershipLost } from "./probe.ts";
 import type { LockSession } from "./session.ts";
 import { admits, assertLockSlice, type LockSlice } from "./slice.ts";
-import { L1, L3, L6, L9, type TableStatements, tableStatements } from "./statements.ts";
+import { L1, L3, L6, type TableStatements, tableStatements } from "./statements.ts";
 import { checkWait, type LockWait, pollAcquire } from "./wait.ts";
 
 export interface LockDeps {
@@ -376,7 +377,8 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
    * stalled backend, which the server has not ended yet (a black-holed
    * socket can keep it for as long as the server's TCP keepalive allows).
    * L9 ends that backend, and only while pg_locks shows it, the pid this run
-   * last held the lock on, holding this name. If another run's backend has
+   * last held the lock on, holding this name and the fencing row still names
+   * this run, in one statement. If another run's backend has
    * taken that pid and the lock between its try-lock and its fence, ending it
    * makes that run refuse (its fence fails), which is safe. No row: the
    * holder is not this run's backend, so the poll stops. Then the claim is
@@ -395,21 +397,33 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     const stalledPid = pid;
     let own = false;
     try {
-      const ended = await within(deps, run(L9, [name, stalledPid]), stallMs);
+      const ended = await within(
+        deps,
+        run(statements.terminate, [name, stalledPid, holder]),
+        stallMs,
+      );
       if (released) return "released";
       if (ended === "timeout") {
         const error = stalled(`ending the stalled backend for ${name}`, stallMs);
         emit({ type: "lock.recovery_failed", name, attempt, ...failure(error) });
         return { stalled: error };
       }
-      if (ended.value.length === 0) return { row, own: false };
+      if (ended.value.length === 0) {
+        // That backend may have exited between the claim and L9: one more
+        // claim tells a lock just freed from one another backend holds.
+        const next = await claim(attempt, false);
+        if (typeof next === "string" || "stalled" in next) return next;
+        return { row: next.row, own: false };
+      }
       own = true;
       if (ended.value[0]?.terminated === true) {
         emit({ type: "lock.stalled_backend_terminated", name, attempt, pid: stalledPid });
       }
     } catch (error) {
       if (released) return "released";
-      own = true;
+      // insufficient_privilege comes from pg_terminate_backend itself, after
+      // pg_locks matched: only then was the backend seen holding the lock.
+      own = pgCode(error) === "42501";
       emit({ type: "lock.terminate_failed", name, attempt, pid: stalledPid, ...failure(error) });
     }
     const every = Math.max(slice.wait.pollIntervalMs, RECOVERY_POLL_FLOOR_MS);
@@ -528,8 +542,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned before any further await, so a keepalive tick that reads the
     // new backend compares against it.
     pid = Number(row.pid);
-    // A rejected claim retried on a fresh session may have stacked a level too.
-    if ((probe === "rejected" && pid === before) || probe === "stalled") {
+    if (probe === "rejected" && pid === before) {
       const stall = await undoStackedLevel();
       if (released) return "released";
       if (stall !== undefined) return { stalled: stall };

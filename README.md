@@ -115,7 +115,8 @@ through. Fix forward with a release, not by reverting the migrations.
      black-holed connection's backend lives as long as the server's TCP
      keepalive allows. The lock ends it with `pg_terminate_backend`, only
      while `pg_locks` shows that backend (the pid the run last held the lock
-     on) holding this name, and emits `lock.stalled_backend_terminated`. The
+     on) holding this name while the fencing row still names this run, and
+     emits `lock.stalled_backend_terminated`. The
      lock role needs the privilege to end its own backends, which a role has
      by default; without it the lock emits `lock.terminate_failed` and only
      waits. If `pg_locks` shows another backend holding it, the recovery
