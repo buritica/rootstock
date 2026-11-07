@@ -247,7 +247,7 @@ describe("QD4: quarantineSafe", () => {
   test("QD4 retries with the minimal payload when the first insert fails", async () => {
     const r = recorder();
     const ok = await quarantineSafe(
-      sql,
+      main.transactor,
       small,
       { job: "alpha-sync", externalId: "s-1", payload: { big: "y".repeat(200) }, reason: "r" },
       r.deps,
@@ -264,7 +264,7 @@ describe("QD4: quarantineSafe", () => {
 
   test("QD4 a payload that fits lands as given", async () => {
     expect(
-      await quarantineSafe(sql, small, {
+      await quarantineSafe(main.transactor, small, {
         job: "alpha-sync",
         externalId: "s-2",
         payload: { ok: 1 },
@@ -281,7 +281,7 @@ describe("QD4: quarantineSafe", () => {
     const r = recorder();
     const externalId = `s-${"z".repeat(60)}`;
     const ok = await quarantineSafe(
-      sql,
+      main.transactor,
       small,
       { job: "alpha-sync", externalId, payload: { big: "y".repeat(200) }, reason: "r" },
       r.deps,
@@ -303,6 +303,29 @@ describe("QD4: quarantineSafe", () => {
     expect(n).toBe("0");
   });
 
+  test("QD4 inside an open transaction, a payload the server refuses (22P05) lands the fallback in a fresh savepoint and leaves the transaction usable (§20 A1)", async () => {
+    const r = recorder();
+    const after = await main.transactor.begin(async (tx) => {
+      const ok = await quarantineSafe(
+        tx,
+        T,
+        { job: "alpha-sync", externalId: "nul-1", payload: { text: "a\u0000b" }, reason: "r" },
+        r.deps,
+      );
+      expect(ok).toBe(true);
+      const [n] = await tx.unsafe<{ n: string }>(
+        `SELECT count(*)::text AS n FROM "${sc}".quarantine WHERE external_id = 'nul-1'`,
+      );
+      return n?.n;
+    });
+    expect(after).toBe("1");
+    const stored = await row("alpha-sync", "nul-1");
+    expect(JSON.parse(stored?.payload ?? "null")).toEqual({ externalId: "nul-1", truncated: true });
+    expect(r.events).toEqual([
+      { type: "runs.quarantined", job: "alpha-sync", externalId: "nul-1", runId: null },
+    ]);
+  });
+
   test("QD4 a missing table refuses NOTABLE at once, from every call", async () => {
     const missing = quarantineTable(
       { ...CAPS, table: { name: "no_such_quarantine" } },
@@ -312,7 +335,7 @@ describe("QD4: quarantineSafe", () => {
     const r = recorder();
     for (const call of [
       () => quarantine(sql, missing, a, r.deps),
-      () => quarantineSafe(sql, missing, a, r.deps),
+      () => quarantineSafe(main.transactor, missing, a, r.deps),
       () => resolveQuarantine(sql, missing, { job: "alpha-sync", externalIds: ["m-1"] }, r.deps),
       () => pendingQuarantine(sql, missing, { job: "alpha-sync" }),
     ]) {

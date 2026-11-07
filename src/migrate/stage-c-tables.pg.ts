@@ -166,6 +166,14 @@ describe("the Stage D tables (R-D1)", () => {
     await sql.unsafe(
       `INSERT INTO "${s}".work_queue (key, source, kind) VALUES ('alpha:1', 'alpha', 'put')`,
     );
+    const fileNode = async () =>
+      (
+        await sql.unsafe<{ f: string }>(
+          "SELECT relfilenode::text AS f FROM pg_class WHERE oid = to_regclass(quote_ident($1) || '.work_queue')",
+          [s],
+        )
+      )[0]?.f;
+    const before = await fileNode();
     const status = await rootstockMigrationStatus(sql, slice);
     expect(status.pending.map((m) => m.filename)).toEqual(STAGE_D);
     const upgrade = await applyRootstockMigrations(main.transactor, slice);
@@ -175,6 +183,8 @@ describe("the Stage D tables (R-D1)", () => {
       `SELECT version::text AS version, claim_token::text AS token FROM "${s}".work_queue`,
     );
     expect(row).toEqual({ version: "0", token: null });
+    // The claim fence columns are catalog-only: the table is not rewritten.
+    expect(await fileNode()).toBe(before);
   });
 
   test("runs and quarantine: columns, checks and indexes equal the contract", async () => {

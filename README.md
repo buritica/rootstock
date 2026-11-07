@@ -97,6 +97,15 @@ when you pass one). 0.8.0 also adds two columns to `work_queue`,
 `version bigint NOT NULL DEFAULT 0` and `claim_token uuid`; a consumer that
 passes its own queue table adds the same two columns, with the same types and
 default, in its own additive migration applied before the 0.8.0 code serves.
+Start that migration with `SET lock_timeout = '5s';`: the `ALTER TABLE` needs
+an exclusive lock for a moment, and without a timeout it queues behind any
+open reader of a busy queue table and stalls every queue statement behind it.
+Existing table grants on `work_queue` cover the new columns. Altering
+`work_queue` needs the migrating role to **own** it (creating tables needed
+only `CREATE` on the schema): check `SELECT tableowner FROM pg_tables WHERE
+schemaname = 'rootstock'` before the first 0.8.0 deploy. A role that only
+reads run history (dashboards, freshness checks) needs `SELECT` on
+`rootstock.runs`.
 
 ### Rolling back
 
@@ -105,6 +114,13 @@ applied migrations that release has no files for: `migrate status` reads the
 database as ahead (so a drift monitor pages) and `apply --manual` refuses
 until the consumer is on 0.6.0 again. A deploy's `apply --deploy` still goes
 through. Fix forward with a release, not by reverting the migrations.
+
+The same holds for any pre-0.8 release after 0.8.0 migrated a database: three
+files read as ahead, `apply --deploy` goes through, `status` and `apply
+--manual` stay red until the consumer is on 0.8.x again. A pre-0.8 image
+ignores the new tables and columns (a claim token it leaves on a released row
+is overwritten by the next 0.8 claim). Once 0.8.0 migrated a database, fix
+forward on 0.8.x only: an older line can never ship a migration there.
 
 ### Run lock
 

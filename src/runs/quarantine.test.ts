@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Sql } from "../db/index.ts";
+import type { Sql, Transactor } from "../db/index.ts";
 import { RootstockRunsError } from "./errors.ts";
 import type { RunsEvent } from "./events.ts";
 import {
@@ -12,6 +12,9 @@ import {
   quarantineTable,
   resolveQuarantine,
 } from "./quarantine.ts";
+
+/** A Transactor whose root client is `sql`: quarantineSafe writes autocommit through it. */
+const auto = (sql: Sql): Transactor => ({ sql }) as unknown as Transactor;
 
 const MIN = { maxPayloadBytes: 1_024, maxReasonChars: 16 };
 const T = quarantineTable(MIN);
@@ -136,7 +139,7 @@ describe("quarantineTable: the parser (§4.1)", () => {
     const want = (fn: string) =>
       `${fn}: expected a QuarantineTable built by quarantineTable() — got an object that parser did not return`;
     await expect(quarantine(noSql, fake, a)).rejects.toThrow(want("quarantine"));
-    await expect(quarantineSafe(noSql, fake, a)).rejects.toThrow(want("quarantineSafe"));
+    await expect(quarantineSafe(auto(noSql), fake, a)).rejects.toThrow(want("quarantineSafe"));
     await expect(
       resolveQuarantine(noSql, fake, { job: "alpha-sync", externalIds: [] }),
     ).rejects.toThrow(want("resolveQuarantine"));
@@ -306,7 +309,7 @@ describe("quarantine: statements, params and events", () => {
 
   test("quarantineSafe: lands first time → true, one statement", async () => {
     const r = recording();
-    expect(await quarantineSafe(r.sql, T, PUT)).toBe(true);
+    expect(await quarantineSafe(auto(r.sql), T, PUT)).toBe(true);
     expect(r.calls).toHaveLength(1);
   });
 
@@ -316,7 +319,7 @@ describe("quarantine: statements, params and events", () => {
       return [];
     });
     const e = events();
-    expect(await quarantineSafe(r.sql, T, { ...PUT, runId: null }, e.deps)).toBe(true);
+    expect(await quarantineSafe(auto(r.sql), T, { ...PUT, runId: null }, e.deps)).toBe(true);
     expect(r.calls.map((c) => c.params[2])).toEqual([
       '{"a":1}',
       '{"externalId":"rec-1","truncated":true}',
@@ -328,7 +331,7 @@ describe("quarantine: statements, params and events", () => {
 
   test("quarantineSafe: a payload refused INPUT goes straight to the minimal one", async () => {
     const r = recording();
-    expect(await quarantineSafe(r.sql, T, { ...PUT, payload: 1n })).toBe(true);
+    expect(await quarantineSafe(auto(r.sql), T, { ...PUT, payload: 1n })).toBe(true);
     expect(r.calls.map((c) => c.params[2])).toEqual(['{"externalId":"rec-1","truncated":true}']);
   });
 
@@ -338,7 +341,7 @@ describe("quarantine: statements, params and events", () => {
       throw i === 0 ? pgError("22P05") : second;
     });
     const e = events();
-    expect(await quarantineSafe(r.sql, T, PUT, e.deps)).toBe(false);
+    expect(await quarantineSafe(auto(r.sql), T, PUT, e.deps)).toBe(false);
     expect(r.calls).toHaveLength(2);
     expect(e.seen).toEqual([
       {
@@ -356,7 +359,7 @@ describe("quarantine: statements, params and events", () => {
       throw pgError("42P01");
     });
     const e = events();
-    const err = await caught(quarantineSafe(r.sql, T, PUT, e.deps));
+    const err = await caught(quarantineSafe(auto(r.sql), T, PUT, e.deps));
     expect(err.code).toBe("ERR_ROOTSTOCK_RUNS_NOTABLE");
     expect(r.calls).toHaveLength(1);
     expect(e.seen).toEqual([]);

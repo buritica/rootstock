@@ -1,4 +1,4 @@
-import type { Sql } from "../db/index.ts";
+import type { Sql, Transactor, TxSql } from "../db/index.ts";
 import {
   type Brand,
   bounded,
@@ -326,12 +326,14 @@ const isNoTable = (err: unknown): boolean => runsErrorCode(err) === "ERR_ROOTSTO
  * `quarantine`, then once more with the minimal payload `{ externalId,
  * truncated: true }` when the first attempt fails for any reason but a missing
  * table (NOTABLE, thrown at once). True when either landed; false when both
- * failed, reporting the second failure as `runs.record_failed`. It opens no
- * savepoint: inside a transaction the caller wraps it in one, since a failed
- * first attempt aborts the enclosing scope (and so the retry in it).
+ * failed, reporting the second failure as `runs.record_failed`. Given a
+ * transaction handle (`TxSql`) it runs each attempt in its own savepoint, so a
+ * first attempt the server refuses rolls back alone and the fallback runs in a
+ * fresh one, leaving the transaction usable; given a `Transactor` it writes
+ * autocommit on the root client (contract §20 A1, reversing K10).
  */
 export async function quarantineSafe(
-  tx: Sql,
+  scope: Transactor | TxSql,
   t: QuarantineTable,
   a: PutInput,
   deps?: Pick<RunsDeps, "onEvent">,
@@ -339,15 +341,18 @@ export async function quarantineSafe(
   const st = statementsOf("quarantineSafe", t);
   const args = putArgs("quarantineSafe", t, a);
   const emit = emitter(deps?.onEvent);
+  const attempt = (payload: string): Promise<void> =>
+    "savepoint" in scope
+      ? scope.savepoint((sp) => put(sp, t, st, args, payload, emit))
+      : put(scope.sql, t, st, args, payload, emit);
   try {
-    await put(tx, t, st, args, payloadJson("quarantineSafe", t, args, a.payload), emit);
+    await attempt(payloadJson("quarantineSafe", t, args, a.payload));
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;
   }
   try {
-    const minimal = JSON.stringify({ externalId: args.externalId, truncated: true });
-    await put(tx, t, st, args, minimal, emit);
+    await attempt(JSON.stringify({ externalId: args.externalId, truncated: true }));
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;
