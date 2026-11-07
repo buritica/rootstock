@@ -1,7 +1,7 @@
 import type { Sql } from "../db/index.ts";
 import type { AcceptedHash, MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
-import type { TrackedSource } from "./tracked.ts";
+import { applyOrder, DRIZZLE_WHEN, type TrackedSource } from "./tracked.ts";
 import { readTracker, type TrackerRead, type TrackerRow } from "./tracker-db.ts";
 
 /**
@@ -38,14 +38,11 @@ export interface SourceState {
   readonly unknown: readonly { rowId: number; hash: string }[];
   /** Keys held by more than one row. */
   readonly duplicate: readonly string[];
-  /** Pending ids that sort before the newest applied key. */
+  /** Pending ids that sort before the newest applied file in apply order (`applyOrder`). */
   readonly outOfOrder: readonly string[];
   /** Keys whose row has a NULL hash. */
   readonly unhashed: readonly string[];
 }
-
-// A journal `when` the reader accepts is any safe integer, negative included.
-const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
 
 /**
  * The slice's acceptance naming this file, and whether it covers exactly the
@@ -66,11 +63,6 @@ export function acceptanceOf(
   };
 }
 
-/** Compares keys the way the tracker orders them: drizzle's as integers. */
-function keyBefore(a: string, b: string, numeric: boolean): boolean {
-  return numeric ? BigInt(a) < BigInt(b) : a < b;
-}
-
 export function sourceState(
   source: TrackedSource,
   read: TrackerRead,
@@ -80,7 +72,7 @@ export function sourceState(
   const unknown: { rowId: number; hash: string }[] = [];
   const byKey = new Map<string, TrackerRow[]>();
   for (const row of read.rows) {
-    if (row.key === null || (numeric && !DECIMAL.test(row.key))) {
+    if (row.key === null || (numeric && !DRIZZLE_WHEN.test(row.key))) {
       unknown.push({ rowId: row.rowId ?? -1, hash: row.hash ?? "" });
       continue;
     }
@@ -96,6 +88,7 @@ export function sourceState(
   const pending: SourceMigration[] = [];
   const tampered: SourceState["tampered"][number][] = [];
   const unhashed: string[] = [];
+  const { of, compare: order } = applyOrder(source);
   let newest: string | undefined;
   for (const m of source.migrations) {
     const rows = byKey.get(m.key);
@@ -104,7 +97,7 @@ export function sourceState(
       continue;
     }
     applied.push(m.id);
-    if (newest === undefined || keyBefore(newest, m.key, numeric)) newest = m.key;
+    if (newest === undefined || order(newest, of(m)) < 0) newest = of(m);
     for (const row of rows) {
       if (row.hash === null) continue;
       if (row.hash === m.sha256) continue;
@@ -128,7 +121,7 @@ export function sourceState(
   const outOfOrder =
     newest === undefined
       ? []
-      : pending.filter((m) => keyBefore(m.key, newest as string, numeric)).map((m) => m.id);
+      : pending.filter((m) => order(of(m), newest as string) < 0).map((m) => m.id);
   const acceptedState = mine.map((a) => {
     const m = source.migrations.find((x) => x.id === a.id);
     const rows = m === undefined ? undefined : byKey.get(m.key);

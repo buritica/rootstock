@@ -196,6 +196,97 @@ describe("checkMigrationOrder", () => {
     ]);
   });
 
+  // rootstock#36: a renamed file's key is its old name, so any stamped key
+  // sorts after it; the applier orders by id, so the id must sort after too.
+  test("after a rename, a new file must also sort after main's newest id", async () => {
+    const renames = JSON.stringify({ "0001_a.sql": "20260101000100_a.sql" });
+    const main = sql({ "20260101000100_a.sql": A, "renames.json": renames });
+    const branch = (extra: Record<string, string>) =>
+      sql({ "20260101000100_a.sql": A, "renames.json": renames, ...extra });
+    expect(await check(branch({ "20260101000000_b.sql": B }), main)).toEqual([
+      { source: "app", id: "20260101000000_b.sql", problem: "older-than-main" },
+    ]);
+    expect(await check(branch({ "20260101000200_b.sql": B }), main)).toEqual([]);
+  });
+
+  test("after a rename to a name that sorts after stamps, a later stamp is clean", async () => {
+    const renames = JSON.stringify({ "init.sql": "20260101000100_a.sql" });
+    const main = sql({ "20260101000100_a.sql": A, "renames.json": renames });
+    const branch = sql({
+      "20260101000100_a.sql": A,
+      "20260101000200_b.sql": B,
+      "renames.json": renames,
+    });
+    expect(await check(branch, main)).toEqual([]);
+  });
+
+  test("main's newest is the newest in apply order, not by key", async () => {
+    const renames = JSON.stringify({ "0005_x.sql": "20260101000100_x.sql" });
+    const files = { "20260101000100_x.sql": A, "20260101000050_y.sql": B, "renames.json": renames };
+    const out = await checkMigrationOrder(
+      SLICE,
+      [tracked(sql({ ...files, "20260101000055_z.sql": C }))],
+      async () => sql(files),
+      NOW,
+    );
+    expect(out.map(({ id, problem, detail }) => ({ id, problem, detail }))).toEqual([
+      {
+        id: "20260101000055_z.sql",
+        problem: "older-than-main",
+        detail:
+          "its name must sort after main's newest, 20260101000100_x.sql, the order files apply in; rename it to a later UTC stamp",
+      },
+    ]);
+  });
+
+  test("a rename made on the branch moves main's newest too", async () => {
+    const main = sql({ "0019_x.sql": A });
+    const branch = sql({
+      "20261020000000_x.sql": A,
+      "20261010000000_y.sql": B,
+      "renames.json": JSON.stringify({ "0019_x.sql": "20261020000000_x.sql" }),
+    });
+    expect(await check(branch, main)).toEqual([
+      { source: "app", id: "20261010000000_y.sql", problem: "older-than-main" },
+    ]);
+    const out = await checkMigrationOrder(SLICE, [tracked(branch)], async () => main, NOW);
+    expect(out.map((f) => f.detail)).toEqual([
+      "its name must sort after main's newest, 20261020000000_x.sql (0019_x.sql on main), the order files apply in; rename it to a later UTC stamp",
+    ]);
+  });
+
+  test("a branch cut before main's rename is judged against main's names", async () => {
+    const renames = JSON.stringify({ "0019_x.sql": "20261020000000_x.sql" });
+    const main = sql({ "20261020000000_x.sql": A, "renames.json": renames });
+    const branch = sql({ "0019_x.sql": A, "20261010000000_y.sql": B });
+    expect(await check(branch, main)).toEqual([
+      { source: "app", id: "0019_x.sql", problem: "stale-base" },
+      { source: "app", id: "20261010000000_y.sql", problem: "older-than-main" },
+    ]);
+  });
+
+  test("a drizzle older-than-main detail names the when it lost to", async () => {
+    const main = drizzle([["20261002000000_a", 1000, A]]);
+    const branch = drizzle([
+      ["20261002000000_a", 1000, A],
+      ["20261003000000_b", 900, B],
+    ]);
+    const out = await checkMigrationOrder(SLICE, [tracked(branch)], async () => main, NOW);
+    expect(out.map((f) => f.detail)).toEqual([
+      "its when 900 must sort after main's newest, 20261002000000_a (when 1000); regenerate it on top of main",
+    ]);
+  });
+
+  test("a drizzle source orders by when alone", async () => {
+    const main = drizzle([["20261002000000_a", 1000, A]]);
+    // A tag sorting before main's newest tag, with a later when, is fine.
+    const branch = drizzle([
+      ["20261002000000_a", 1000, A],
+      ["20261001000000_b", 2000, B],
+    ]);
+    expect(await check(branch, main)).toEqual([]);
+  });
+
   test("accepted entries must name a migration with that current hash", async () => {
     const branch = sql({ ...MAIN });
     const current = branch[0]?.sha256 as string;
@@ -281,7 +372,7 @@ describe("checkMigrationOrder", () => {
         (f) => f.detail,
       );
     expect(await detailOf(sql({ ...MAIN, "20261001120000_c.sql": C }), sql(MAIN))).toEqual([
-      "its key 20261001120000_c.sql must sort after main's newest, 20261002000000_b.sql (20261002000000_b.sql); regenerate it on top of main",
+      "its name must sort after main's newest, 20261002000000_b.sql, the order files apply in; rename it to a later UTC stamp",
     ]);
     const branch = sql(MAIN);
     const slice = migrateSlice({
