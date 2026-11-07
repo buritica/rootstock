@@ -1,4 +1,4 @@
-import type { Sql, Transactor, TxSql } from "../db/index.ts";
+import { pgCode, type Sql, type Transactor, type TxSql } from "../db/index.ts";
 import {
   type Brand,
   bounded,
@@ -308,10 +308,24 @@ async function put(
 }
 
 /** `runs.quarantined`, sent once the write (and its savepoint, if any) settled. */
-function quarantined(emit: Emit, st: QuarantineStatements, args: PutArgs): void {
+function quarantined(
+  emit: Emit,
+  st: QuarantineStatements,
+  args: PutArgs,
+  truncated: boolean,
+): void {
   // The run id the row stores: none on a table without a run column.
   const runId = st.putTakesRunId ? args.runId : null;
-  emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId });
+  emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId, truncated });
+}
+
+// The failures a smaller payload can cure (§20 A4): rootstock's own INPUT
+// refusal of the payload, and the server refusing its bytes or size.
+const PAYLOAD_CODES: ReadonlySet<string> = new Set(["22P05", "22P02", "22021", "54000"]);
+function payloadShaped(err: unknown): boolean {
+  if (runsErrorCode(err) === "ERR_ROOTSTOCK_RUNS_INPUT") return true;
+  const code = pgCode(err);
+  return code !== undefined && PAYLOAD_CODES.has(code);
 }
 
 /**
@@ -332,20 +346,24 @@ export async function quarantine(
   const args = putArgs("quarantine", t, a);
   const json = payloadJson("quarantine", t, args, a.payload);
   await put(tx, t, st, args, json);
-  quarantined(emitter(deps?.onEvent), st, args);
+  quarantined(emitter(deps?.onEvent), st, args, false);
 }
 
 const isNoTable = (err: unknown): boolean => runsErrorCode(err) === "ERR_ROOTSTOCK_RUNS_NOTABLE";
 
 /**
  * `quarantine`, then once more with the minimal payload `{ externalId,
- * truncated: true }` when the first attempt fails for any reason but a missing
- * table (NOTABLE, thrown at once). True when either landed; false when both
- * failed, reporting the second failure as `runs.record_failed`. Given a
- * transaction handle (`TxSql`) it runs each attempt in its own savepoint, so a
- * first attempt the server refuses rolls back alone and the fallback runs in a
- * fresh one, leaving the transaction usable; given a `Transactor` it writes
- * autocommit on the root client (contract §20 A1, reversing K10).
+ * truncated: true }` when the first attempt fails in a way a smaller payload
+ * can cure: rootstock's INPUT refusal of the payload, or the server refusing
+ * its bytes or size (22P05, 22P02, 22021, 54000). Any other failure (a missing
+ * table, a grant, a timeout, a misused transaction) is rethrown with no
+ * fallback (§20 A4). True when either landed (`runs.quarantined` says which
+ * through `truncated`); false when the fallback failed too, reported as
+ * `runs.record_failed` with the external id. Given a transaction handle
+ * (`TxSql`) each attempt runs in its own savepoint, so a refused first attempt
+ * rolls back alone and the transaction stays usable; given a `Transactor` it
+ * writes autocommit on the root client (§20 A1). Calls on one `TxSql` must be
+ * sequential: a concurrent call's savepoint refusal is rethrown.
  */
 export async function quarantineSafe(
   scope: Transactor | TxSql,
@@ -362,21 +380,27 @@ export async function quarantineSafe(
       : put(scope.sql, t, st, args, payload);
   try {
     await attempt(payloadJson("quarantineSafe", t, args, a.payload));
-    quarantined(emit, st, args);
+    quarantined(emit, st, args, false);
     return true;
   } catch (err) {
-    if (isNoTable(err)) throw err;
+    if (!payloadShaped(err)) throw err;
   }
   try {
     // The fallback holds to the same cap (a long external id could break it).
     await attempt(
       payloadJson("quarantineSafe", t, args, { externalId: args.externalId, truncated: true }),
     );
-    quarantined(emit, st, args);
+    quarantined(emit, st, args, true);
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;
-    emit({ type: "runs.record_failed", operation: "quarantine", job: args.job, ...failure(err) });
+    emit({
+      type: "runs.record_failed",
+      operation: "quarantine",
+      job: args.job,
+      externalId: args.externalId,
+      ...failure(err),
+    });
     return false;
   }
 }

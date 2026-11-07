@@ -53,7 +53,12 @@ export type RunsEvent =
       settled: number;
     }
   | ({ type: "runs.record_failed"; id: string; job: string; operation: "finish" | "discard" } & Err)
-  | ({ type: "runs.record_failed"; job: string; operation: "quarantine" } & Err)
+  | ({
+      type: "runs.record_failed";
+      job: string;
+      externalId: string;
+      operation: "quarantine";
+    } & Err)
   | { type: "runs.settled_elsewhere"; id: string; job: string }
   | {
       type: "runs.finished";
@@ -74,7 +79,14 @@ export type RunsEvent =
   | { type: "runs.discarded"; id: string; job: string }
   | { type: "runs.after_run_failed"; id: string; job: string; error: unknown }
   | { type: "runs.pruned"; deleted: number }
-  | { type: "runs.quarantined"; job: string; externalId: string; runId: string | null }
+  /** `truncated`: quarantineSafe's fallback landed instead of the real payload (§20 A4). */
+  | {
+      type: "runs.quarantined";
+      job: string;
+      externalId: string;
+      runId: string | null;
+      truncated: boolean;
+    }
   | { type: "runs.resolved"; job: string; count: number }
   | { type: "runs.brake_refused"; brake: string; planned: number; held: number; cap: number | null }
   | {

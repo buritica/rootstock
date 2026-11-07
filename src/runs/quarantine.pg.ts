@@ -104,9 +104,21 @@ describe("QD1: put, repeat put, resolve, pending", () => {
     );
     expect(n).toBe("1");
     expect(r.events).toEqual([
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "rec-1", runId: RUN },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "rec-1",
+        runId: RUN,
+        truncated: false,
+      },
       { type: "runs.resolved", job: "alpha-sync", count: 1 },
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "rec-1", runId: null },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "rec-1",
+        runId: null,
+        truncated: false,
+      },
     ]);
   });
 
@@ -250,7 +262,7 @@ describe("QD4: quarantineSafe", () => {
     const ok = await quarantineSafe(
       main.transactor,
       small,
-      { job: "alpha-sync", externalId: "s-1", payload: { big: "y".repeat(200) }, reason: "r" },
+      { job: "alpha-sync", externalId: "s-1", payload: { text: "a\u0000b" }, reason: "r" },
       r.deps,
     );
     expect(ok).toBe(true);
@@ -259,8 +271,29 @@ describe("QD4: quarantineSafe", () => {
     );
     expect(JSON.parse(stored?.payload ?? "null")).toEqual({ externalId: "s-1", truncated: true });
     expect(r.events).toEqual([
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "s-1", runId: null },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "s-1",
+        runId: null,
+        truncated: true,
+      },
     ]);
+  });
+
+  test("QD4 a first failure no payload can cure (a CHECK) is rethrown with no fallback (§20 A4)", async () => {
+    const r = recorder();
+    const err = await quarantineSafe(
+      main.transactor,
+      small,
+      { job: "alpha-sync", externalId: "s-3", payload: { big: "y".repeat(200) }, reason: "r" },
+      r.deps,
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(pgCode(err)).toBe("23514");
+    expect(r.events).toEqual([]);
   });
 
   test("QD4 a payload that fits lands as given", async () => {
@@ -284,7 +317,7 @@ describe("QD4: quarantineSafe", () => {
     const ok = await quarantineSafe(
       main.transactor,
       small,
-      { job: "alpha-sync", externalId, payload: { big: "y".repeat(200) }, reason: "r" },
+      { job: "alpha-sync", externalId, payload: { text: "a\u0000b" }, reason: "r" },
       r.deps,
     );
     expect(ok).toBe(false);
@@ -294,6 +327,7 @@ describe("QD4: quarantineSafe", () => {
       type: "runs.record_failed",
       operation: "quarantine",
       job: "alpha-sync",
+      externalId,
       code: "23514",
     });
     expect(pgCode(e.error)).toBe("23514");
@@ -323,7 +357,13 @@ describe("QD4: quarantineSafe", () => {
     const stored = await row("alpha-sync", "nul-1");
     expect(JSON.parse(stored?.payload ?? "null")).toEqual({ externalId: "nul-1", truncated: true });
     expect(r.events).toEqual([
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "nul-1", runId: null },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "nul-1",
+        runId: null,
+        truncated: true,
+      },
     ]);
   });
 

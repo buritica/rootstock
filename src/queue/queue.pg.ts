@@ -936,6 +936,37 @@ describe("QF2: the sticky kind holds only while unclaimed", () => {
     expect(next).toMatchObject({ key: "alpha:s", kind: "put", payload: { p: 1 }, attempts: 0 });
     expect(next?.claim.version).toBe("1");
   });
+
+  // Latest intent wins (§20 A5): the put stays the row's kind on the fail and
+  // expired-claim paths too, so the drop is not retried.
+  test("a put over a claimed drop stays a put when the claim fails (§20 A5)", async () => {
+    const q = await fresh();
+    await q.put("alpha:f", { kind: "drop", payload: { d: 1 } });
+    const [taken] = await claim(sql, q.s, { source: "alpha", limit: 1, worker: W });
+    await q.put("alpha:f", { kind: "put", payload: { p: 1 } });
+    const failed = await fail(main.transactor, q.s, {
+      key: "alpha:f",
+      worker: W,
+      errorClass: "E",
+      claim: taken?.claim as Claim,
+    });
+    expect(failed.result).toBe("failed");
+    await sql.unsafe(`UPDATE ${q.T} SET not_before = now() WHERE key = 'alpha:f'`);
+    const [next] = await claim(sql, q.s, { source: "alpha", limit: 1, worker: W });
+    expect(next).toMatchObject({ key: "alpha:f", kind: "put", payload: { p: 1 } });
+  });
+
+  test("a put over a claimed drop stays a put when the claim expires and is reclaimed (§20 A5)", async () => {
+    const q = await fresh();
+    await q.put("alpha:x", { kind: "drop", payload: { d: 1 } });
+    await claim(sql, q.s, { source: "alpha", limit: 1, worker: W });
+    await q.put("alpha:x", { kind: "put", payload: { p: 1 } });
+    await sql.unsafe(
+      `UPDATE ${q.T} SET claimed_at = claimed_at - interval '2 days', not_before = now() WHERE key = 'alpha:x'`,
+    );
+    const [next] = await claim(sql, q.s, { source: "alpha", limit: 1, worker: "worker-b" });
+    expect(next).toMatchObject({ key: "alpha:x", kind: "put", payload: { p: 1 } });
+  });
 });
 
 describe("QF3: the version", () => {

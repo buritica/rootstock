@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Sql, Transactor } from "../db/index.ts";
+import type { Sql, Transactor, TxSql } from "../db/index.ts";
 import { RootstockRunsError } from "./errors.ts";
 import type { RunsEvent } from "./events.ts";
 import {
@@ -288,12 +288,19 @@ describe("quarantine: statements, params and events", () => {
     expect(r.calls[0]?.params).toEqual(["alpha-sync", "rec-1", '{"a":1}', "bad row", null]);
     expect(r.calls[1]?.params[4]).toBe("0f0e0d0c-0b0a-4908-8706-050403020100");
     expect(e.seen).toEqual([
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "rec-1", runId: null },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "rec-1",
+        runId: null,
+        truncated: false,
+      },
       {
         type: "runs.quarantined",
         job: "alpha-sync",
         externalId: "rec-1",
         runId: "0f0e0d0c-0b0a-4908-8706-050403020100",
+        truncated: false,
       },
     ]);
   });
@@ -331,9 +338,9 @@ describe("quarantine: statements, params and events", () => {
     expect(r.calls).toHaveLength(1);
   });
 
-  test("quarantineSafe: a failed first put retries once with the minimal payload", async () => {
+  test("quarantineSafe: a payload the server refuses (22P05) retries once with the minimal payload (§20 A4)", async () => {
     const r = recording((_, i) => {
-      if (i === 0) throw pgError("23514");
+      if (i === 0) throw pgError("22P05");
       return [];
     });
     const e = events();
@@ -343,8 +350,31 @@ describe("quarantine: statements, params and events", () => {
       '{"externalId":"rec-1","truncated":true}',
     ]);
     expect(e.seen).toEqual([
-      { type: "runs.quarantined", job: "alpha-sync", externalId: "rec-1", runId: null },
+      {
+        type: "runs.quarantined",
+        job: "alpha-sync",
+        externalId: "rec-1",
+        runId: null,
+        truncated: true,
+      },
     ]);
+  });
+
+  test("quarantineSafe: a failure no payload can cure is rethrown with no fallback (§20 A4)", async () => {
+    for (const code of ["23514", "42501", "42703", "57014"]) {
+      const boom = pgError(code);
+      const r = recording(() => {
+        throw boom;
+      });
+      const e = events();
+      await expect(quarantineSafe(auto(r.sql), T, PUT, e.deps)).rejects.toBe(boom);
+      expect(r.calls).toHaveLength(1);
+      expect(e.seen).toEqual([]);
+    }
+    // A client-side refusal (e.g. a second savepoint on a TxSql in use) is rethrown too.
+    const misuse = new Error("savepoint already open");
+    const busy = { savepoint: () => Promise.reject(misuse) } as unknown as TxSql;
+    await expect(quarantineSafe(busy, T, PUT)).rejects.toBe(misuse);
   });
 
   test("quarantineSafe: a payload refused INPUT goes straight to the minimal one", async () => {
@@ -366,6 +396,7 @@ describe("quarantine: statements, params and events", () => {
         type: "runs.record_failed",
         operation: "quarantine",
         job: "alpha-sync",
+        externalId: "rec-1",
         error: second,
         code: "23514",
       },
