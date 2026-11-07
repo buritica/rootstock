@@ -10,7 +10,7 @@ import { L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
  * saw. An answer is rows, an Error to reject with, or a function of the
  * params. An id with an empty queue answers its default.
  */
-export type StatementId = "L1" | "L2" | "L3" | "L4" | "L5" | "L6" | "L7" | "L8";
+export type StatementId = "L1" | "L2" | "L3" | "L4" | "L5" | "L6" | "L7" | "L8" | "L9";
 export type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[] | Promise<Row[]>);
 
 export interface FakeSession extends LockSession {
@@ -38,6 +38,7 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
     [L6, "L6"],
     [L7, "L7"],
     [L8, "L8"],
+    [t.terminate, "L9"],
   ]);
   const defaults: Record<StatementId, Answer> = {
     L1: [{ locked: true, pid: PID }],
@@ -48,6 +49,7 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
     L6: [{ pg_advisory_unlock: true }],
     L7: [],
     L8: [],
+    L9: [{ terminated: true }],
   };
   const queues = new Map<StatementId, Answer[]>();
   const seen: StatementId[] = [];

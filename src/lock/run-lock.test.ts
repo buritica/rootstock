@@ -12,7 +12,13 @@ import {
   PID,
 } from "./fake.test-support.ts";
 import { lockOwnershipLost } from "./probe.ts";
-import { acquireRunLock, type LockDeps, SETTLE_MS } from "./run-lock.ts";
+import {
+  acquireRunLock,
+  type LockDeps,
+  RECOVERY_POLL_FLOOR_MS,
+  type RunLock,
+  SETTLE_MS,
+} from "./run-lock.ts";
 import { type LockSlice, lockSlice } from "./slice.ts";
 
 const SLICE = lockSlice({
@@ -22,7 +28,7 @@ const SLICE = lockSlice({
   probeStallSeconds: 60,
   maxRecoveries: 5,
   endTimeoutSeconds: 5,
-  wait: { maxMs: 1000, pollIntervalMs: 50 },
+  wait: { maxMs: 1000, pollIntervalMs: 100 },
 });
 
 async function caught(p: Promise<unknown>): Promise<unknown> {
@@ -33,6 +39,25 @@ async function caught(p: Promise<unknown>): Promise<unknown> {
   }
   throw new Error("expected a rejection");
 }
+
+/** Takes the lock on `first`; each later open (a recovery after a stalled probe) hands out the next of `rest`. */
+function takeOn(
+  deps: LockDeps,
+  sessions: readonly FakeSession[],
+  slice: LockSlice = SLICE,
+): { lock: Promise<RunLock>; opens: () => number } {
+  let opens = 0;
+  const open = () => {
+    const s = sessions[opens];
+    opens += 1;
+    if (s === undefined) throw new Error("fake: no session left to open");
+    return s;
+  };
+  return { lock: acquireRunLock(open, slice, "alpha-sync", deps), opens: () => opens };
+}
+
+/** A statement that never answers. */
+const hang = () => new Promise<Row[]>(() => {});
 
 function take(session: FakeSession, deps: LockDeps, slice: LockSlice = SLICE, name = "alpha-sync") {
   return acquireRunLock(() => session, slice, name, deps);
@@ -991,36 +1016,12 @@ describe("round 2: the gate never drops, outlives or outwaits the lock", () => {
     expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_LOST");
   });
 
-  test("a hung probe makes every waiting gate UNVERIFIABLE within probeStallSeconds", async () => {
-    const s = fakeSession();
-    const deps = manualDeps();
-    const lock = await take(s, deps);
-    s.answer("L3", () => new Promise<Row[]>(() => {}));
-    const gates = [0, 1, 2].map(() => caught(lock.ensureExclusive()));
-    await deps.advance(59_999);
-    let settled = 0;
-    for (const g of gates) void g.then(() => (settled += 1));
-    await flush();
-    expect(settled).toBe(0);
-    await deps.advance(1);
-    const errs = (await Promise.all(gates)) as RootstockLockError[];
-    for (const e of errs) {
-      expect(e).toBe(errs[0] as RootstockLockError);
-      expect(e.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
-      expect((e.cause as Error).message).toBe(
-        "rootstock lock: the ownership probe for alpha-sync did not settle within 60000 ms",
-      );
-    }
-    expect(s.seen.slice(2)).toEqual(["L3"]);
-    expect(await caught(lock.ensureExclusive())).toBe(errs[0]);
-  });
-
   test("a hung recovery claim is UNVERIFIABLE within probeStallSeconds, even on the lost path", async () => {
     const s = fakeSession();
     const deps = manualDeps();
     const lock = await take(s, deps);
     s.answer("L3", [{ pid: PID + 1, held: 0 }]);
-    s.answer("L4", () => new Promise<Row[]>(() => {}));
+    s.answer("L4", hang);
     const gate = caught(lock.ensureExclusive());
     await deps.advance(60_000);
     const err = (await gate) as RootstockLockError;
@@ -1066,5 +1067,727 @@ describe("round 2: the gate never drops, outlives or outwaits the lock", () => {
     await gate;
     expect(types(deps.events)).not.toContain("lock.session_lost");
     lock.stopKeepalive();
+  });
+});
+
+describe("#41: a stalled probe recovers on a fresh session", () => {
+  const PROBE_STALL =
+    "rootstock lock: the ownership probe for alpha-sync did not settle within 60000 ms";
+
+  test("every waiting gate shares one recovery: the stalled session closes, the claim goes on a fresh one", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const { lock: taking, opens } = takeOn(deps, [s1, s2]);
+    const lock = await taking;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: true, pid: PID + 7, holder: lock.holder }]);
+    s2.answer("L3", [{ pid: PID + 7, held: 1 }], [{ pid: PID + 7, held: 1 }]);
+    const gates = [0, 1, 2].map(() => lock.ensureExclusive());
+    let settled = 0;
+    for (const g of gates) void g.then(() => (settled += 1));
+    await deps.advance(59_999);
+    expect(settled).toBe(0);
+    expect(s1.closes).toBe(0);
+    await deps.advance(1);
+    await Promise.all(gates);
+    expect(s1.closes).toBe(1);
+    expect(opens()).toBe(2);
+    expect(s1.seen).toEqual(["L1", "L2", "L3"]);
+    expect(s2.seen).toEqual(["L4"]);
+    expect(deps.events).toContainEqual({
+      type: "lock.session_replaced",
+      name: "alpha-sync",
+      attempt: 1,
+      previousPid: PID,
+    });
+    expect(deps.events.at(-1)).toEqual({
+      type: "lock.recovered",
+      name: "alpha-sync",
+      attempt: 1,
+      max: 5,
+      pid: PID + 7,
+    });
+    // The next gate probes the fresh session against its pid.
+    await lock.ensureExclusive();
+    expect(s2.seen).toEqual(["L4", "L3"]);
+    await lock.release();
+    expect(s2.seen.at(-1)).toBe("L6");
+    expect(s2.closes).toBe(1);
+    expect(s1.closes).toBe(1);
+  });
+
+  test("a fresh claim that reads the lock held by another run refuses UNVERIFIABLE with the probe's stall, latched", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: false, pid: PID + 1, holder: "another-run" }]);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(PROBE_STALL);
+    expect(deps.events.at(-1)).toEqual({
+      type: "lock.recovery_refused",
+      name: "alpha-sync",
+      attempt: 1,
+      reason: "held",
+    });
+    expect(await caught(lock.ensureExclusive())).toBe(err);
+    expect(s2.seen).toEqual(["L4"]);
+  });
+
+  test("a fresh claim that reads its own stalled backend still holding polls until the server frees it", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const ours = { locked: false, pid: PID + 1, holder: lock.holder };
+    s2.answer("L4", [ours], [ours], [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    expect(s2.seen).toEqual(["L4", "L9"]);
+    await deps.advance(SLICE.wait.pollIntervalMs * 2);
+    await gate;
+    expect(s2.seen).toEqual(["L4", "L9", "L4", "L4"]);
+    expect(deps.events).toContainEqual({
+      type: "lock.stalled_backend_terminated",
+      name: "alpha-sync",
+      attempt: 1,
+      pid: PID,
+    });
+    expect(types(deps.events).at(-1)).toBe("lock.recovered");
+  });
+
+  test("the poll gives up once the stall bound has passed, as held", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+    s2.answer("L4", ...Array.from({ length: 1 + 60_000 / SLICE.wait.pollIntervalMs }, () => ours));
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    let settled = false;
+    void gate.then(() => (settled = true));
+    await deps.advance(59_950);
+    expect(settled).toBe(false);
+    await deps.advance(50);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(PROBE_STALL);
+    expect(s2.seen).toHaveLength(2 + 60_000 / SLICE.wait.pollIntervalMs);
+    expect(deps.events.at(-1)).toMatchObject({ type: "lock.recovery_refused", reason: "held" });
+  });
+
+  test("a poll ends at once when another run has fenced the lock", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer(
+      "L4",
+      [{ locked: false, pid: PID + 1, holder: lock.holder }],
+      [{ locked: false, pid: PID + 1, holder: "another-run" }],
+    );
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000 + SLICE.wait.pollIntervalMs);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect(s2.seen).toEqual(["L4", "L9", "L4"]);
+    expect(deps.events.at(-1)).toMatchObject({ type: "lock.recovery_refused", reason: "held" });
+  });
+
+  test("a poll claim that rejects is a failed recovery; release during a poll is LOST", async () => {
+    const deps = manualDeps();
+    {
+      const s1 = fakeSession();
+      const s2 = fakeSession();
+      const lock = await takeOn(deps, [s1, s2]).lock;
+      s1.answer("L3", hang);
+      s2.answer("L4", [{ locked: false, pid: PID + 1, holder: lock.holder }], new Error("reset"));
+      const gate = caught(lock.ensureExclusive());
+      await deps.advance(60_000 + SLICE.wait.pollIntervalMs);
+      expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+      expect(deps.events.at(-1)).toMatchObject({ type: "lock.recovery_failed", attempt: 1 });
+    }
+    {
+      const s1 = fakeSession();
+      const s2 = fakeSession();
+      const lock = await takeOn(deps, [s1, s2]).lock;
+      s1.answer("L3", hang);
+      s2.answer("L4", () => [{ locked: false, pid: PID + 1, holder: lock.holder }]);
+      const gate = caught(lock.ensureExclusive());
+      await deps.advance(60_000);
+      await lock.release();
+      await deps.advance(SLICE.wait.pollIntervalMs);
+      expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_LOST");
+      expect(s2.seen.filter((id) => id === "L4")).toHaveLength(1);
+    }
+  });
+
+  test("a fresh claim that names another holder gives the lock back and refuses", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: "someone-else" }]);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect(s2.seen).toEqual(["L4", "L6"]);
+    expect(deps.events.at(-1)).toMatchObject({
+      type: "lock.recovery_refused",
+      reason: "displaced",
+    });
+  });
+
+  test("a stalled probe counts against maxRecoveries: exhausted, it refuses without reopening", async () => {
+    const slice = lockSlice({
+      ...SLICE,
+      table: { ...SLICE.table },
+      maxRecoveries: 1,
+      wait: { ...SLICE.wait },
+    });
+    const s = fakeSession();
+    const deps = manualDeps();
+    const { lock: taking, opens } = takeOn(deps, [s], slice);
+    const lock = await taking;
+    s.answer("L3", [{ pid: PID, held: 0 }], hang);
+    s.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    await lock.ensureExclusive();
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(PROBE_STALL);
+    expect(deps.events.at(-1)).toMatchObject({ type: "lock.recovery_exhausted", recoveries: 1 });
+    expect(opens()).toBe(1);
+    expect(s.closes).toBe(0);
+  });
+
+  test("a fresh claim that also hangs is UNVERIFIABLE with the claim's stall", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", hang);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(120_000);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(
+      "rootstock lock: the recovery claim for alpha-sync did not settle within 60000 ms",
+    );
+  });
+
+  test("a close that hangs is bounded by endTimeoutSeconds, reported, and recovery goes on", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s1.close = () => new Promise<void>(() => {});
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    expect(s2.seen).toEqual([]);
+    await deps.advance(6_000);
+    await gate;
+    const ended = deps.events.find((e) => e.type === "lock.end_failed");
+    expect(ended).toMatchObject({ type: "lock.end_failed", phase: "recovery" });
+    expect(ended?.type === "lock.end_failed" && (ended.error as Error).message).toBe(
+      "rootstock lock: closing the stalled session for alpha-sync did not settle within 6000 ms",
+    );
+    expect(types(deps.events).at(-1)).toBe("lock.recovered");
+  });
+
+  test("a close that rejects is reported with phase recovery, and recovery goes on", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const closeErr = new Error("end failed");
+    s1.failClose(closeErr);
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    await gate;
+    expect(deps.events).toContainEqual({
+      type: "lock.end_failed",
+      name: "alpha-sync",
+      phase: "recovery",
+      error: closeErr,
+      code: undefined,
+    });
+  });
+
+  test("an open that throws is a failed recovery: UNVERIFIABLE with the probe's stall", async () => {
+    const s1 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1]).lock;
+    s1.answer("L3", hang);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(PROBE_STALL);
+    const failed = deps.events.at(-1);
+    expect(failed).toMatchObject({ type: "lock.recovery_failed", attempt: 1 });
+    expect(failed?.type === "lock.recovery_failed" && (failed.error as Error).message).toBe(
+      "fake: no session left to open",
+    );
+    await lock.release();
+  });
+
+  test("release while the stalled session closes: no new session, the gate refuses LOST", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const { lock: taking, opens } = takeOn(deps, [s1, s2]);
+    const lock = await taking;
+    s1.answer("L3", hang);
+    let closed: () => void = () => {};
+    s1.close = () =>
+      new Promise<void>((resolve) => {
+        closed = resolve;
+      });
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    const before = deps.events.length;
+    const releasing = lock.release();
+    await deps.advance(6_000);
+    closed();
+    await releasing;
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_LOST");
+    // Nothing reports after release() began, not even the close's own bound.
+    expect(deps.events.slice(before)).toEqual([]);
+    expect(opens()).toBe(1);
+    expect(s2.seen).toEqual([]);
+    expect(types(deps.events)).not.toContain("lock.recovered");
+  });
+
+  test("a tick hung on the stalled session that fails after the swap reports nothing", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    let failTick: (err: Error) => void = () => {};
+    s1.answer(
+      "L3",
+      () =>
+        new Promise<Row[]>((_, reject) => {
+          failTick = reject;
+        }),
+      hang,
+    );
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    lock.startKeepalive();
+    deps.fire();
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    await gate;
+    failTick(new Error("CONNECTION_ENDED"));
+    await flush();
+    expect(types(deps.events)).not.toContain("lock.keepalive_failed");
+    expect(s2.seen).toEqual(["L4"]);
+    lock.stopKeepalive();
+  });
+
+  test("the poll running out on the run's own stalled backend says so with stalledPid", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+    s2.answer("L4", ...Array.from({ length: 1 + 60_000 / SLICE.wait.pollIntervalMs }, () => ours));
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(126_000);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect(deps.events.at(-1)).toEqual({
+      type: "lock.recovery_refused",
+      name: "alpha-sync",
+      attempt: 1,
+      reason: "held",
+      stalledPid: PID,
+    });
+  });
+
+  test("a poll whose claim stalls is UNVERIFIABLE with the claim's stall", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: false, pid: PID + 1, holder: lock.holder }], hang);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(126_000 + SLICE.wait.pollIntervalMs);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    const cause =
+      "rootstock lock: the recovery claim for alpha-sync did not settle within 60000 ms";
+    expect((err.cause as Error).message).toBe(cause);
+    const failed = deps.events.at(-1);
+    expect(failed?.type).toBe("lock.recovery_failed");
+    expect(failed?.type === "lock.recovery_failed" && (failed.error as Error).message).toBe(cause);
+    expect(s2.seen).toEqual(["L4", "L9", "L4"]);
+  });
+
+  test("the poll's last pause is clamped to the window", async () => {
+    const slice = lockSlice({
+      ...SLICE,
+      table: { ...SLICE.table },
+      wait: { maxMs: 1000, pollIntervalMs: 45_000 },
+    });
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2], slice).lock;
+    s1.answer("L3", hang);
+    const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+    s2.answer("L4", ours, ours, ours, ours);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    let settled = false;
+    void gate.then(() => (settled = true));
+    await deps.advance(59_999);
+    expect(settled).toBe(false);
+    await deps.advance(1);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    // 0 s, 45 s, then clamped to 60 s.
+    expect(s2.seen).toEqual(["L4", "L9", "L4", "L4"]);
+  });
+
+  test("a fresh session's first claim that rejects is retried once, then recovers", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", new Error("connect ECONNREFUSED"), [
+      { locked: true, pid: PID + 1, holder: lock.holder },
+    ]);
+    const gate = lock.ensureExclusive();
+    await deps.advance(66_000 + SETTLE_MS);
+    await gate;
+    expect(types(deps.events).slice(-3)).toEqual([
+      "lock.session_replaced",
+      "lock.recovery_retrying",
+      "lock.recovered",
+    ]);
+  });
+
+  test("a tick on the stalled session that the close rejects reports nothing", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    let failTick: (err: Error) => void = () => {};
+    s1.answer(
+      "L3",
+      () =>
+        new Promise<Row[]>((_, reject) => {
+          failTick = reject;
+        }),
+      hang,
+    );
+    // The driver rejects every pending query as it ends, before the swap.
+    s1.close = async () => {
+      failTick(new Error("CONNECTION_DESTROYED"));
+      await flush();
+    };
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    lock.startKeepalive();
+    deps.fire();
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    await gate;
+    expect(types(deps.events)).not.toContain("lock.keepalive_failed");
+    lock.stopKeepalive();
+  });
+
+  test("a late rejection from the replaced session does not make the fresh one rest", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    let failTick: (err: Error) => void = () => {};
+    s1.answer(
+      "L3",
+      () =>
+        new Promise<Row[]>((_, reject) => {
+          failTick = reject;
+        }),
+      hang,
+    );
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    s2.answer("L3", [{ pid: PID + 1, held: 1 }], [{ pid: PID + 1, held: 1 }]);
+    lock.startKeepalive();
+    deps.fire();
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    await gate;
+    failTick(new Error("CONNECTION_ENDED"));
+    await flush();
+    const next = lock.ensureExclusive();
+    await flush();
+    // Sent with no clock movement: no settle was owed on s2.
+    expect(s2.seen).toEqual(["L4", "L3"]);
+    await next;
+    lock.stopKeepalive();
+  });
+
+  test("after a failed reopen, release sends no unlock to the closed session", async () => {
+    const s1 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1]).lock;
+    s1.answer("L3", hang);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    await gate;
+    const before = deps.events.length;
+    await lock.release();
+    expect(s1.seen).not.toContain("L6");
+    expect(deps.events.slice(before)).toEqual([]);
+  });
+
+  test("a close that times out and later rejects reports one end_failed", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    let failClose: (err: Error) => void = () => {};
+    s1.close = () =>
+      new Promise<void>((_, reject) => {
+        failClose = reject;
+      });
+    s2.answer("L4", [{ locked: true, pid: PID + 1, holder: lock.holder }]);
+    const gate = lock.ensureExclusive();
+    await deps.advance(66_000);
+    await gate;
+    failClose(new Error("late"));
+    await flush();
+    expect(deps.events.filter((e) => e.type === "lock.end_failed")).toHaveLength(1);
+  });
+
+  test("a tick that answers after the gate latched reports nothing", async () => {
+    const s = fakeSession();
+    const deps = manualDeps();
+    const lock = await take(s, deps);
+    let answerTick: (rows: Row[]) => void = () => {};
+    s.answer(
+      "L3",
+      () =>
+        new Promise<Row[]>((resolve) => {
+          answerTick = resolve;
+        }),
+      new Error("ECONNRESET"),
+    );
+    s.answer("L4", [{ locked: false, pid: PID + 1, holder: "another-run" }]);
+    lock.startKeepalive();
+    deps.fire();
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(SETTLE_MS);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    answerTick([{ pid: PID + 1, held: 0 }]);
+    await flush();
+    expect(types(deps.events)).not.toContain("lock.session_lost");
+    lock.stopKeepalive();
+  });
+
+  test("a lock pg_locks shows on another backend stops the poll at once, with no stalledPid", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+    s2.answer("L4", ours, ours);
+    s2.answer("L9", []);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect(s2.seen).toEqual(["L4", "L9", "L4"]);
+    expect(s2.calls.find((c) => c.id === "L9")?.params).toEqual(["alpha-sync", PID, lock.holder]);
+    expect(deps.events.at(-1)).toEqual({
+      type: "lock.recovery_refused",
+      name: "alpha-sync",
+      attempt: 1,
+      reason: "held",
+    });
+  });
+
+  test("no L9 row and a lock freed meanwhile: the one more claim recovers", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer(
+      "L4",
+      [{ locked: false, pid: PID + 1, holder: lock.holder }],
+      [{ locked: true, pid: PID + 1, holder: lock.holder }],
+    );
+    s2.answer("L9", []);
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    await gate;
+    expect(s2.seen).toEqual(["L4", "L9", "L4"]);
+    expect(types(deps.events).at(-1)).toBe("lock.recovered");
+  });
+
+  test("a terminate refused for privilege marks the backend as the run's own; a lost connection does not", async () => {
+    for (const [code, own] of [
+      ["42501", true],
+      [undefined, false],
+    ] as const) {
+      const s1 = fakeSession();
+      const s2 = fakeSession();
+      const deps = manualDeps();
+      const lock = await takeOn(deps, [s1, s2]).lock;
+      s1.answer("L3", hang);
+      const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+      s2.answer(
+        "L4",
+        ...Array.from({ length: 1 + 60_000 / SLICE.wait.pollIntervalMs }, () => ours),
+      );
+      s2.answer("L9", Object.assign(new Error("terminate failed"), { code }));
+      const gate = caught(lock.ensureExclusive());
+      await deps.advance(126_000);
+      expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+      const refused = deps.events.at(-1);
+      expect(refused?.type).toBe("lock.recovery_refused");
+      expect(refused !== undefined && "stalledPid" in refused).toBe(own);
+    }
+  });
+
+  test("a terminate that rejects is reported and the poll goes on", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    const denied = new Error("must be a member of the role");
+    s2.answer(
+      "L4",
+      [{ locked: false, pid: PID + 1, holder: lock.holder }],
+      [{ locked: true, pid: PID + 1, holder: lock.holder }],
+    );
+    s2.answer("L9", denied);
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000 + SETTLE_MS + SLICE.wait.pollIntervalMs);
+    await gate;
+    expect(deps.events).toContainEqual({
+      type: "lock.terminate_failed",
+      name: "alpha-sync",
+      attempt: 1,
+      pid: PID,
+      error: denied,
+      code: undefined,
+    });
+    expect(types(deps.events).at(-1)).toBe("lock.recovered");
+  });
+
+  test("a terminate that stalls is UNVERIFIABLE with its own stall", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: false, pid: PID + 1, holder: lock.holder }]);
+    s2.answer("L9", hang);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(120_000);
+    const err = (await gate) as RootstockLockError;
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect((err.cause as Error).message).toBe(
+      "rootstock lock: ending the stalled backend for alpha-sync did not settle within 60000 ms",
+    );
+  });
+
+  test("the recovery poll never runs faster than RECOVERY_POLL_FLOOR_MS", async () => {
+    const slice = lockSlice({
+      ...SLICE,
+      table: { ...SLICE.table },
+      wait: { maxMs: 1000, pollIntervalMs: 10 },
+    });
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2], slice).lock;
+    s1.answer("L3", hang);
+    const ours = [{ locked: false, pid: PID + 1, holder: lock.holder }];
+    s2.answer("L4", ...Array.from({ length: 1000 }, () => ours));
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(120_000);
+    await gate;
+    expect(s2.seen.filter((id) => id === "L4")).toHaveLength(1 + 60_000 / RECOVERY_POLL_FLOOR_MS);
+  });
+
+  test("a sleep that breaks during the poll stops it instead of spinning", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", () => [{ locked: false, pid: PID + 1, holder: lock.holder }]);
+    s2.answer("L9", () => {
+      deps.sleep = () => Promise.reject(new Error("clock gone"));
+      return [{ terminated: true }];
+    });
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    expect(lockErrorCode(await gate)).toBe("ERR_ROOTSTOCK_LOCK_UNVERIFIABLE");
+    expect(s2.seen).toEqual(["L4", "L9"]);
+  });
+
+  test("the keepalive stands down while a stalled probe's recovery runs", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer(
+      "L4",
+      [{ locked: false, pid: PID + 1, holder: lock.holder }],
+      [{ locked: true, pid: PID + 1, holder: lock.holder }],
+    );
+    s2.answer("L3", [{ pid: PID + 1, held: 1 }], [{ pid: PID + 1, held: 1 }]);
+    lock.startKeepalive();
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    deps.fire();
+    await flush();
+    expect(s2.seen).toEqual(["L4", "L9"]);
+    await deps.advance(SLICE.wait.pollIntervalMs);
+    await gate;
+    deps.fire();
+    await flush();
+    expect(s2.seen.slice(-2)).toEqual(["L3", "L5"]);
+    lock.stopKeepalive();
+  });
+
+  test("release after a refused stalled recovery sends no unlock to the fresh session", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang);
+    s2.answer("L4", [{ locked: false, pid: PID + 1, holder: "another-run" }]);
+    const gate = caught(lock.ensureExclusive());
+    await deps.advance(60_000);
+    await gate;
+    await lock.release();
+    expect(s2.seen).toEqual(["L4"]);
+    expect(s2.closes).toBe(1);
   });
 });
