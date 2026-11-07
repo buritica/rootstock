@@ -37,8 +37,9 @@ type Err = { error: unknown; code: string | undefined };
 
 /**
  * What `runs` reports (contract §0.6). No event carries a quarantine payload,
- * a scope value or a price. `runs.record_failed` and `runs.after_run_failed`
- * carry the thrown error itself (the record binds only its job's name).
+ * a scope value or a price. Two stated exceptions carry the thrown error
+ * itself: `runs.record_failed` (the record names only its job) and
+ * `runs.after_run_failed` (the hook is the consumer's own code).
  */
 export type RunsEvent =
   | { type: "runs.refused"; job: string; code: RunsErrorCode }
@@ -51,12 +52,8 @@ export type RunsEvent =
       lockName: string;
       settled: number;
     }
-  | ({
-      type: "runs.record_failed";
-      id?: string;
-      job: string;
-      operation: "finish" | "discard" | "quarantine";
-    } & Err)
+  | ({ type: "runs.record_failed"; id: string; job: string; operation: "finish" | "discard" } & Err)
+  | ({ type: "runs.record_failed"; job: string; operation: "quarantine" } & Err)
   | { type: "runs.settled_elsewhere"; id: string; job: string }
   | {
       type: "runs.finished";

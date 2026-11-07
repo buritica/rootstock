@@ -226,7 +226,9 @@ describe("lock and queue composed", () => {
     );
     expect(tables.map((r) => r.t)).toEqual([
       "cursors",
+      "quarantine",
       "run_locks",
+      "runs",
       "schema_migrations",
       "work_queue",
     ]);

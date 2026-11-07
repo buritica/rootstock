@@ -187,7 +187,10 @@ describe("the Stage D files", () => {
 
   test("they follow the Stage C files, in order, all additive", () => {
     expect(MANIFEST.slice(4)).toEqual(Object.keys(STAGE_D));
-    for (const m of rootstockMigrations().slice(4)) expect(m.kind).toBe("additive");
+    for (const m of rootstockMigrations().slice(4)) {
+      expect(m.kind).toBe("additive");
+      expect(m.statements).toHaveLength(1);
+    }
   });
 });
 

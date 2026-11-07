@@ -48,7 +48,7 @@ export function runsErrorCode(err: unknown): RunsErrorCode | undefined {
   return codeIn(CODE_SET, err);
 }
 
-/** The frozen texts (contract §3.8), one builder per refusal. */
+/** The frozen texts (contract §3.8), one builder per text. */
 export const refusals = {
   /** `detail` names the call and the field, e.g. `count("x"): n must be … — got …`. */
   input: (detail: string, job?: string) =>
@@ -89,7 +89,8 @@ export const refusals = {
       `run ${id} (${job}) already finished — ${call}() after finish() or discard()`,
       { job },
     ),
-  brake: (brake: string, judgement: BrakeJudgement) =>
+  /** Only an armed brake refuses, so its cap is a number. */
+  brake: (brake: string, judgement: BrakeJudgement & { cap: number }) =>
     new RootstockRunsError(
       "ERR_ROOTSTOCK_RUNS_BRAKE",
       `${brake} would archive ${judgement.planned} of ${judgement.held} (cap ${judgement.cap}) — refusing; pass the override to allow it`,

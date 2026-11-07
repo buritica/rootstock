@@ -92,10 +92,11 @@ the queue and cursor calls fail with the driver's permission error.
 **Run record.** The `runs` subpath (0.8.0) adds two more tables, `runs` and
 `quarantine`, owned by the migrating role like the others. When the writers
 connect as another role, grant it `SELECT`, `INSERT`, `UPDATE`, `DELETE` on
-`rootstock.runs` and `rootstock.quarantine`. 0.8.0 also adds two columns
-(`version`, `claim_token`) to `work_queue`; a consumer that passes its own
-queue table adds the same two columns in its own additive migration, applied
-before the 0.8.0 code serves.
+`rootstock.runs` and `rootstock.quarantine` (or on your own quarantine table,
+when you pass one). 0.8.0 also adds two columns to `work_queue`,
+`version bigint NOT NULL DEFAULT 0` and `claim_token uuid`; a consumer that
+passes its own queue table adds the same two columns, with the same types and
+default, in its own additive migration applied before the 0.8.0 code serves.
 
 ### Rolling back
 
