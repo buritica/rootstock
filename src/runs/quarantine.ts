@@ -1,14 +1,21 @@
+import type { Sql } from "../db/index.ts";
 import {
   type Brand,
   bounded,
   identifier,
   isRecord,
   own,
+  perSlice,
+  q,
+  quoteIdentifier,
+  quoteTable,
   type SliceRefusals,
   sliceBrand,
   sliceRefusals,
   tableRef,
 } from "../internal/slice.ts";
+import { guarded, refusals, runsErrorCode } from "./errors.ts";
+import { type Emit, emitter, failure, type RunsDeps } from "./events.ts";
 
 export interface QuarantineTableInput {
   /** Default { <default schema>, "quarantine" }. */
@@ -147,4 +154,263 @@ export function assertQuarantineTable(
   value: unknown,
 ): asserts value is QuarantineTable {
   brand.assert(fn, value);
+}
+
+/** The quarantine statements (contract §4.3), frozen text, built once per table. */
+export interface QuarantineStatements {
+  /**
+   * QU1, params [job, externalId, payloadJson, reason, runId], or QU1′ (the
+   * table has no run column), params [job, externalId, payloadJson, reason].
+   */
+  readonly put: string;
+  /** True for QU1, false for QU1′. */
+  readonly putTakesRunId: boolean;
+  /** QU2, params [job, JSON.stringify(externalIds)]. */
+  readonly resolve: string;
+  /** QU3, params [job, externalIds === undefined ? null : JSON.stringify(externalIds)]. */
+  readonly pending: string;
+}
+
+export function quarantineStatements(t: QuarantineTable): QuarantineStatements {
+  const Q = quoteTable(t.table);
+  const c = t.columns;
+  const job = quoteIdentifier(c.job);
+  const ext = quoteIdentifier(c.externalId);
+  const payload = quoteIdentifier(c.payload);
+  const reason = quoteIdentifier(c.reason);
+  const status = quoteIdentifier(c.status);
+  const failedAt = quoteIdentifier(c.failedAt);
+  const resolvedAt = quoteIdentifier(c.resolvedAt);
+  const run = c.runId === null ? null : quoteIdentifier(c.runId);
+  const put =
+    run === null
+      ? `INSERT INTO ${Q} (${job}, ${ext}, ${payload}, ${reason}, ${status}, ${failedAt}, ${resolvedAt})
+VALUES ($1::text, $2::text, $3::text::jsonb, $4::text, 'pending', clock_timestamp(), NULL)
+ON CONFLICT (${job}, ${ext}) DO UPDATE SET
+  ${payload} = excluded.${payload}, ${reason} = excluded.${reason},
+  ${status} = 'pending', ${failedAt} = excluded.${failedAt}, ${resolvedAt} = NULL`
+      : `INSERT INTO ${Q} (${job}, ${ext}, ${payload}, ${reason}, ${status}, ${failedAt}, ${resolvedAt}, ${run})
+VALUES ($1::text, $2::text, $3::text::jsonb, $4::text, 'pending', clock_timestamp(), NULL, $5::uuid)
+ON CONFLICT (${job}, ${ext}) DO UPDATE SET
+  ${payload} = excluded.${payload}, ${reason} = excluded.${reason},
+  ${status} = 'pending', ${failedAt} = excluded.${failedAt}, ${resolvedAt} = NULL,
+  ${run} = excluded.${run}`;
+  return Object.freeze({
+    put,
+    putTakesRunId: run !== null,
+    resolve: `WITH r AS (
+  UPDATE ${Q} SET ${status} = 'resolved', ${resolvedAt} = clock_timestamp()
+  WHERE ${job} = $1::text AND ${status} = 'pending'
+    AND ${ext} IN (SELECT jsonb_array_elements_text($2::text::jsonb))
+  RETURNING 1
+)
+SELECT count(*)::text AS n FROM r`,
+    pending: `SELECT ${ext} AS external_id, ${reason} AS reason,
+       floor(extract(epoch FROM ${failedAt}) * 1000)::text AS failed_at_ms
+FROM ${Q}
+WHERE ${job} = $1::text AND ${status} = 'pending'
+  AND ($2::text IS NULL OR ${ext} IN (SELECT jsonb_array_elements_text($2::text::jsonb)))
+ORDER BY ${failedAt}, ${ext}`,
+  });
+}
+
+/** The table's statements, after the brand check, built once per table. */
+const statementsOf = perSlice(assertQuarantineTable, quarantineStatements);
+
+/** One pending quarantine row (QU3). */
+export interface PendingRow {
+  externalId: string;
+  reason: string;
+  failedAt: Date;
+}
+
+/** What `quarantine` and `quarantineSafe` take. */
+interface PutInput {
+  job: string;
+  externalId: string;
+  payload: unknown;
+  reason: string;
+  runId?: string | null;
+}
+
+/** A put's parameters other than the payload, checked before any query. */
+interface PutArgs {
+  readonly job: string;
+  readonly externalId: string;
+  readonly reason: string;
+  readonly runId: string | null;
+}
+
+const utf8 = new TextEncoder();
+
+function text(fn: string, field: string, value: unknown, job?: string): string {
+  if (typeof value === "string") return value;
+  throw refusals.input(`${fn}(): ${field} must be a string — got ${q(value)}`, job);
+}
+
+function putArgs(fn: string, t: QuarantineTable, a: PutInput): PutArgs {
+  const job = text(fn, "job", a.job);
+  const externalId = text(fn, "externalId", a.externalId, job);
+  const full = text(fn, "reason", a.reason, job);
+  const runId = a.runId ?? null;
+  if (runId !== null && typeof runId !== "string") {
+    throw refusals.input(`${fn}(): runId must be a string or null — got ${q(runId)}`, job);
+  }
+  let reason = full.slice(0, t.maxReasonChars);
+  // A cut never leaves half a surrogate pair behind.
+  const last = reason.charCodeAt(reason.length - 1);
+  if (reason.length < full.length && last >= 0xd800 && last <= 0xdbff) {
+    reason = reason.slice(0, -1);
+  }
+  return { job, externalId, reason, runId };
+}
+
+/** The payload's JSON text; INPUT when it does not serialize or is over the cap. */
+function payloadJson(fn: string, t: QuarantineTable, args: PutArgs, payload: unknown): string {
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(payload);
+  } catch {
+    json = undefined;
+  }
+  if (typeof json !== "string") {
+    throw refusals.input(`${fn}(${q(args.externalId)}): payload must serialize to JSON`, args.job);
+  }
+  const bytes = utf8.encode(json).length;
+  if (bytes > t.maxPayloadBytes) {
+    throw refusals.input(
+      `${fn}(${q(args.externalId)}): payload is ${bytes} bytes, over the ${t.maxPayloadBytes} cap`,
+      args.job,
+    );
+  }
+  return json;
+}
+
+async function put(
+  tx: Sql,
+  t: QuarantineTable,
+  st: QuarantineStatements,
+  args: PutArgs,
+  json: string,
+  emit: Emit,
+): Promise<void> {
+  const params: (string | null)[] = [args.job, args.externalId, json, args.reason];
+  if (st.putTakesRunId) params.push(args.runId);
+  await guarded(t.table, () => tx.unsafe(st.put, params), args.job);
+  emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId: args.runId });
+}
+
+/**
+ * QU1 (QU1′ on a table without a run column). Writes the record a run could
+ * not load, or resets its row to pending with the new payload and reason.
+ * `tx` is the caller's transaction or savepoint handle, so the row commits or
+ * rolls back with the batch. The payload is refused (INPUT) before any query
+ * when it does not serialize or is over `maxPayloadBytes`; the reason is cut
+ * to `maxReasonChars`. A rejection propagates.
+ */
+export async function quarantine(
+  tx: Sql,
+  t: QuarantineTable,
+  a: PutInput,
+  deps?: Pick<RunsDeps, "onEvent">,
+): Promise<void> {
+  const st = statementsOf("quarantine", t);
+  const args = putArgs("quarantine", t, a);
+  const json = payloadJson("quarantine", t, args, a.payload);
+  await put(tx, t, st, args, json, emitter(deps?.onEvent));
+}
+
+const isNoTable = (err: unknown): boolean => runsErrorCode(err) === "ERR_ROOTSTOCK_RUNS_NOTABLE";
+
+/**
+ * `quarantine`, then once more with the minimal payload `{ externalId,
+ * truncated: true }` when the first attempt fails for any reason but a missing
+ * table (NOTABLE, thrown at once). True when either landed; false when both
+ * failed, reporting the second failure as `runs.record_failed`. It opens no
+ * savepoint: inside a transaction the caller wraps it in one, since a failed
+ * first attempt aborts the enclosing scope (and so the retry in it).
+ */
+export async function quarantineSafe(
+  tx: Sql,
+  t: QuarantineTable,
+  a: PutInput,
+  deps?: Pick<RunsDeps, "onEvent">,
+): Promise<boolean> {
+  const st = statementsOf("quarantineSafe", t);
+  const args = putArgs("quarantineSafe", t, a);
+  const emit = emitter(deps?.onEvent);
+  try {
+    await put(tx, t, st, args, payloadJson("quarantineSafe", t, args, a.payload), emit);
+    return true;
+  } catch (err) {
+    if (isNoTable(err)) throw err;
+  }
+  try {
+    const minimal = JSON.stringify({ externalId: args.externalId, truncated: true });
+    await put(tx, t, st, args, minimal, emit);
+    return true;
+  } catch (err) {
+    if (isNoTable(err)) throw err;
+    emit({ type: "runs.record_failed", operation: "quarantine", job: args.job, ...failure(err) });
+    return false;
+  }
+}
+
+function idList(fn: string, job: string, value: unknown): string {
+  if (Array.isArray(value) && value.every((v) => typeof v === "string")) {
+    return JSON.stringify(value);
+  }
+  throw refusals.input(`${fn}(): externalIds must be an array of strings — got ${q(value)}`, job);
+}
+
+/**
+ * QU2. Marks the job's pending rows for `externalIds` resolved and returns how
+ * many it moved. An empty list returns 0 without a query.
+ */
+export async function resolveQuarantine(
+  tx: Sql,
+  t: QuarantineTable,
+  a: { job: string; externalIds: readonly string[] },
+  deps?: Pick<RunsDeps, "onEvent">,
+): Promise<number> {
+  const st = statementsOf("resolveQuarantine", t);
+  const job = text("resolveQuarantine", "job", a.job);
+  const ids = idList("resolveQuarantine", job, a.externalIds);
+  if (a.externalIds.length === 0) return 0;
+  const [row] = await guarded(t.table, () => tx.unsafe<{ n: string }>(st.resolve, [job, ids]), job);
+  const count = Number(row?.n ?? 0);
+  if (count > 0) emitter(deps?.onEvent)({ type: "runs.resolved", job, count });
+  return count;
+}
+
+/**
+ * QU3. The job's pending rows, oldest failure first; only those for
+ * `externalIds` when it is given.
+ */
+export async function pendingQuarantine(
+  sql: Sql,
+  t: QuarantineTable,
+  a: { job: string; externalIds?: readonly string[] },
+): Promise<readonly PendingRow[]> {
+  const st = statementsOf("pendingQuarantine", t);
+  const job = text("pendingQuarantine", "job", a.job);
+  const ids = a.externalIds === undefined ? null : idList("pendingQuarantine", job, a.externalIds);
+  const rows = await guarded(
+    t.table,
+    () =>
+      sql.unsafe<{ external_id: string; reason: string; failed_at_ms: string }>(st.pending, [
+        job,
+        ids,
+      ]),
+    job,
+  );
+  return Object.freeze(
+    rows.map((r) =>
+      Object.freeze({
+        externalId: String(r.external_id),
+        reason: String(r.reason),
+        failedAt: new Date(Number(r.failed_at_ms)),
+      }),
+    ),
+  );
 }

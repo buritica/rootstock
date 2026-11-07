@@ -6,4 +6,13 @@ export type {
   RunsEvent,
   ScopeJudgement,
 } from "./events.ts";
-export { type QuarantineTable, type QuarantineTableInput, quarantineTable } from "./quarantine.ts";
+export {
+  type PendingRow,
+  pendingQuarantine,
+  type QuarantineTable,
+  type QuarantineTableInput,
+  quarantine,
+  quarantineSafe,
+  quarantineTable,
+  resolveQuarantine,
+} from "./quarantine.ts";
