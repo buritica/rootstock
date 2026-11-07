@@ -95,6 +95,7 @@ const PURE_SUBPATHS = [
   "src/internal/",
   "src/lock/",
   "src/queue/",
+  "src/runs/",
 ] as const;
 // The one cross-subpath import a pure subpath may make: the shared slice
 // parser pieces, which are pure themselves and are no package export.
@@ -103,6 +104,7 @@ const SHARED_INTERNAL = "../internal/slice.ts";
 const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   "src/lock/": ["../db/index.ts"],
   "src/queue/": ["../db/index.ts"],
+  "src/runs/": ["../db/index.ts", "../lock/index.ts"],
 };
 // A name read as a value. A property access (`deps.setInterval(...)`) and a
 // key (`setInterval: …`, `setInterval?: …`) are not the global, and an

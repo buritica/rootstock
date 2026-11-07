@@ -89,6 +89,14 @@ application connects as a different role, grant it:
 Without them the lock refuses `UNFENCED` (the fence cannot write its row) and
 the queue and cursor calls fail with the driver's permission error.
 
+**Run record.** The `runs` subpath (0.8.0) adds two more tables, `runs` and
+`quarantine`, owned by the migrating role like the others. When the writers
+connect as another role, grant it `SELECT`, `INSERT`, `UPDATE`, `DELETE` on
+`rootstock.runs` and `rootstock.quarantine`. 0.8.0 also adds two columns
+(`version`, `claim_token`) to `work_queue`; a consumer that passes its own
+queue table adds the same two columns in its own additive migration, applied
+before the 0.8.0 code serves.
+
 ### Rolling back
 
 Rolling a consumer back to 0.5.x after 0.6.0 migrated its database leaves
