@@ -114,6 +114,28 @@ describe("lock and queue slices", () => {
     ]);
   });
 
+  test("wait.block prints only when given (w4d §0.4): a config without it prints as before", () => {
+    const without = printRootstockConfig(defineRootstockConfig(input()));
+    expect(JSON.parse(without).lock.wait).toEqual({ maxMs: 30000, pollIntervalMs: 1000 });
+    expect(without).not.toContain("block");
+    const blockInput = {
+      ...input(),
+      lock: { ...LOCK, wait: { ...LOCK.wait, block: { checkIntervalMs: 1000 } } },
+    };
+    const withBlock = printRootstockConfig(defineRootstockConfig(blockInput));
+    expect(JSON.parse(withBlock).lock).toEqual({
+      ...LOCK_PRINT,
+      wait: { block: { checkIntervalMs: 1000 }, maxMs: 30000, pollIntervalMs: 1000 },
+    });
+    // The block key is the only difference.
+    const strip = (text: string) => {
+      const view = JSON.parse(text);
+      delete view.lock.wait.block;
+      return JSON.stringify(view);
+    };
+    expect(strip(withBlock)).toBe(strip(without));
+  });
+
   test("CF4: an omitted table schema is migrate.schema", () => {
     const config = defineRootstockConfig({ ...input(), migrate: { schema: "rs_a" } });
     expect(config.lock?.table).toEqual({ schema: "rs_a", name: "run_locks" });

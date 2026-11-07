@@ -20,6 +20,7 @@ import {
   SETTLE_MS,
 } from "./run-lock.ts";
 import { type LockSlice, lockSlice } from "./slice.ts";
+import { createTurnQueue } from "./turns.ts";
 
 const SLICE = lockSlice({
   profile: "lock",
@@ -1789,5 +1790,171 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
     await lock.release();
     expect(s2.seen).toEqual(["L4"]);
     expect(s2.closes).toBe(1);
+  });
+});
+
+describe("w4d §8.2: #39 lock items", () => {
+  test("LB6 (unit): an L5 with no row emits fence_missing; the next gate skips L3 and ends LOST, latched", async () => {
+    for (const holderNow of ["another-run", null]) {
+      const s = fakeSession();
+      const deps = fakeDeps();
+      const lock = await take(s, deps);
+      lock.startKeepalive();
+      s.answer("L5", []);
+      deps.fire();
+      await flush();
+      expect(deps.events.at(-1)).toEqual({
+        type: "lock.fence_missing",
+        name: "alpha-sync",
+        holder: lock.holder,
+      });
+      s.answer("L4", [{ locked: true, pid: PID, holder: holderNow }]);
+      const err = await caught(lock.ensureExclusive());
+      expect((err as RootstockLockError).code).toBe("ERR_ROOTSTOCK_LOCK_LOST");
+      expect(s.seen).toEqual(["L1", "L2", "L3", "L5", "L4", "L6"]);
+      expect(deps.events.at(-1)).toEqual({
+        type: "lock.recovery_refused",
+        name: "alpha-sync",
+        attempt: 1,
+        reason: "displaced",
+      });
+      expect(await caught(lock.ensureExclusive())).toBe(err);
+      await lock.release();
+    }
+  });
+
+  test("LB6 (unit): an L5 that updates its row marks nothing; a suspect lock whose row came back recovers", async () => {
+    const s = fakeSession();
+    const deps = fakeDeps();
+    const lock = await take(s, deps);
+    lock.startKeepalive();
+    deps.fire();
+    await flush();
+    expect(types(deps.events)).not.toContain("lock.fence_missing");
+    await lock.ensureExclusive();
+    expect(s.seen.slice(-1)).toEqual(["L3"]);
+    s.answer("L5", []);
+    deps.fire();
+    await flush();
+    s.answer("L4", [{ locked: true, pid: PID, holder: lock.holder }]);
+    await lock.ensureExclusive();
+    expect(s.seen.slice(-1)).toEqual(["L4"]);
+    // No longer suspect: the next gate probes again.
+    await lock.ensureExclusive();
+    expect(s.seen.slice(-1)).toEqual(["L3"]);
+    await lock.release();
+  });
+
+  test("LB7: a keepalive tick finding the guard stalled emits probe_stalled with the stall", async () => {
+    const s = fakeSession();
+    const deps = fakeDeps();
+    const lock = await take(s, deps);
+    s.answer("L3", hang);
+    lock.startKeepalive();
+    deps.fire();
+    await flush();
+    deps.clock += 59_999;
+    deps.fire();
+    await flush();
+    expect(types(deps.events)).not.toContain("lock.probe_stalled");
+    deps.clock += 1;
+    deps.fire();
+    await flush();
+    expect(deps.events.filter((e) => e.type === "lock.probe_stalled")).toEqual([
+      { type: "lock.probe_stalled", name: "alpha-sync", ms: 60_000 },
+    ]);
+    // The stalled tick went through: L3 again, then its beat.
+    expect(s.seen.slice(2)).toEqual(["L3", "L3", "L5"]);
+    lock.stopKeepalive();
+  });
+
+  test("LB7: a gate probe stall does not emit probe_stalled; nor does a tick while its recovery stands the keepalive down", async () => {
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    s1.answer("L3", hang, hang);
+    s2.answer(
+      "L4",
+      [{ locked: false, pid: PID + 1, holder: lock.holder }],
+      [{ locked: true, pid: PID + 1, holder: lock.holder }],
+    );
+    lock.startKeepalive();
+    // A tick whose probe hangs holds the guard from here.
+    deps.fire();
+    await flush();
+    const gate = lock.ensureExclusive();
+    await deps.advance(60_000);
+    // Past the stall, inside the recovery: the keepalive stands down.
+    deps.fire();
+    await flush();
+    await deps.advance(SLICE.wait.pollIntervalMs);
+    await gate;
+    expect(types(deps.events)).toContain("lock.recovered");
+    expect(types(deps.events)).not.toContain("lock.probe_stalled");
+    lock.stopKeepalive();
+    await lock.release();
+  });
+
+  test("LB8: details mirrors the top-level fields for each code", async () => {
+    const errs: RootstockLockError[] = [];
+    const push = async (p: Promise<unknown>) => errs.push((await caught(p)) as RootstockLockError);
+    const held = fakeSession();
+    held.answer("L1", [{ locked: false, pid: PID }]);
+    await push(take(held, fakeDeps()));
+    const odd = fakeSession();
+    odd.answer("L1", [{ locked: "t", pid: PID }]);
+    await push(take(odd, fakeDeps()));
+    const conn = fakeSession();
+    conn.answer("L2", [{ pid: PID + 1 }]);
+    await push(take(conn, fakeDeps()));
+    const noRow = fakeSession();
+    noRow.answer("L2", []);
+    await push(take(noRow, fakeDeps()));
+    const unfenced = fakeSession();
+    unfenced.answer("L2", new Error("no table"));
+    await push(take(unfenced, fakeDeps()));
+    await push(take(fakeSession(), fakeDeps(), SLICE, "delta-sync"));
+    const waitHeld = fakeSession();
+    waitHeld.answer("L1", [{ locked: false, pid: PID }]);
+    const d = fakeDeps();
+    await push(
+      acquireRunLock(() => waitHeld, SLICE, "alpha-sync", d, {
+        wait: { mode: "poll", ms: 0, turns: createTurnQueue() },
+      }),
+    );
+    const lost = fakeSession();
+    lost.answer("L3", [{ pid: PID, held: 0 }]);
+    lost.answer("L4", [{ locked: false, pid: PID, holder: HOLDER }]);
+    await push((await take(lost, fakeDeps())).ensureExclusive());
+
+    expect(errs.map((e) => e.details)).toEqual([
+      { code: "ERR_ROOTSTOCK_LOCK_HELD" },
+      { code: "ERR_ROOTSTOCK_LOCK_MALFUNCTION", answer: "t" },
+      { code: "ERR_ROOTSTOCK_LOCK_CONN", expectedPid: PID, actualPid: PID + 1 },
+      { code: "ERR_ROOTSTOCK_LOCK_CONN", expectedPid: PID, actualPid: null },
+      { code: "ERR_ROOTSTOCK_LOCK_UNFENCED" },
+      { code: "ERR_ROOTSTOCK_LOCK_NAME" },
+      { code: "ERR_ROOTSTOCK_LOCK_HELD", waitedMs: 0 },
+      { code: "ERR_ROOTSTOCK_LOCK_LOST" },
+    ]);
+    for (const e of errs) {
+      expect(e.details.code).toBe(e.code);
+      expect(Object.isFrozen(e.details)).toBe(true);
+      const { code: _code, ...fields } = e.details;
+      for (const [key, value] of Object.entries(fields)) {
+        expect(e[key as keyof RootstockLockError]).toEqual(value);
+      }
+    }
+    // The other codes carry only their code.
+    for (const code of [
+      "ERR_ROOTSTOCK_LOCK_WAIT",
+      "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE",
+      "ERR_ROOTSTOCK_LOCK_ABANDONED",
+    ] as const) {
+      expect(new RootstockLockError(code, "alpha-sync", "x", { waitedMs: 1 }).details).toEqual({
+        code,
+      });
+    }
   });
 });

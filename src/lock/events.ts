@@ -15,7 +15,7 @@ export type LockEvent =
   | {
       type: "lock.wait";
       name: string;
-      mode: "poll";
+      mode: "poll" | "block";
       outcome: "acquired" | "timeout" | "aborted" | "error";
       waitedMs: number;
     }
@@ -27,6 +27,10 @@ export type LockEvent =
       held: number;
     }
   | ({ type: "lock.keepalive_failed"; name: string } & Err)
+  /** A keepalive L5 updated no row: the fencing row no longer names this holder; the next gate ends LOST. */
+  | { type: "lock.fence_missing"; name: string; holder: string }
+  /** A keepalive tick found the previous tick's probe in flight past probeStallSeconds; `ms` is how long. */
+  | { type: "lock.probe_stalled"; name: string; ms: number }
   | ({ type: "lock.recovery_retrying"; name: string; attempt: number } & Err)
   | ({ type: "lock.recovery_failed"; name: string; attempt: number } & Err)
   | {

@@ -20,7 +20,14 @@ function lockView(lock: RootstockConfig["lock"]): unknown {
     probeStallSeconds: lock.probeStallSeconds,
     profile: lock.profile,
     table: table(lock.table),
-    wait: { maxMs: lock.wait.maxMs, pollIntervalMs: lock.wait.pollIntervalMs },
+    wait: {
+      maxMs: lock.wait.maxMs,
+      pollIntervalMs: lock.wait.pollIntervalMs,
+      // Printed only when given, so a config without it prints as before.
+      ...(lock.wait.block === undefined
+        ? {}
+        : { block: { checkIntervalMs: lock.wait.block.checkIntervalMs } }),
+    },
   };
 }
 

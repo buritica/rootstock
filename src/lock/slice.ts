@@ -22,7 +22,8 @@ export interface LockSliceInput {
   probeStallSeconds: number;
   maxRecoveries: number;
   endTimeoutSeconds: number;
-  wait: { maxMs: number; pollIntervalMs: number };
+  /** `block`: block-mode waiting; absent, a block-mode wait refuses WAIT. */
+  wait: { maxMs: number; pollIntervalMs: number; block?: { checkIntervalMs: number } };
 }
 
 declare const lockSliceBrand: unique symbol;
@@ -37,7 +38,12 @@ export interface LockSlice {
   readonly probeStallSeconds: number;
   readonly maxRecoveries: number;
   readonly endTimeoutSeconds: number;
-  readonly wait: { readonly maxMs: number; readonly pollIntervalMs: number };
+  readonly wait: {
+    readonly maxMs: number;
+    readonly pollIntervalMs: number;
+    /** Absent when the input had none (the key is then missing, not undefined). */
+    readonly block?: { readonly checkIntervalMs: number };
+  };
 }
 
 const PARSER = "lockSlice";
@@ -61,7 +67,8 @@ const REQUIRED = [
   "endTimeoutSeconds",
   "wait",
 ] as const;
-const WAIT_KEYS: ReadonlySet<string> = new Set(["maxMs", "pollIntervalMs"]);
+const WAIT_KEYS: ReadonlySet<string> = new Set(["maxMs", "pollIntervalMs", "block"]);
+const BLOCK_KEYS: ReadonlySet<string> = new Set(["checkIntervalMs"]);
 
 // A profile name and a group name follow the same rule.
 const DASHED_NAME = /^[a-z][a-z0-9-]*$/;
@@ -153,17 +160,29 @@ function parseGroups(
   return Object.freeze(out);
 }
 
-function parseWait(raw: unknown): { maxMs: number; pollIntervalMs: number } {
+function parseBlock(raw: unknown): { checkIntervalMs: number } {
+  const block = refuse.record("wait.block", raw);
+  refuse.refuseUnknownKeys(block, BLOCK_KEYS, "wait.block.");
+  const checkIntervalMs = own(block, "checkIntervalMs");
+  if (checkIntervalMs === undefined) throw refuse.required("wait.block.checkIntervalMs");
+  return Object.freeze({
+    checkIntervalMs: bounded(refuse, "wait.block.checkIntervalMs", checkIntervalMs, 100, 10_000),
+  });
+}
+
+function parseWait(raw: unknown): LockSlice["wait"] {
   const wait = refuse.record("wait", raw);
   refuse.refuseUnknownKeys(wait, WAIT_KEYS, "wait.");
   const maxMs = own(wait, "maxMs");
   const pollIntervalMs = own(wait, "pollIntervalMs");
   if (maxMs === undefined) throw refuse.required("wait.maxMs");
   if (pollIntervalMs === undefined) throw refuse.required("wait.pollIntervalMs");
-  return Object.freeze({
+  const parsed = {
     maxMs: bounded(refuse, "wait.maxMs", maxMs, 0, 3_600_000),
     pollIntervalMs: bounded(refuse, "wait.pollIntervalMs", pollIntervalMs, 10, 60_000),
-  });
+  };
+  const block = own(wait, "block");
+  return Object.freeze(block === undefined ? parsed : { ...parsed, block: parseBlock(block) });
 }
 
 /**

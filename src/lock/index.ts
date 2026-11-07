@@ -1,4 +1,9 @@
-export { type LockErrorCode, lockErrorCode, RootstockLockError } from "./errors.ts";
+export {
+  type LockErrorCode,
+  type LockErrorDetails,
+  lockErrorCode,
+  RootstockLockError,
+} from "./errors.ts";
 export type { LockEvent } from "./events.ts";
 export { lockNameCollisions, lockOwnershipLost, locksHeld } from "./probe.ts";
 export { acquireRunLock, type LockDeps, type RunLock } from "./run-lock.ts";
