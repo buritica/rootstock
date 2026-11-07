@@ -150,7 +150,10 @@ describe("applyRootstockMigrations", () => {
     }
   });
 
-  test("concurrent-same-schema: two applies serialize, one applies and one finds it done", async () => {
+  // Each file commits in its own transaction under the migration lock, so two
+  // applies may interleave file by file: between them every file applies
+  // exactly once, in order, and each finds the rest done.
+  test("concurrent-same-schema: two applies serialize per file, and every file applies exactly once", async () => {
     const second = openSecond();
     try {
       let failures = 0;
@@ -161,11 +164,16 @@ describe("applyRootstockMigrations", () => {
           applyMigrationList(second.transactor, slice, SHIPPED),
         ]);
         const reports = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+        const applied = reports.flatMap((r) => r.applied);
         const ok =
           reports.length === 2 &&
-          reports.filter((r) => r.applied.join() === NAMES.join()).length === 1 &&
-          reports.filter((r) => r.applied.length === 0 && r.alreadyApplied === SHIPPED.length)
-            .length === 1;
+          applied.length === NAMES.length &&
+          [...applied].sort().join() === [...NAMES].sort().join() &&
+          reports.every(
+            (r) =>
+              r.applied.join() === NAMES.filter((n) => r.applied.includes(n)).join() &&
+              r.applied.length + r.alreadyApplied === SHIPPED.length,
+          );
         if (!ok) failures++;
       }
       expect(`${failures}/50 iterations failed`).toBe("0/50 iterations failed");

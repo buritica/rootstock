@@ -181,7 +181,7 @@ const exampleWithEverySlice: RootstockConfigInput = {
     names: ["alpha-sync", "gamma-*", "shared-write", "delta:*"],
   },
   runs: {
-    ...runsInputWithStaleHeartbeat(400),
+    ...runsInputWithStaleHeartbeat(450),
     quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 },
   },
 };

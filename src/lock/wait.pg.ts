@@ -8,7 +8,12 @@ import {
 import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
-import { lockDriver, openBunSqlClient, openPostgresJsClient } from "./fixtures.pg-support.ts";
+import {
+  lateBunSqlDestroy,
+  lockDriver,
+  openBunSqlClient,
+  openPostgresJsClient,
+} from "./fixtures.pg-support.ts";
 import {
   acquireRunLock,
   createTurnQueue,
@@ -370,7 +375,14 @@ describe("block mode against a real server (w4d §8.1)", () => {
     const id = withDestroy ? "LB3" : "LB3b";
     test(`${id}: an aborted blocked waiter refuses ABANDONED and ends ${withDestroy ? "by destroy()" : "by close() (no destroy)"}; the next waiter is granted promptly; it never fences`, async () => {
       const name = withDestroy ? "beta-sync" : "alpha-sync";
-      const bound = (withDestroy ? 0 : blockSlice.endTimeoutSeconds * 1000) + CHECK_MS + 200;
+      // §20 A38: on Bun.SQL before 1.4.4 neither destroy() nor close() sends
+      // the FIN while B2 is in flight, so the ghost ends at its lock_timeout
+      // (the wait's ms), still before it is granted.
+      const late = lateBunSqlDestroy();
+      const ghostMs = late ? 1500 : 5000;
+      const bound = late
+        ? ghostMs + CHECK_MS + 500
+        : (withDestroy ? 0 : blockSlice.endTimeoutSeconds * 1000) + CHECK_MS + 200;
       const holder = await acquireRunLock(openBlock, blockSlice, name, deps());
       const rec: Recorded = { sent: [], ends: [] };
       const ac = new AbortController();
@@ -380,7 +392,7 @@ describe("block mode against a real server (w4d §8.1)", () => {
         blockSlice,
         name,
         ghostDeps,
-        { wait: { mode: "block", ms: 5000, turns: createTurnQueue(), signal: ac.signal } },
+        { wait: { mode: "block", ms: ghostMs, turns: createTurnQueue(), signal: ac.signal } },
       ).then(
         () => undefined,
         (e: unknown) => e,
@@ -413,7 +425,9 @@ describe("block mode against a real server (w4d §8.1)", () => {
         expect(ghostDeps.uuids()).toBe(0);
         expect(await fenceHolder(name)).toBe(lock.holder);
         expect(measured[`${id.toLowerCase()}GhostGoneAfterAbortMs`]).toBeLessThanOrEqual(bound);
-        expect(measured[`${id.toLowerCase()}GrantAfterReleaseMs`]).toBeLessThanOrEqual(bound);
+        expect(measured[`${id.toLowerCase()}GrantAfterReleaseMs`]).toBeLessThanOrEqual(
+          late ? CHECK_MS + 200 : bound,
+        );
       } finally {
         await lock.release();
       }

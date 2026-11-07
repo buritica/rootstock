@@ -1965,3 +1965,72 @@ describe("w4d §8.2: #39 lock items", () => {
     }
   });
 });
+
+describe("§20 A35: the longest beat gap a successful recovery leaves", () => {
+  test("a stalled-probe recovery with every step at its bound ends within the runs-stale-heartbeat floor", async () => {
+    const stall = SLICE.probeStallSeconds * 1000;
+    const s1 = fakeSession();
+    const s2 = fakeSession();
+    const deps = manualDeps();
+    const lock = await takeOn(deps, [s1, s2]).lock;
+    const startedAt = deps.clock;
+    // 1. The probe hangs for the whole stall.
+    s1.answer("L3", hang);
+    // 2. The close hangs for its whole bound.
+    (s1 as { close: () => Promise<void> }).close = () => new Promise<void>(() => {});
+    const ours = { locked: false, pid: PID + 1, holder: lock.holder };
+    const slow =
+      <T>(value: () => T) =>
+      async () => {
+        await deps.sleep(stall - 1);
+        return value();
+      };
+    let terminatedAt = Number.POSITIVE_INFINITY;
+    let recoveredAt = 0;
+    s2.answer(
+      "L4",
+      // 3. The first claim fails just inside the stall, and its retry reads
+      //    the run's own stalled backend just inside the stall too.
+      slow(() => {
+        throw Object.assign(new Error("reconnect"), { code: "08006" });
+      }),
+      // The retry is sent after the rest a rejection leaves (SETTLE_MS),
+      // which the stall bound also counts.
+      async () => {
+        await deps.sleep(stall - 1 - SETTLE_MS);
+        return [ours];
+      },
+      // 5. The outwait polls; its last claim starts at the deadline and
+      //    answers just inside the stall.
+      ...Array.from({ length: 1 + stall / RECOVERY_POLL_FLOOR_MS }, () => async () => {
+        if (deps.clock + RECOVERY_POLL_FLOOR_MS < terminatedAt + stall) return [ours];
+        await deps.sleep(stall - 1);
+        recoveredAt = deps.clock;
+        return [{ locked: true, pid: PID + 1, holder: lock.holder }];
+      }),
+    );
+    // 4. The terminate answers just inside the stall.
+    s2.answer(
+      "L9",
+      slow(() => {
+        terminatedAt = deps.clock;
+        return [{ terminated: true }];
+      }),
+    );
+    const gate = lock.ensureExclusive();
+    await deps.advance(10 * stall);
+    await gate;
+    expect(types(deps.events).at(-1)).toBe("lock.recovered");
+    const gap = recoveredAt - startedAt;
+    const bound = 6 * stall + SLICE.endTimeoutSeconds * 1000 + 1000;
+    // The scenario really is the worst case (within a ms per step, the
+    // settle rest and one poll interval's alignment)…
+    expect(gap).toBeGreaterThan(bound - SETTLE_MS - 2 * RECOVERY_POLL_FLOOR_MS);
+    // …and stays inside the bound the floor is built from.
+    expect(gap).toBeLessThanOrEqual(bound);
+    // With a beat interval on either side, the floor covers it.
+    const floorSeconds =
+      6 * SLICE.probeStallSeconds + SLICE.endTimeoutSeconds + 1 + 2 * SLICE.heartbeatSeconds;
+    expect(gap + 2 * SLICE.heartbeatSeconds * 1000).toBeLessThanOrEqual(floorSeconds * 1000);
+  });
+});

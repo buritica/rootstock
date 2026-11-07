@@ -10,6 +10,7 @@ import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
 import {
+  lateBunSqlDestroy,
   lockDriver,
   openBunSqlClient,
   openPostgresJsClient,
@@ -41,6 +42,8 @@ const B2 =
   "SELECT true AS locked, pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(hashtext($1))) AS t";
 
 const driver = lockDriver();
+/** §20 A38: this cell's destroy() waits for B2, so there is no at-once FIN to time. */
+const late = lateBunSqlDestroy();
 let main: TestTransactor;
 let admin: TestTransactor;
 let adminSql: Sql;
@@ -61,10 +64,10 @@ interface Waiter {
   close(timeoutSeconds: number): Promise<void>;
 }
 
-async function openWaiter(): Promise<Waiter> {
+async function openWaiter(kind = driver): Promise<Waiter> {
   let sql: Sql;
   let end: (timeout: number) => Promise<void>;
-  if (driver === "bun-sql") {
+  if (kind === "bun-sql") {
     const c = openBunSqlClient(1);
     sql = rawSql(c);
     end = (timeout) => c.close({ timeout });
@@ -123,14 +126,14 @@ async function msUntil(
 }
 
 /** A holder on its own raw session, and a waiter blocked behind it in B2 after B1. */
-async function blockedWaiter(name: string, checkInterval: string) {
+async function blockedWaiter(name: string, checkInterval: string, lockTimeout = "30000ms") {
   const holder = openRaw();
   const [h] = await holder.sql.unsafe(
     "SELECT pg_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid",
     [name],
   );
   const w = await openWaiter();
-  await w.sql.unsafe(B1, ["30000ms", checkInterval]);
+  await w.sql.unsafe(B1, [lockTimeout, checkInterval]);
   const b2 = pending(w.sql.unsafe(B2, [name]));
   await msUntil(() => waitingOnLock(w.pid), performance.now(), 3_000);
   const unlock = () => holder.sql.unsafe("SELECT pg_advisory_unlock(hashtext($1))", [name]);
@@ -231,125 +234,170 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     }
   });
 
-  test("H10: destroy() ends the client at once while B2 is in flight; B2 rejects; nothing is unhandled; the server hears the FIN at once", async () => {
-    const unhandled: unknown[] = [];
-    const onUnhandled = (e: unknown) => unhandled.push(e);
-    process.on("unhandledRejection", onUnhandled);
-    process.on("uncaughtException", onUnhandled);
-    const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
-    try {
-      const t0 = performance.now();
-      await w.destroy();
-      const destroyMs = performance.now() - t0;
-      const settled = await b2;
-      const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 5_000);
-      expect(destroyMs).toBeLessThan(100);
-      expect(settled.ok).toBe(false);
-      if (!settled.ok) {
-        expect(pgCode(settled.error)).toBeUndefined();
-        expect((settled.error as { code?: unknown }).code).toBe(CLOSED_CODE);
+  test.skipIf(late)(
+    "H10: destroy() ends the client at once while B2 is in flight; B2 rejects; nothing is unhandled; the server hears the FIN at once",
+    async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown) => unhandled.push(e);
+      process.on("unhandledRejection", onUnhandled);
+      process.on("uncaughtException", onUnhandled);
+      const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
+      try {
+        const t0 = performance.now();
+        await w.destroy();
+        const destroyMs = performance.now() - t0;
+        const settled = await b2;
+        const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 5_000);
+        expect(destroyMs).toBeLessThan(100);
+        expect(settled.ok).toBe(false);
+        if (!settled.ok) {
+          expect(pgCode(settled.error)).toBeUndefined();
+          expect((settled.error as { code?: unknown }).code).toBe(CLOSED_CODE);
+        }
+        // With a 100 ms check interval the backend goes within one interval of the FIN.
+        expect(goneMs).toBeLessThan(400);
+        expect(await holdsAdvisory(holderPid)).toBe(true);
+        await Bun.sleep(100);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        process.off("uncaughtException", onUnhandled);
+        await unlock();
+        await holder.end();
       }
-      // With a 100 ms check interval the backend goes within one interval of the FIN.
-      expect(goneMs).toBeLessThan(400);
-      expect(await holdsAdvisory(holderPid)).toBe(true);
-      await Bun.sleep(100);
-      expect(unhandled).toEqual([]);
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
-      process.off("uncaughtException", onUnhandled);
-      await unlock();
-      await holder.end();
-    }
-  });
+    },
+  );
 
-  test("H10 contrast: close({ timeout: 1 }) waits out the timeout with B2 in flight before it sends the FIN", async () => {
-    const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
-    try {
-      const t0 = performance.now();
-      await w.close(1);
-      const closeMs = performance.now() - t0;
-      const settled = await b2;
-      expect(closeMs).toBeGreaterThanOrEqual(900);
-      expect(closeMs).toBeLessThan(2_000);
-      expect(settled.ok).toBe(false);
-      // The FIN goes out only now: the backend leaves within one 100 ms interval of it.
-      const closed = performance.now();
-      expect(await msUntil(async () => !(await alive(w.pid)), closed, 5_000)).toBeLessThan(400);
-    } finally {
-      await unlock();
-      await holder.end();
-    }
-  });
+  test.skipIf(late)(
+    "H10 contrast: close({ timeout: 1 }) waits out the timeout with B2 in flight before it sends the FIN",
+    async () => {
+      const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
+      try {
+        const t0 = performance.now();
+        await w.close(1);
+        const closeMs = performance.now() - t0;
+        const settled = await b2;
+        expect(closeMs).toBeGreaterThanOrEqual(900);
+        expect(closeMs).toBeLessThan(2_000);
+        expect(settled.ok).toBe(false);
+        // The FIN goes out only now: the backend leaves within one 100 ms interval of it.
+        const closed = performance.now();
+        expect(await msUntil(async () => !(await alive(w.pid)), closed, 5_000)).toBeLessThan(400);
+      } finally {
+        await unlock();
+        await holder.end();
+      }
+    },
+  );
 
-  test("H6a: with client_connection_check_interval 1000ms, a destroyed waiter is ended within about 1 s, before it is granted", async () => {
-    const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
-    try {
-      const t0 = performance.now();
-      await w.destroy();
-      const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 5_000);
-      expect(goneMs).toBeLessThan(2_000);
-      // The holder never let go, so the waiter was ended while still waiting.
-      expect(await holdsAdvisory(holderPid)).toBe(true);
-      expect((await b2).ok).toBe(false);
-    } finally {
-      await unlock();
-      await holder.end();
-    }
-  });
+  test.skipIf(late)(
+    "H6a: with client_connection_check_interval 1000ms, a destroyed waiter is ended within about 1 s, before it is granted",
+    async () => {
+      const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
+      try {
+        const t0 = performance.now();
+        await w.destroy();
+        const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 5_000);
+        expect(goneMs).toBeLessThan(2_000);
+        // The holder never let go, so the waiter was ended while still waiting.
+        expect(await holdsAdvisory(holderPid)).toBe(true);
+        expect((await b2).ok).toBe(false);
+      } finally {
+        await unlock();
+        await holder.end();
+      }
+    },
+  );
 
-  test("H6b: without it, a destroyed waiter stays blocked until granted, then exits when its reply fails; a second waiter is granted at once", async () => {
-    const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "0");
-    const second = queuedSecond("alpha-sync");
-    try {
-      await w.destroy();
-      await Bun.sleep(1_500);
-      expect(await waitingOnLock(w.pid)).toBe(true);
-      const released = performance.now();
-      await unlock();
-      const goneMs = await msUntil(async () => !(await alive(w.pid)), released, 5_000);
-      const grantedMs = (await second.granted()) - released;
-      expect(goneMs).toBeLessThan(500);
-      expect(grantedMs).toBeLessThan(500);
-      expect((await b2).ok).toBe(false);
-    } finally {
-      await second.end();
-      await holder.end();
-    }
-  });
+  test.skipIf(late)(
+    "H6b: without it, a destroyed waiter stays blocked until granted, then exits when its reply fails; a second waiter is granted at once",
+    async () => {
+      const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "0");
+      const second = queuedSecond("alpha-sync");
+      try {
+        await w.destroy();
+        await Bun.sleep(1_500);
+        expect(await waitingOnLock(w.pid)).toBe(true);
+        const released = performance.now();
+        await unlock();
+        const goneMs = await msUntil(async () => !(await alive(w.pid)), released, 5_000);
+        const grantedMs = (await second.granted()) - released;
+        expect(goneMs).toBeLessThan(500);
+        expect(grantedMs).toBeLessThan(500);
+        expect((await b2).ok).toBe(false);
+      } finally {
+        await second.end();
+        await holder.end();
+      }
+    },
+  );
 
-  test("H6c (LB3's second bound): released just after the destroy, a second waiter is granted within checkIntervalMs + 200 ms", async () => {
-    const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
-    const second = queuedSecond("alpha-sync");
-    try {
-      await w.destroy();
-      const released = performance.now();
-      await unlock();
-      const grantedMs = (await second.granted()) - released;
-      expect(grantedMs).toBeLessThan(1_200);
-      await msUntil(async () => !(await alive(w.pid)), released, 3_000);
-      expect((await b2).ok).toBe(false);
-    } finally {
-      await second.end();
-      await holder.end();
-    }
-  });
+  test.skipIf(late)(
+    "H6c (LB3's second bound): released just after the destroy, a second waiter is granted within checkIntervalMs + 200 ms",
+    async () => {
+      const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
+      const second = queuedSecond("alpha-sync");
+      try {
+        await w.destroy();
+        const released = performance.now();
+        await unlock();
+        const grantedMs = (await second.granted()) - released;
+        expect(grantedMs).toBeLessThan(1_200);
+        await msUntil(async () => !(await alive(w.pid)), released, 3_000);
+        expect((await b2).ok).toBe(false);
+      } finally {
+        await second.end();
+        await holder.end();
+      }
+    },
+  );
 
-  test("H6d: through close() bounded by endTimeoutSeconds, the ghost window is endTimeoutSeconds + checkIntervalMs", async () => {
-    const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
-    try {
-      const t0 = performance.now();
-      const closing = w.close(1);
-      const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 6_000);
-      await closing;
-      expect(goneMs).toBeGreaterThanOrEqual(900);
-      expect(goneMs).toBeLessThan(4_000);
-      expect(await holdsAdvisory(holderPid)).toBe(true);
-      expect((await b2).ok).toBe(false);
-    } finally {
-      await unlock();
-      await holder.end();
-    }
-  });
+  test.skipIf(late)(
+    "H6d: through close() bounded by endTimeoutSeconds, the ghost window is endTimeoutSeconds + checkIntervalMs",
+    async () => {
+      const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
+      try {
+        const t0 = performance.now();
+        const closing = w.close(1);
+        const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 6_000);
+        await closing;
+        expect(goneMs).toBeGreaterThanOrEqual(900);
+        expect(goneMs).toBeLessThan(4_000);
+        expect(await holdsAdvisory(holderPid)).toBe(true);
+        expect((await b2).ok).toBe(false);
+      } finally {
+        await unlock();
+        await holder.end();
+      }
+    },
+  );
+
+  test.skipIf(!late)(
+    "A38 (Bun.SQL before 1.4.4): destroy() waits for B2, which ends at lock_timeout; then the backend leaves and the holder keeps the lock",
+    async () => {
+      const { holder, holderPid, w, b2, unlock } = await blockedWaiter(
+        "alpha-sync",
+        "100ms",
+        "1500ms",
+      );
+      try {
+        const t0 = performance.now();
+        await w.destroy();
+        const destroyMs = performance.now() - t0;
+        const settled = await b2;
+        const goneMs = await msUntil(async () => !(await alive(w.pid)), t0, 5_000);
+        expect(destroyMs).toBeGreaterThanOrEqual(1_300);
+        expect(destroyMs).toBeLessThan(3_500);
+        expect(settled.ok).toBe(false);
+        if (!settled.ok) expect(pgCode(settled.error)).toBe("55P03");
+        expect(goneMs - destroyMs).toBeLessThan(1_000);
+        expect(await holdsAdvisory(holderPid)).toBe(true);
+      } finally {
+        await unlock();
+        await holder.end();
+      }
+    },
+  );
 
   test("H11: a stalled-probe recovery's L9 ends only the run's own backend, never an abandoned block-mode waiter, and its fresh session sends no B statement", async () => {
     const proxy = startStallProxy();
@@ -376,8 +424,9 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     };
     const lock = await acquireRunLock(open, slice, "alpha-sync", lockDeps(events));
     // A block-mode waiter, abandoned: its socket closed, no check interval, so
-    // the server keeps it queued for the advisory lock.
-    const ghost = await openWaiter();
+    // the server keeps it queued for the advisory lock. On a §20 A38 cell the
+    // ghost is a postgres.js client, whose destroy() closes the socket at once.
+    const ghost = await openWaiter(late ? "postgres-js" : driver);
     await ghost.sql.unsafe(B1, ["30000ms", "0"]);
     const ghostB2 = pending(ghost.sql.unsafe(B2, ["alpha-sync"]));
     try {

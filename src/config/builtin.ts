@@ -117,24 +117,37 @@ export const runsJobLocks: Invariant = Object.freeze({
 });
 
 /**
- * Built in, never exported (contract §20 A9, A17, A30): a running row whose
+ * Built in, never exported (contract §20 A9, A30, A35): a running row whose
  * fence has not beaten for `staleHeartbeatSeconds` reads interrupted. A
  * healthy run goes without a beat through a stalled-probe recovery: the hung
- * probe, the close (endTimeoutSeconds), then the claim, the terminate and the
- * outwait (up to three more stalls), and a beat interval either side. So the
- * floor is 4 × probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds.
+ * probe, the close (endTimeoutSeconds plus a 1 s margin), a claim and its
+ * retry, the terminate, the outwait and its last claim (about six stalls in
+ * all), and a beat interval either side. So the floor is
+ * 6 × probeStallSeconds + endTimeoutSeconds + 1 + 2 × heartbeatSeconds.
  * Holds when there is no lock slice (`runs-job-locks` reports that).
  */
+/** The least staleHeartbeatSeconds a lock slice allows (§20 A35). */
+export function staleHeartbeatFloor(lock: {
+  readonly probeStallSeconds: number;
+  readonly endTimeoutSeconds: number;
+  readonly heartbeatSeconds: number;
+}): number {
+  return 6 * lock.probeStallSeconds + lock.endTimeoutSeconds + 1 + 2 * lock.heartbeatSeconds;
+}
+
 export const runsStaleHeartbeat: Invariant = Object.freeze({
   id: "runs-stale-heartbeat",
   check(config: RootstockConfig): string | null {
     const { runs, lock } = config;
     if (runs === null || lock === null) return null;
-    const floor = 4 * lock.probeStallSeconds + lock.endTimeoutSeconds + 2 * lock.heartbeatSeconds;
-    const offenders = Object.entries(runs.jobs).flatMap(([key, job]) =>
+    const { probeStallSeconds: stall, endTimeoutSeconds: end, heartbeatSeconds: beat } = lock;
+    const floor = staleHeartbeatFloor(lock);
+    const jobs = Object.entries(runs.jobs);
+    const offenders = jobs.flatMap(([key, job]) =>
       job.staleHeartbeatSeconds < floor ? [`${key} (${job.staleHeartbeatSeconds})`] : [],
     );
     if (offenders.length === 0) return null;
-    return `jobs ${offenders.join(", ")} have staleHeartbeatSeconds below ${floor}, 4 × the lock slice's probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds: a live run would read interrupted during a lock recovery`;
+    const who = offenders.length === jobs.length ? "every job" : `jobs ${offenders.join(", ")}`;
+    return `${who} must set staleHeartbeatSeconds to at least ${floor}: 6 × probeStallSeconds ${stall} + endTimeoutSeconds ${end} + 1 + 2 × heartbeatSeconds ${beat}, or a live run would read interrupted during a lock recovery`;
   },
 });

@@ -25,9 +25,9 @@ export interface JobDeclInput {
   /**
    * A running row whose fencing row has not beaten for longer than this reads
    * interrupted in `verdictFor` (§20 A9); 10–86 400. The config invariant
-   * `runs-stale-heartbeat` holds it at ≥ 4 × the lock slice's
-   * probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds (A30); the
-   * slice alone cannot see the lock.
+   * `runs-stale-heartbeat` holds it at ≥ 6 × the lock slice's
+   * probeStallSeconds + endTimeoutSeconds + 1 + 2 × heartbeatSeconds (A35);
+   * the slice alone cannot see the lock.
    */
   staleHeartbeatSeconds: number;
   /** `heartbeat` is the consumer's paging rule (rootstock does not read it); printed. */

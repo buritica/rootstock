@@ -25,11 +25,11 @@ type LockInput = NonNullable<RootstockConfigInput["lock"]>;
 const LOCK: LockInput = {
   profile: "lock",
   names: ["alpha-sync", "shared-write", "delta:*"],
-  heartbeatSeconds: 10,
-  // 4 × 20 + 20 + 2 × 10 = 120, the fixtures' staleHeartbeatSeconds: exactly the floor (A30).
-  probeStallSeconds: 20,
+  heartbeatSeconds: 5,
+  // 6 × 15 + 19 + 1 + 2 × 5 = 120, the fixtures' staleHeartbeatSeconds: exactly the floor (A35).
+  probeStallSeconds: 15,
   maxRecoveries: 5,
-  endTimeoutSeconds: 20,
+  endTimeoutSeconds: 19,
   wait: { maxMs: 30000, pollIntervalMs: 1000 },
 };
 
@@ -94,17 +94,33 @@ describe("RC2: the runs built-in invariants", () => {
     ).toThrow('defineRootstockConfig: invariant id "runs-job-locks" must match');
   });
 
-  test("RC2 runs-lock-table fails when runs.lockTable is not the lock slice's table", () => {
-    expect(failure(input({ lock: { table: { schema: "ops", name: "locks_o" } } }))).toBe(
+  test("RC2 runs-lock-table fails only on an explicit runs.lockTable that is not the lock slice's table (A36)", () => {
+    expect(
+      failure(
+        input({
+          lock: { table: { schema: "ops", name: "locks_o" } },
+          runs: { lockTable: { schema: "rootstock", name: "run_locks" } },
+        }),
+      ),
+    ).toBe(
       "runs-lock-table: runs.lockTable rootstock.run_locks is not the lock slice's table ops.locks_o: running rows would be judged against the wrong fence",
     );
     // The same name in another schema is another table.
-    expect(failure(input({ lock: { table: { schema: "ops" } } }))).toBe(
+    expect(
+      failure(
+        input({ lock: { table: { schema: "ops" } }, runs: { lockTable: { schema: "rootstock" } } }),
+      ),
+    ).toBe(
       "runs-lock-table: runs.lockTable rootstock.run_locks is not the lock slice's table ops.run_locks: running rows would be judged against the wrong fence",
     );
     expect(failure(input({ runs: { lockTable: { name: "locks_o" } } }))).toBe(
       "runs-lock-table: runs.lockTable rootstock.locks_o is not the lock slice's table rootstock.run_locks: running rows would be judged against the wrong fence",
     );
+    // An omitted runs.lockTable is the lock slice's table, wherever it lives.
+    const elsewhere = defineRootstockConfig(
+      input({ lock: { table: { schema: "public", name: "run_locks" } } }),
+    );
+    expect(elsewhere.runs?.lockTable).toEqual({ schema: "public", name: "run_locks" });
     // Both default from the migrate schema, and an explicit match holds.
     const moved = { table: { schema: "ops", name: "locks_o" } };
     expect(() =>
@@ -181,22 +197,30 @@ describe("RC2: the runs built-in invariants", () => {
     ).not.toThrow();
   });
 
-  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ 4 × probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds (A30)", () => {
+  test("RC2 runs-stale-heartbeat holds staleHeartbeatSeconds at ≥ 6 × probeStallSeconds + endTimeoutSeconds + 1 + 2 × heartbeatSeconds (A35)", () => {
     expect(() =>
       defineRootstockConfig(
-        input({ lock: { heartbeatSeconds: 5, probeStallSeconds: 25, endTimeoutSeconds: 10 } }),
+        input({ lock: { heartbeatSeconds: 5, probeStallSeconds: 14, endTimeoutSeconds: 25 } }),
       ),
     ).not.toThrow();
     const { jobs } = withJob("beta-sync", { staleHeartbeatSeconds: 121 });
     expect(
       failure(
         input({
-          lock: { heartbeatSeconds: 5, probeStallSeconds: 25, endTimeoutSeconds: 11 },
+          lock: { heartbeatSeconds: 5, probeStallSeconds: 15, endTimeoutSeconds: 20 },
           runs: { jobs },
         }),
       ),
     ).toBe(
-      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, 4 × the lock slice's probeStallSeconds + endTimeoutSeconds + 2 × heartbeatSeconds: a live run would read interrupted during a lock recovery",
+      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) must set staleHeartbeatSeconds to at least 121: 6 × probeStallSeconds 15 + endTimeoutSeconds 20 + 1 + 2 × heartbeatSeconds 5, or a live run would read interrupted during a lock recovery",
+    );
+    // When no job meets the floor, the message says so instead of listing them.
+    expect(
+      failure(
+        input({ lock: { heartbeatSeconds: 5, probeStallSeconds: 15, endTimeoutSeconds: 20 } }),
+      ),
+    ).toStartWith(
+      "runs-stale-heartbeat: every job must set staleHeartbeatSeconds to at least 121:",
     );
   });
 
@@ -211,6 +235,7 @@ describe("RC2: the runs built-in invariants", () => {
             probeStallSeconds: 90,
             table: { name: "locks_o" },
           },
+          runs: { lockTable: { name: "run_locks" } },
         }),
       );
     } catch (err) {
@@ -220,7 +245,7 @@ describe("RC2: the runs built-in invariants", () => {
       message.startsWith("defineRootstockConfig: 3 invariant(s) failed — runs-lock-table: "),
     ).toBe(true);
     expect(message).toContain("; runs-job-locks: jobs beta-sync");
-    expect(message).toContain("; runs-stale-heartbeat: jobs alpha-sync (120)");
+    expect(message).toContain("; runs-stale-heartbeat: every job must set staleHeartbeatSeconds");
   });
 
   test("RC2 a runs slice refusal reaches the caller unchanged, after the queue slice's", () => {

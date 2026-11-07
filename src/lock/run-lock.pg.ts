@@ -346,7 +346,14 @@ describe("acquire against a real server", () => {
     const err = await refusal(take("alpha-sync", s));
     expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNFENCED");
     expect(err.cause).toBeDefined();
-    expect(await held("alpha-sync")).toBe(false);
+    // The close returns once the client has sent its Terminate; the backend
+    // frees the lock as it exits, a few ms later on a loaded runner.
+    let stillHeld = await held("alpha-sync");
+    for (let i = 0; stillHeld && i < 100; i += 1) {
+      await Bun.sleep(10);
+      stillHeld = await held("alpha-sync");
+    }
+    expect(stillHeld).toBe(false);
   });
 
   test("R9: two rootstock schemas share the advisory key but keep their own fencing rows", async () => {

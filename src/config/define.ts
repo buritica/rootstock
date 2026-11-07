@@ -90,7 +90,16 @@ export function composeRootstockConfig(
   const defaults = { schema: migrate.schema };
   const lock = input.lock === undefined ? null : parsers.lockSlice(input.lock, defaults);
   const queue = input.queue === undefined ? null : parsers.queueSlice(input.queue, defaults);
-  const runs = input.runs === undefined ? null : parsers.runsSlice(input.runs, defaults);
+  // An omitted runs.lockTable is the lock slice's table (§20 A36): the
+  // runs-lock-table invariant then catches only an explicit mismatch.
+  const runsInput =
+    lock !== null &&
+    typeof input.runs === "object" &&
+    input.runs !== null &&
+    !Object.hasOwn(input.runs, "lockTable")
+      ? { ...input.runs, lockTable: { schema: lock.table.schema, name: lock.table.name } }
+      : input.runs;
+  const runs = runsInput === undefined ? null : parsers.runsSlice(runsInput, defaults);
 
   // A misspelled key would otherwise drop its slice or its invariants and
   // still build green. The value is never echoed, as in every slice parser.

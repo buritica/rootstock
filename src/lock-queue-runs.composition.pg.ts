@@ -129,7 +129,7 @@ describe("lock, queue and runs composed (§13.11)", () => {
       },
       queue: QUEUE,
       runs: {
-        ...runsInputWithStaleHeartbeat(400),
+        ...runsInputWithStaleHeartbeat(450),
         quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 },
       },
     });
