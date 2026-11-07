@@ -64,6 +64,7 @@ const QUEUE = {
   maxPayloadBytes: 65536,
   maxClaimLimit: 500,
   enqueueLockTimeoutMs: 2000,
+  ackLockTimeoutMs: 2000,
 };
 
 const ORIGIN_DDL = [
@@ -85,6 +86,8 @@ const ORIGIN_DDL = [
      dead_at timestamptz,
      enqueued_at timestamptz NOT NULL DEFAULT now(),
      updated_at timestamptz NOT NULL DEFAULT now(),
+     version bigint NOT NULL DEFAULT 0,
+     claim_token uuid,
      CHECK (key LIKE source || ':%'))`,
   `CREATE TABLE public.cursors_o (
      name text PRIMARY KEY,
@@ -186,7 +189,13 @@ describe("lock and queue composed", () => {
       ).toBe("enqueued");
       const rows = await claim(sql, queue, { source: "alpha", limit: 10, worker: "worker-a" });
       expect(rows.map((r) => [r.key, r.payload])).toEqual([["alpha:1", { n: 1 }]]);
-      expect(await ack(sql, queue, { key: "alpha:1", worker: "worker-a" })).toBe("deleted");
+      expect(
+        await ack(main.transactor, queue, {
+          key: "alpha:1",
+          worker: "worker-a",
+          claim: rows[0]?.claim as { token: string; version: string },
+        }),
+      ).toBe("deleted");
       await setCursor(sql, queue.cursors, "alpha-feed", "page-2");
       expect(await getCursor(sql, queue.cursors, "alpha-feed")).toBe("page-2");
     } finally {

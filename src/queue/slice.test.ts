@@ -161,6 +161,34 @@ describe("queueSlice", () => {
       0,
     ],
     [
+      "ackLockTimeoutMs 0",
+      { ackLockTimeoutMs: 0 },
+      "ackLockTimeoutMs",
+      "an integer from 1 to 60000",
+      0,
+    ],
+    [
+      "ackLockTimeoutMs 60001",
+      { ackLockTimeoutMs: 60001 },
+      "ackLockTimeoutMs",
+      "an integer from 1 to 60000",
+      60001,
+    ],
+    [
+      "ackLockTimeoutMs fractional",
+      { ackLockTimeoutMs: 1.5 },
+      "ackLockTimeoutMs",
+      "an integer from 1 to 60000",
+      1.5,
+    ],
+    [
+      "ackLockTimeoutMs text",
+      { ackLockTimeoutMs: "2000" },
+      "ackLockTimeoutMs",
+      "an integer from 1 to 60000",
+      "2000",
+    ],
+    [
       "cursors.value",
       { cursors: { value: "json", maxNameChars: 1, maxValueChars: 1 } },
       "cursors.value",
@@ -198,6 +226,15 @@ describe("queueSlice", () => {
       if (value !== null) expect(got).toBe(`queueSlice: ${path} must be ${expected}${tail}`);
     });
   }
+
+  test("ackLockTimeoutMs is required, kept on the slice, and admits 1 and 60000", () => {
+    expect(refusal(() => parse({ ackLockTimeoutMs: undefined }))).toBe(
+      "queueSlice: ackLockTimeoutMs is required",
+    );
+    expect(parse({}).ackLockTimeoutMs).toBe(2000);
+    expect(parse({ ackLockTimeoutMs: 1 }).ackLockTimeoutMs).toBe(1);
+    expect(parse({ ackLockTimeoutMs: 60_000 }).ackLockTimeoutMs).toBe(60_000);
+  });
 
   test("QS1: the refusal order is unknown keys, then required, then values", () => {
     expect(refusal(() => parse({ extra: 1, sources: undefined, maxAttempts: 99 }))).toBe(

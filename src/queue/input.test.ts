@@ -4,7 +4,7 @@ import { getCursor, setCursor, touchCursor } from "./cursors.ts";
 import { RootstockQueueError } from "./errors.ts";
 import type { QueueEvent } from "./events.ts";
 import { QUEUE_INPUT } from "./fixtures.test-support.ts";
-import { claim, enqueue, fail } from "./queue.ts";
+import { ack, claim, enqueue, extendClaim, fail } from "./queue.ts";
 import { cursorTable, queueSlice } from "./slice.ts";
 
 const S = queueSlice(QUEUE_INPUT);
@@ -45,6 +45,9 @@ async function refused(
   }
   throw new Error("expected a refusal");
 }
+
+/** A well-formed claim, as `claim` returns one. */
+const CLAIM = { token: "6f1c2b9e-3a4d-4e5f-8a7b-0c1d2e3f4a5b", version: "3" };
 
 const base = { key: "alpha:1", source: "alpha", kind: "put", payload: {}, debounceSeconds: 0 };
 const enq = (over: Record<string, unknown>) => (onEvent: (e: QueueEvent) => void) =>
@@ -246,7 +249,7 @@ describe("QI1: every reason, its text and its event", () => {
       { type: "queue.refused", key: null, source: "alpha", reason: "worker_invalid", size: 129 },
     ]);
     const f = await refused((onEvent) =>
-      fail(noSql, S, { key: "alpha:1", worker: "w", errorClass: "" }, { onEvent }),
+      fail(noScope, S, { key: "alpha:1", worker: "w", errorClass: "", claim: CLAIM }, { onEvent }),
     );
     expect(f.err.reason).toBe("error_class_invalid");
     expect(f.err.detail).toBe("error class must be a non-empty string");
@@ -259,6 +262,86 @@ describe("QI1: every reason, its text and its event", () => {
     await expect(enqueue(noScope, { ...S } as never, base)).rejects.toThrow(
       "enqueue: expected a QueueSlice built by queueSlice() — got an object that parser did not return",
     );
+  });
+});
+
+describe("QF8: claim_invalid", () => {
+  const CLAIM_DETAIL =
+    "claim must be { token: a uuid, version: a decimal integer as text }, as claim returned it";
+  const calls: [string, (claim: unknown, onEvent: (e: QueueEvent) => void) => Promise<unknown>][] =
+    [
+      [
+        "ack",
+        (c, onEvent) =>
+          ack(noScope, S, { key: "alpha:1", worker: "w", claim: c } as never, { onEvent }),
+      ],
+      [
+        "fail",
+        (c, onEvent) =>
+          fail(noScope, S, { key: "alpha:1", worker: "w", errorClass: "E", claim: c } as never, {
+            onEvent,
+          }),
+      ],
+      [
+        "extendClaim",
+        (c, onEvent) =>
+          extendClaim(noScope, S, { key: "alpha:1", worker: "w", claim: c } as never, { onEvent }),
+      ],
+    ];
+  const bad: [string, unknown][] = [
+    ["missing", undefined],
+    ["null", null],
+    ["a string", "6f1c2b9e-3a4d-4e5f-8a7b-0c1d2e3f4a5b"],
+    ["no token", { version: "1" }],
+    ["no version", { token: CLAIM.token }],
+    ["token not a uuid", { token: "not-a-uuid", version: "1" }],
+    ["token braced", { token: `{${CLAIM.token}}`, version: "1" }],
+    ["token a number", { token: 7, version: "1" }],
+    ["version a number", { token: CLAIM.token, version: 1 }],
+    ["version a bigint", { token: CLAIM.token, version: 1n }],
+    ["version empty", { token: CLAIM.token, version: "" }],
+    ["version fractional", { token: CLAIM.token, version: "1.5" }],
+    ["version leading zero", { token: CLAIM.token, version: "01" }],
+    ["version spaced", { token: CLAIM.token, version: " 1" }],
+    ["version over int8", { token: CLAIM.token, version: "9223372036854775808" }],
+    ["version under int8", { token: CLAIM.token, version: "-9223372036854775809" }],
+  ];
+  for (const [fn, call] of calls) {
+    for (const [label, c] of bad) {
+      test(`QF8: ${fn} with a claim ${label} refuses before any statement`, async () => {
+        const r = await refused((onEvent) => call(c, onEvent));
+        expect(r.err.code).toBe("ERR_ROOTSTOCK_QUEUE_INPUT");
+        expect(r.err.reason).toBe("claim_invalid");
+        expect(r.err.message).toBe(`rootstock queue: ${CLAIM_DETAIL}`);
+        expect(r.events).toEqual([
+          { type: "queue.refused", key: "alpha:1", source: null, reason: "claim_invalid" },
+        ]);
+      });
+    }
+    test(`QF8: ${fn} passes a well-formed claim on to its scope`, async () => {
+      for (const version of ["0", "42", "9223372036854775807", "-9223372036854775808"]) {
+        const token = CLAIM.token.toUpperCase();
+        await expect(call({ token, version }, () => {})).rejects.toThrow("no transaction expected");
+      }
+    });
+  }
+
+  test("QF8: a key that is not a string reports key null", async () => {
+    const r = await refused((onEvent) =>
+      ack(noScope, S, { key: 5, worker: "w", claim: null } as never, { onEvent }),
+    );
+    expect(r.events).toEqual([
+      { type: "queue.refused", key: null, source: null, reason: "claim_invalid" },
+    ]);
+  });
+
+  test("QF8: fail checks the error class before the claim", async () => {
+    const r = await refused((onEvent) =>
+      fail(noScope, S, { key: "alpha:1", worker: "w", errorClass: "", claim: null } as never, {
+        onEvent,
+      }),
+    );
+    expect(r.err.reason).toBe("error_class_invalid");
   });
 });
 
@@ -422,7 +505,15 @@ describe("boolean columns a driver hands back as text", () => {
       await claim(deadSql, S, { source: "alpha", limit: 1, worker: "w" }, { onEvent }),
     ).toEqual([]);
     expect(events.at(-1)).toMatchObject({ type: "queue.drained", deadLettered: 1 });
-    const failed = await fail(deadSql, S, { key: "alpha:1", worker: "w", errorClass: "E" });
+    const deadScope = {
+      begin: async (fn: (t: unknown) => unknown) => fn(deadSql),
+    } as unknown as Transactor;
+    const failed = await fail(deadScope, S, {
+      key: "alpha:1",
+      worker: "w",
+      errorClass: "E",
+      claim: CLAIM,
+    });
     expect(failed).toEqual({ result: "dead", attempts: 8 });
   });
 });

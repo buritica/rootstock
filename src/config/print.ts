@@ -28,6 +28,7 @@ function queueView(queue: RootstockConfig["queue"]): unknown {
   if (queue === null) return "absent";
   const c = queue.cursors;
   return {
+    ackLockTimeoutMs: queue.ackLockTimeoutMs,
     backoffMinutes: [...queue.backoffMinutes],
     claimTimeoutMinutes: queue.claimTimeoutMinutes,
     cursors:

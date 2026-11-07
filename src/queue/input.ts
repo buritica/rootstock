@@ -260,3 +260,35 @@ export function clampLimit(limit: unknown, max: number, fallback: number): numbe
   if (typeof limit !== "number" || !Number.isFinite(limit)) return fallback;
   return Math.min(Math.max(Math.trunc(limit), 1), max);
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DECIMAL = /^(0|-?[1-9][0-9]*)$/;
+const BIGINT_MIN = -(2n ** 63n);
+const BIGINT_MAX = 2n ** 63n - 1n;
+
+export interface Claim {
+  token: string;
+  version: string;
+}
+
+const isBigintText = (v: unknown): v is string =>
+  typeof v === "string" && DECIMAL.test(v) && BigInt(v) >= BIGINT_MIN && BigInt(v) <= BIGINT_MAX;
+
+/**
+ * §9.2: the claim a row was taken with, as `claim` returned it: a uuid token
+ * and a bigint version as decimal text. Anything else refuses `claim_invalid`
+ * before a statement is sent.
+ */
+export function checkClaim(emit: Emit, key: unknown, claim: unknown): Claim {
+  const c = typeof claim === "object" && claim !== null ? (claim as Record<string, unknown>) : {};
+  const { token, version } = c;
+  if (typeof token !== "string" || !UUID.test(token) || !isBigintText(version)) {
+    throw refuse(
+      emit,
+      "claim_invalid",
+      "claim must be { token: a uuid, version: a decimal integer as text }, as claim returned it",
+      { key: typeof key === "string" ? key : null },
+    );
+  }
+  return { token, version };
+}

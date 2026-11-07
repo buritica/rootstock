@@ -73,6 +73,7 @@ describe("lock and queue slices", () => {
     const view = JSON.parse(printRootstockConfig(config));
     expect(view.lock).toEqual(LOCK_PRINT);
     expect(view.queue).toEqual({
+      ackLockTimeoutMs: 2000,
       backoffMinutes: [1, 5, 30, 120, 240, 480],
       claimTimeoutMinutes: 30,
       cursors: {

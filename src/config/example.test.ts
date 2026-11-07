@@ -254,6 +254,7 @@ const EXAMPLE_LOCK_QUEUE_PRINT = `{
     "schema": "rootstock"
   },
   "queue": {
+    "ackLockTimeoutMs": 2000,
     "backoffMinutes": [
       1,
       5,

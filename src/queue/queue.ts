@@ -1,8 +1,8 @@
 import { pgCode, type Sql, type Transactor, type TxSql } from "../db/index.ts";
 import { perSlice } from "../internal/slice.ts";
 import { guarded } from "./errors.ts";
-import { emitter, type QueueHooks } from "./events.ts";
-import { checkEnqueue, clampLimit, type EnqueueArgs, text } from "./input.ts";
+import { type Emit, emitter, type QueueHooks } from "./events.ts";
+import { checkClaim, checkEnqueue, clampLimit, type EnqueueArgs, text } from "./input.ts";
 import { assertQueueSlice, type QueueSlice } from "./slice.ts";
 import {
   LOCK_TIMEOUT_READ,
@@ -23,8 +23,11 @@ export interface QueueRow {
   notBefore: Date;
   claimedAt: Date | null;
   claimedBy: string | null;
+  /** What ack, fail and extendClaim present: the claim's token, and the row's version (a bigint as text). */
+  claim: { token: string; version: string };
 }
 export type AckResult = "deleted" | "released" | "missing";
+export type ExtendResult = "extended" | "changed" | "missing";
 export interface FailResult {
   result: "failed" | "dead" | "missing";
   attempts: number;
@@ -75,6 +78,61 @@ const str = (v: unknown): string | null => (v === null || v === undefined ? null
 const bool = (v: unknown): boolean => v === true || v === "t" || v === "true";
 
 /**
+ * Q1 (a)(b)(d) around one statement, in one scope: a `Transactor` opens its
+ * own transaction, a `TxSql` a savepoint, so a caller's transaction keeps
+ * working. `lock_timeout` is `ms` for the statement and restored after it.
+ * Returns the statement's first row.
+ */
+async function withLockTimeout(
+  scope: Transactor | TxSql,
+  s: QueueSlice,
+  ms: number,
+  statement: string,
+  params: readonly unknown[],
+): Promise<Row | undefined> {
+  const work = async (tx: Sql): Promise<Row | undefined> => {
+    const [current] = await tx.unsafe(LOCK_TIMEOUT_READ);
+    try {
+      await tx.unsafe(LOCK_TIMEOUT_SET, [`${ms}ms`]);
+      const [row] = await tx.unsafe(statement, params);
+      return row;
+    } finally {
+      try {
+        await tx.unsafe(LOCK_TIMEOUT_SET, [String(current?.v ?? "0")]);
+      } catch {
+        // On a failing scope its own error is the one to report. On the
+        // success path a failed restore leaves the transaction aborted, so
+        // the commit or savepoint release that follows rejects and reports it.
+      }
+    }
+  };
+  return guarded(s.table, () => ("savepoint" in scope ? scope.savepoint(work) : scope.begin(work)));
+}
+
+/**
+ * Runs an ack, fail or extend statement under `ackLockTimeoutMs`. A row lock
+ * held past it emits `queue.ack_contended` and rethrows: the row stays
+ * claimed and is reclaimed on expiry.
+ */
+async function underAckLock(
+  scope: Transactor | TxSql,
+  s: QueueSlice,
+  emit: Emit,
+  a: { key: string; worker: string; operation: "ack" | "fail" | "extend" },
+  statement: string,
+  params: readonly unknown[],
+): Promise<Row | undefined> {
+  try {
+    return await withLockTimeout(scope, s, s.ackLockTimeoutMs, statement, params);
+  } catch (err) {
+    if (pgCode(err) === "55P03") {
+      emit({ type: "queue.ack_contended", key: a.key, worker: a.worker, operation: a.operation });
+    }
+    throw err;
+  }
+}
+
+/**
  * Q1. Enqueues or coalesces one row under a bounded lock wait, in one scope:
  * a `Transactor` opens its own transaction, a `TxSql` a savepoint, so a
  * caller's transaction keeps working. A row lock held past
@@ -89,35 +147,17 @@ export async function enqueue(
   const st = statementsOf("enqueue", s);
   const emit = emitter(hooks);
   const c = checkEnqueue(emit, s, a);
-  const work = async (tx: Sql): Promise<Row | undefined> => {
-    const [current] = await tx.unsafe(LOCK_TIMEOUT_READ);
-    try {
-      await tx.unsafe(LOCK_TIMEOUT_SET, [`${s.enqueueLockTimeoutMs}ms`]);
-      const [row] = await tx.unsafe(st.enqueue, [
-        c.key,
-        c.source,
-        c.kind,
-        c.json,
-        c.debounce,
-        c.slide,
-        s.stickyKind,
-      ]);
-      return row;
-    } finally {
-      try {
-        await tx.unsafe(LOCK_TIMEOUT_SET, [String(current?.v ?? "0")]);
-      } catch {
-        // On a failing scope its own error is the one to report. On the
-        // success path a failed restore leaves the transaction aborted, so
-        // the commit or savepoint release that follows rejects and reports it.
-      }
-    }
-  };
   let row: Row | undefined;
   try {
-    row = await guarded(s.table, () =>
-      "savepoint" in scope ? scope.savepoint(work) : scope.begin(work),
-    );
+    row = await withLockTimeout(scope, s, s.enqueueLockTimeoutMs, st.enqueue, [
+      c.key,
+      c.source,
+      c.kind,
+      c.json,
+      c.debounce,
+      c.slide,
+      s.stickyKind,
+    ]);
   } catch (err) {
     if (pgCode(err) !== "55P03") throw err;
     emit({ type: "queue.contended", key: c.key, source: c.source, kind: c.kind });
@@ -195,6 +235,7 @@ export async function claim(
       notBefore: date(r.not_before_ms) as Date,
       claimedAt: date(r.claimed_at_ms),
       claimedBy: str(r.claimed_by),
+      claim: { token: String(r.claim_token), version: String(r.version) },
     });
     emit({ type: "queue.claimed", key, source, kind, attempts, worker });
   }
@@ -210,19 +251,26 @@ export async function claim(
 }
 
 /**
- * Q3. Deletes a claimed row nothing touched since the claim, or releases it
- * for another pass when an enqueue landed meanwhile. `missing` when this
- * worker no longer holds it.
+ * Q3. Deletes a claimed row nothing touched since the claim (same version),
+ * or releases it for another pass when an enqueue landed meanwhile.
+ * `missing` when this claim no longer holds it (another worker, or a reclaim
+ * that changed the token).
  */
 export async function ack(
-  sql: Sql,
+  scope: Transactor | TxSql,
   s: QueueSlice,
-  a: { key: string; worker: string },
+  a: { key: string; worker: string; claim: QueueRow["claim"] },
   hooks?: QueueHooks,
 ): Promise<AckResult> {
   const st = statementsOf("ack", s);
   const emit = emitter(hooks);
-  const [row] = await guarded(s.table, () => sql.unsafe(st.ack, [a.key, a.worker]));
+  const c = checkClaim(emit, a.key, a.claim);
+  const row = await underAckLock(scope, s, emit, { ...a, operation: "ack" }, st.ack, [
+    a.key,
+    a.worker,
+    c.token,
+    c.version,
+  ]);
   if (row === undefined) {
     emit({ type: "queue.lost", key: a.key, worker: a.worker, operation: "ack" });
     return "missing";
@@ -247,9 +295,9 @@ export async function ack(
  * attempt (the last rung repeats), and the row is dead at `maxAttempts`.
  */
 export async function fail(
-  sql: Sql,
+  scope: Transactor | TxSql,
   s: QueueSlice,
-  a: { key: string; worker: string; errorClass: string },
+  a: { key: string; worker: string; errorClass: string; claim: QueueRow["claim"] },
   hooks?: QueueHooks,
 ): Promise<FailResult> {
   const { statements: st, backoffJson } = builtOf("fail", s);
@@ -262,16 +310,16 @@ export async function fail(
     "error_class_invalid",
     { key: typeof a.key === "string" ? a.key : null },
   );
-  const [row] = await guarded(s.table, () =>
-    sql.unsafe(st.fail, [
-      a.key,
-      a.worker,
-      errorClass,
-      backoffJson,
-      s.backoffMinutes.length,
-      s.maxAttempts,
-    ]),
-  );
+  const c = checkClaim(emit, a.key, a.claim);
+  const row = await underAckLock(scope, s, emit, { ...a, operation: "fail" }, st.fail, [
+    a.key,
+    a.worker,
+    errorClass,
+    backoffJson,
+    s.backoffMinutes.length,
+    s.maxAttempts,
+    c.token,
+  ]);
   if (row === undefined) {
     emit({
       type: "queue.lost",
@@ -307,6 +355,35 @@ export async function fail(
     });
   }
   return { result: dead ? "dead" : "failed", attempts };
+}
+
+/**
+ * Q8. Moves a held claim's `claimed_at` to now, so a long job is not
+ * reclaimed. `changed` when an enqueue landed since the claim: extending
+ * would let ack delete the new work, so the claim is left as it is and the
+ * worker's ack will release. `missing` when this claim no longer holds it.
+ */
+export async function extendClaim(
+  scope: Transactor | TxSql,
+  s: QueueSlice,
+  a: { key: string; worker: string; claim: QueueRow["claim"] },
+  hooks?: QueueHooks,
+): Promise<ExtendResult> {
+  const st = statementsOf("extendClaim", s);
+  const emit = emitter(hooks);
+  const c = checkClaim(emit, a.key, a.claim);
+  const row = await underAckLock(scope, s, emit, { ...a, operation: "extend" }, st.extendClaim, [
+    a.key,
+    a.worker,
+    c.token,
+  ]);
+  if (Number(row?.extended) === 1) {
+    emit({ type: "queue.claim_extended", key: a.key, worker: a.worker });
+    return "extended";
+  }
+  if (Number(row?.held) === 1) return "changed";
+  emit({ type: "queue.lost", key: a.key, worker: a.worker, operation: "extend" });
+  return "missing";
 }
 
 /** Q5. Puts a dead row back, due now with a clean slate. False when it was not dead. */
