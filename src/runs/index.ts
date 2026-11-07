@@ -16,3 +16,22 @@ export {
   quarantineTable,
   resolveQuarantine,
 } from "./quarantine.ts";
+export {
+  type Accounting,
+  type FinishResult,
+  type JobSnapshot,
+  pruneRuns,
+  type Run,
+  type RunRow,
+  type RunsSnapshot,
+  runsSnapshot,
+  startRun,
+} from "./record.ts";
+export {
+  type JobDecl,
+  type JobDeclInput,
+  jobDecl,
+  type RunsSlice,
+  type RunsSliceInput,
+  runsSlice,
+} from "./slice.ts";
