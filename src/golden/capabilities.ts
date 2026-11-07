@@ -28,6 +28,7 @@ export const CAPABILITIES = [
   // Ingest and webhooks
   "webhook.verify",
   "ingest.accounting",
+  "ingest.run", // run record and accounting: start, settle, interrupted, counts, tokens and cost
   // Retrieval and answer shaping
   "search.lexical",
   "search.trigram",
@@ -42,6 +43,7 @@ export const CAPABILITIES = [
   "db.migrate", // migration discovery, ordering, tracking and apply decisions
   "db.lock", // run locks: acquire, refuse, fence, probe, recover, release, and their events
   "db.queue", // durable work queue: enqueue, claim, ack, fail, dead letters, cursors, and their events
+  "ops.freshness", // freshness verdicts over the run record
   "concurrency.map", // bounded-concurrency map and for-each: dispatch order, width and bad-limit behavior, early stop, errors
   "config", // a consumer's composed, validated configuration
 ] as const;

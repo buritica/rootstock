@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { CAPABILITIES, isCapabilityId } from "./capabilities.ts";
 import { validateSuites } from "./suite.ts";
 
-test("v0.2.1 appends db.migrate, concurrency.map and config to the 24-id v0.2.0 vocabulary, and v0.6.0 db.lock and db.queue after db.migrate", () => {
+test("v0.2.1 appends db.migrate, concurrency.map and config to the 24-id v0.2.0 vocabulary, v0.6.0 db.lock and db.queue after db.migrate, and v0.8.0 ingest.run after ingest.accounting and ops.freshness after db.queue", () => {
   expect([...CAPABILITIES]).toEqual([
     "hash.content",
     "normalize.name",
@@ -20,6 +20,7 @@ test("v0.2.1 appends db.migrate, concurrency.map and config to the 24-id v0.2.0 
     "llm.request",
     "webhook.verify",
     "ingest.accounting",
+    "ingest.run",
     "search.lexical",
     "search.trigram",
     "search.vector",
@@ -31,6 +32,7 @@ test("v0.2.1 appends db.migrate, concurrency.map and config to the 24-id v0.2.0 
     "db.migrate",
     "db.lock",
     "db.queue",
+    "ops.freshness",
     "concurrency.map",
     "config",
   ]);

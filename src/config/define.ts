@@ -1,4 +1,4 @@
-import { lockProfileSingle } from "./builtin.ts";
+import { lockProfileSingle, runsJobLocks, runsLockTable, runsStaleHeartbeat } from "./builtin.ts";
 import type {
   ClientInput,
   ClientSlice,
@@ -10,6 +10,8 @@ import type {
   MigrateSlice,
   QueueInput,
   QueueSlice,
+  RunsInput,
+  RunsSlice,
   SliceParsers,
 } from "./slices.ts";
 
@@ -26,6 +28,7 @@ export interface RootstockConfigInput {
   concurrency: ConcurrencyInput;
   lock?: LockInput;
   queue?: QueueInput;
+  runs?: RunsInput;
   invariants?: readonly Invariant[];
 }
 
@@ -37,9 +40,12 @@ export interface RootstockConfig {
   readonly concurrency: ConcurrencySlice;
   readonly lock: LockSlice | null;
   readonly queue: QueueSlice | null;
+  readonly runs: RunsSlice | null;
   /**
    * Every invariant id, in input order, after the built-in ones that apply
-   * (`lock-profile-single` when there is a lock); all held, or define threw.
+   * (`lock-profile-single` when there is a lock; `runs-lock-table`,
+   * `runs-job-locks` and `runs-stale-heartbeat` when there is a runs slice);
+   * all held, or define threw.
    */
   readonly invariants: readonly string[];
 }
@@ -52,6 +58,7 @@ const INPUT_KEYS: readonly string[] = [
   "concurrency",
   "lock",
   "queue",
+  "runs",
   "invariants",
 ];
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
@@ -83,6 +90,7 @@ export function composeRootstockConfig(
   const defaults = { schema: migrate.schema };
   const lock = input.lock === undefined ? null : parsers.lockSlice(input.lock, defaults);
   const queue = input.queue === undefined ? null : parsers.queueSlice(input.queue, defaults);
+  const runs = input.runs === undefined ? null : parsers.runsSlice(input.runs, defaults);
 
   // A misspelled key would otherwise drop its slice or its invariants and
   // still build green. The value is never echoed, as in every slice parser.
@@ -99,7 +107,11 @@ export function composeRootstockConfig(
   // Copied once, so a getter-backed entry is read the same in both passes.
   // The built-in checks run first and their ids come first, so a consumer
   // invariant reusing one is refused as a duplicate.
-  const invariants = [...(lock === null ? [] : [lockProfileSingle]), ...(input.invariants ?? [])];
+  const invariants = [
+    ...(lock === null ? [] : [lockProfileSingle]),
+    ...(runs === null ? [] : [runsLockTable, runsJobLocks, runsStaleHeartbeat]),
+    ...(input.invariants ?? []),
+  ];
   const ids: string[] = [];
   for (const inv of invariants) {
     const id = (inv as { id?: unknown } | null)?.id;
@@ -119,6 +131,7 @@ export function composeRootstockConfig(
     concurrency,
     lock,
     queue,
+    runs,
     invariants: ids,
   } satisfies Omit<RootstockConfig, typeof rootstockConfigBrand>);
   built.add(config);
