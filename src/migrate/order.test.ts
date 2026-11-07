@@ -209,6 +209,60 @@ describe("checkMigrationOrder", () => {
     expect(await check(branch({ "20260101000200_b.sql": B }), main)).toEqual([]);
   });
 
+  test("after a rename to a name that sorts after stamps, a later stamp is clean", async () => {
+    const renames = JSON.stringify({ "init.sql": "20260101000100_a.sql" });
+    const main = sql({ "20260101000100_a.sql": A, "renames.json": renames });
+    const branch = sql({
+      "20260101000100_a.sql": A,
+      "20260101000200_b.sql": B,
+      "renames.json": renames,
+    });
+    expect(await check(branch, main)).toEqual([]);
+  });
+
+  test("main's newest is the newest in apply order, not by key", async () => {
+    const renames = JSON.stringify({ "0005_x.sql": "20260101000100_x.sql" });
+    const files = { "20260101000100_x.sql": A, "20260101000050_y.sql": B, "renames.json": renames };
+    const out = await checkMigrationOrder(
+      SLICE,
+      [tracked(sql({ ...files, "20260101000055_z.sql": C }))],
+      async () => sql(files),
+      NOW,
+    );
+    expect(out.map(({ id, problem, detail }) => ({ id, problem, detail }))).toEqual([
+      {
+        id: "20260101000055_z.sql",
+        problem: "older-than-main",
+        detail:
+          "it must sort after main's newest, 20260101000100_x.sql, in apply order; regenerate it on top of main",
+      },
+    ]);
+  });
+
+  test("a rename made on the branch moves main's newest too", async () => {
+    const main = sql({ "0019_x.sql": A });
+    const branch = sql({
+      "20261020000000_x.sql": A,
+      "20261010000000_y.sql": B,
+      "renames.json": JSON.stringify({ "0019_x.sql": "20261020000000_x.sql" }),
+    });
+    expect(await check(branch, main)).toEqual([
+      { source: "app", id: "20261010000000_y.sql", problem: "older-than-main" },
+    ]);
+  });
+
+  test("a drizzle older-than-main detail names the when it lost to", async () => {
+    const main = drizzle([["20261002000000_a", 1000, A]]);
+    const branch = drizzle([
+      ["20261002000000_a", 1000, A],
+      ["20261003000000_b", 900, B],
+    ]);
+    const out = await checkMigrationOrder(SLICE, [tracked(branch)], async () => main, NOW);
+    expect(out.map((f) => f.detail)).toEqual([
+      "it must sort after main's newest, 20261002000000_a (key 1000), in apply order; regenerate it on top of main",
+    ]);
+  });
+
   test("a drizzle source orders by when alone", async () => {
     const main = drizzle([["20261002000000_a", 1000, A]]);
     // A tag sorting before main's newest tag, with a later when, is fine.

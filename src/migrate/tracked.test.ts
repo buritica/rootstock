@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { migrateSlice } from "./slice.ts";
-import { drizzleTracker, filenameTracker, trackerTable } from "./tracked.ts";
+import { applyOrder, drizzleTracker, filenameTracker, trackerTable } from "./tracked.ts";
 
 describe("tracker factories", () => {
   test("default to each origin's own table", () => {
@@ -62,5 +62,42 @@ describe("tracker factories", () => {
       schema: "drizzle",
       table: "__drizzle_migrations",
     });
+  });
+});
+
+describe("applyOrder", () => {
+  const m = (id: string, key: string) =>
+    ({ source: "app", id, key, sha256: "", kind: null, baselined: false }) as never;
+  const of = (kind: "drizzle" | "filename" | "rootstock") =>
+    applyOrder({
+      name: kind === "rootstock" ? "rootstock" : "app",
+      migrations: [],
+      tracker: kind === "rootstock" ? { kind } : { kind, schema: "s", table: "t" },
+    });
+
+  test("drizzle orders by key as an integer", () => {
+    const order = of("drizzle");
+    expect(order.of(m("0001_b", "900"))).toBe("900");
+    expect(order.compare("900", "1000")).toBeLessThan(0);
+    expect(order.compare("1000", "1000")).toBe(0);
+  });
+
+  test("filename and rootstock order by id, in code-unit order", () => {
+    for (const kind of ["filename", "rootstock"] as const) {
+      const order = of(kind);
+      expect(order.of(m("20260101000100_a.sql", "0001_a.sql"))).toBe("20260101000100_a.sql");
+      expect(order.compare("20260101000100_a.sql", "init.sql")).toBeLessThan(0);
+    }
+  });
+
+  test("refuses a drizzle key that is not an integer, with the source code", () => {
+    const err = (() => {
+      try {
+        of("drizzle").compare("0001_a.sql", "1000");
+      } catch (e) {
+        return e as { code?: string };
+      }
+    })();
+    expect(err?.code).toBe("ERR_ROOTSTOCK_MIG_SRC");
   });
 });

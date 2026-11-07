@@ -18,7 +18,7 @@ export interface OrderFinding {
     | "stale-base"
     | "accepted-unknown-id"
     | "accepted-current-mismatch";
-  /** What the fix needs: the main key to beat, the hash to accept, the file it collided with. */
+  /** What the fix needs: main's newest file to sort after, the hash to accept, the file it collided with. */
   readonly detail: string;
 }
 
@@ -154,10 +154,15 @@ function compare(
   const mainByKey = new Map(main.map((m) => [m.key, m]));
   const branchKeys = new Set(source.migrations.map((m) => m.key));
   const branchIds = new Set(source.migrations.map((m) => m.id));
-  const newest = main.reduce<SourceMigration | undefined>(
-    (top, m) => (top === undefined || order(of(m), of(top)) > 0 ? m : top),
-    undefined,
-  );
+  // Main's files as this branch names them: a rename made on the branch moves
+  // where that file applies, so the newest is judged in the branch's order.
+  const branchByKey = new Map(source.migrations.map((m) => [m.key, m]));
+  const newest = main
+    .map((m) => branchByKey.get(m.key) ?? m)
+    .reduce<SourceMigration | undefined>(
+      (top, m) => (top === undefined || order(of(m), of(top)) > 0 ? m : top),
+      undefined,
+    );
   for (const m of source.migrations) {
     const onMain = mainById.get(m.id);
     if (onMain !== undefined) {
@@ -201,10 +206,11 @@ function compare(
       continue;
     }
     if (newest !== undefined && order(of(m), of(newest)) <= 0) {
+      const at = of(newest) === newest.id ? "" : ` (key ${of(newest)})`;
       add(
         m.id,
         "older-than-main",
-        `it must sort after main's newest, ${newest.id}${of(newest) === newest.id ? "" : ` (key ${of(newest)})`}, in apply order; regenerate it on top of main`,
+        `it must sort after main's newest, ${newest.id}${at}, in apply order; regenerate it on top of main`,
       );
     }
     if (!m.baselined && m.kind === null) {

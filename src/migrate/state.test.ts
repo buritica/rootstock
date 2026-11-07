@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { sqlFolderFrom } from "./sources.ts";
+import { drizzleJournalFrom, sqlFolderFrom } from "./sources.ts";
 import { sourceState } from "./state.ts";
 import type { TrackedSource } from "./tracked.ts";
 
@@ -14,6 +14,15 @@ function folder(files: Record<string, string>): TrackedSource {
       name: "app",
     }),
     tracker: { kind: "filename", schema: "public", table: "schema_migrations" },
+  };
+}
+
+function journal(entries: readonly [string, number][]): TrackedSource {
+  const text = JSON.stringify({ entries: entries.map(([tag, when]) => ({ tag, when })) });
+  return {
+    name: "app",
+    migrations: drizzleJournalFrom(text, () => enc.encode(A), { name: "app" }),
+    tracker: { kind: "drizzle", schema: "drizzle", table: "__drizzle_migrations" },
   };
 }
 
@@ -47,5 +56,28 @@ describe("sourceState outOfOrder", () => {
       "renames.json": renames,
     });
     expect(sourceState(source, read(["0001_a.sql"]), []).outOfOrder).toEqual([]);
+  });
+
+  test("after a rename to a name that sorts after stamps, a later stamp is in order", () => {
+    const renames = JSON.stringify({ "init.sql": "20260101000100_a.sql" });
+    const source = folder({
+      "20260101000100_a.sql": A,
+      "20260101000200_b.sql": B,
+      "renames.json": renames,
+    });
+    expect(sourceState(source, read(["init.sql"]), []).outOfOrder).toEqual([]);
+  });
+
+  test("a drizzle source orders by when as an integer", () => {
+    const later = journal([
+      ["0000_a", 900],
+      ["0001_b", 1000],
+    ]);
+    expect(sourceState(later, read(["900"]), []).outOfOrder).toEqual([]);
+    const earlier = journal([
+      ["0000_a", 1000],
+      ["0001_b", 900],
+    ]);
+    expect(sourceState(earlier, read(["1000"]), []).outOfOrder).toEqual(["0001_b"]);
   });
 });
