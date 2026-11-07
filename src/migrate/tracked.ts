@@ -17,6 +17,9 @@ export interface TrackedSource {
   readonly tracker: Tracker;
 }
 
+/** A drizzle key: a journal `when`, which the reader accepts as any safe integer, negative included. */
+export const DRIZZLE_WHEN = /^-?(0|[1-9][0-9]*)$/;
+
 /**
  * Where a migration sits in apply order, for the order check and status.
  *
@@ -37,7 +40,7 @@ export function applyOrder(source: TrackedSource): {
 } {
   if (source.tracker.kind === "drizzle") {
     const int = (key: string): bigint => {
-      if (!/^-?\d+$/.test(key)) {
+      if (!DRIZZLE_WHEN.test(key)) {
         fail(`source ${q(source.name)}: key ${q(key)} is not a drizzle when`);
       }
       return BigInt(key);

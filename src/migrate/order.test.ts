@@ -234,7 +234,7 @@ describe("checkMigrationOrder", () => {
         id: "20260101000055_z.sql",
         problem: "older-than-main",
         detail:
-          "it must sort after main's newest, 20260101000100_x.sql, in apply order; regenerate it on top of main",
+          "its name must sort after main's newest, 20260101000100_x.sql, the order files apply in; rename it to a later UTC stamp",
       },
     ]);
   });
@@ -249,6 +249,20 @@ describe("checkMigrationOrder", () => {
     expect(await check(branch, main)).toEqual([
       { source: "app", id: "20261010000000_y.sql", problem: "older-than-main" },
     ]);
+    const out = await checkMigrationOrder(SLICE, [tracked(branch)], async () => main, NOW);
+    expect(out.map((f) => f.detail)).toEqual([
+      "its name must sort after main's newest, 20261020000000_x.sql (0019_x.sql on main), the order files apply in; rename it to a later UTC stamp",
+    ]);
+  });
+
+  test("a branch cut before main's rename is judged against main's names", async () => {
+    const renames = JSON.stringify({ "0019_x.sql": "20261020000000_x.sql" });
+    const main = sql({ "20261020000000_x.sql": A, "renames.json": renames });
+    const branch = sql({ "0019_x.sql": A, "20261010000000_y.sql": B });
+    expect(await check(branch, main)).toEqual([
+      { source: "app", id: "0019_x.sql", problem: "stale-base" },
+      { source: "app", id: "20261010000000_y.sql", problem: "older-than-main" },
+    ]);
   });
 
   test("a drizzle older-than-main detail names the when it lost to", async () => {
@@ -259,7 +273,7 @@ describe("checkMigrationOrder", () => {
     ]);
     const out = await checkMigrationOrder(SLICE, [tracked(branch)], async () => main, NOW);
     expect(out.map((f) => f.detail)).toEqual([
-      "it must sort after main's newest, 20261002000000_a (key 1000), in apply order; regenerate it on top of main",
+      "its when 900 must sort after main's newest, 20261002000000_a (when 1000); regenerate it on top of main",
     ]);
   });
 
@@ -358,7 +372,7 @@ describe("checkMigrationOrder", () => {
         (f) => f.detail,
       );
     expect(await detailOf(sql({ ...MAIN, "20261001120000_c.sql": C }), sql(MAIN))).toEqual([
-      "it must sort after main's newest, 20261002000000_b.sql, in apply order; regenerate it on top of main",
+      "its name must sort after main's newest, 20261002000000_b.sql, the order files apply in; rename it to a later UTC stamp",
     ]);
     const branch = sql(MAIN);
     const slice = migrateSlice({

@@ -2,7 +2,7 @@ import { isRecord, q } from "../internal/slice.ts";
 import { fail, failIo } from "./errors.ts";
 import { assertMigrateSlice, type MigrateSlice } from "./slice.ts";
 import { drizzleJournalAt, type SourceMigration, secondOf, sqlFolderAt } from "./sources.ts";
-import { applyOrder, type TrackedSource } from "./tracked.ts";
+import { applyOrder, DRIZZLE_WHEN, type TrackedSource } from "./tracked.ts";
 
 export interface OrderFinding {
   readonly source: string;
@@ -30,7 +30,7 @@ const DAY_S = 86_400;
 function assertDrizzleKeys(source: TrackedSource, main: readonly SourceMigration[]): void {
   if (source.tracker.kind !== "drizzle") return;
   for (const m of [...source.migrations, ...main]) {
-    if (!/^\d+$/.test(m.key)) {
+    if (!DRIZZLE_WHEN.test(m.key)) {
       fail(`source ${q(source.name)}: ${q(m.id)} has key ${q(m.key)}, but a drizzle key is a when`);
     }
   }
@@ -155,12 +155,17 @@ function compare(
   const branchKeys = new Set(source.migrations.map((m) => m.key));
   const branchIds = new Set(source.migrations.map((m) => m.id));
   // Main's files as this branch names them: a rename made on the branch moves
-  // where that file applies, so the newest is judged in the branch's order.
+  // where that file applies, so the newest is judged in the branch's order. A
+  // branch copy still under its old, unstamped name predates main's rename
+  // (stale-base), and after the update it applies under main's name.
   const branchByKey = new Map(source.migrations.map((m) => [m.key, m]));
   const newest = main
-    .map((m) => branchByKey.get(m.key) ?? m)
-    .reduce<SourceMigration | undefined>(
-      (top, m) => (top === undefined || order(of(m), of(top)) > 0 ? m : top),
+    .map((onMain) => {
+      const here = branchByKey.get(onMain.key);
+      return { at: here !== undefined && STAMPED_NAME.test(here.id) ? here : onMain, onMain };
+    })
+    .reduce<{ at: SourceMigration; onMain: SourceMigration } | undefined>(
+      (top, c) => (top === undefined || order(of(c.at), of(top.at)) > 0 ? c : top),
       undefined,
     );
   for (const m of source.migrations) {
@@ -205,13 +210,8 @@ function compare(
       }
       continue;
     }
-    if (newest !== undefined && order(of(m), of(newest)) <= 0) {
-      const at = of(newest) === newest.id ? "" : ` (key ${of(newest)})`;
-      add(
-        m.id,
-        "older-than-main",
-        `it must sort after main's newest, ${newest.id}${at}, in apply order; regenerate it on top of main`,
-      );
+    if (newest !== undefined && order(of(m), of(newest.at)) <= 0) {
+      add(m.id, "older-than-main", olderThanMain(source, m, newest));
     }
     if (!m.baselined && m.kind === null) {
       add(
@@ -232,6 +232,20 @@ function compare(
     }
   }
   return out;
+}
+
+/** What an older-than-main file must beat, in the words its own tooling uses. */
+function olderThanMain(
+  source: TrackedSource,
+  m: SourceMigration,
+  newest: { at: SourceMigration; onMain: SourceMigration },
+): string {
+  const { at, onMain } = newest;
+  if (source.tracker.kind === "drizzle") {
+    return `its when ${m.key} must sort after main's newest, ${at.id} (when ${at.key}); regenerate it on top of main`;
+  }
+  const named = at.id === onMain.id ? at.id : `${at.id} (${onMain.id} on main)`;
+  return `its name must sort after main's newest, ${named}, the order files apply in; rename it to a later UTC stamp`;
 }
 
 export interface GitMainFolder {

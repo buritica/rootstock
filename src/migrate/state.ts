@@ -1,7 +1,7 @@
 import type { Sql } from "../db/index.ts";
 import type { AcceptedHash, MigrateSlice } from "./slice.ts";
 import type { SourceMigration } from "./sources.ts";
-import { applyOrder, type TrackedSource } from "./tracked.ts";
+import { applyOrder, DRIZZLE_WHEN, type TrackedSource } from "./tracked.ts";
 import { readTracker, type TrackerRead, type TrackerRow } from "./tracker-db.ts";
 
 /**
@@ -38,14 +38,11 @@ export interface SourceState {
   readonly unknown: readonly { rowId: number; hash: string }[];
   /** Keys held by more than one row. */
   readonly duplicate: readonly string[];
-  /** Pending ids that sort before the newest applied key. */
+  /** Pending ids that sort before the newest applied file in apply order (`applyOrder`). */
   readonly outOfOrder: readonly string[];
   /** Keys whose row has a NULL hash. */
   readonly unhashed: readonly string[];
 }
-
-// A journal `when` the reader accepts is any safe integer, negative included.
-const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
 
 /**
  * The slice's acceptance naming this file, and whether it covers exactly the
@@ -75,7 +72,7 @@ export function sourceState(
   const unknown: { rowId: number; hash: string }[] = [];
   const byKey = new Map<string, TrackerRow[]>();
   for (const row of read.rows) {
-    if (row.key === null || (numeric && !DECIMAL.test(row.key))) {
+    if (row.key === null || (numeric && !DRIZZLE_WHEN.test(row.key))) {
       unknown.push({ rowId: row.rowId ?? -1, hash: row.hash ?? "" });
       continue;
     }
