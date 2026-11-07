@@ -89,12 +89,22 @@ const PURE_SUBPATHS = [
   "src/db/",
   "src/concurrency/",
   "src/internal/",
+  "src/lock/",
 ] as const;
 // The one cross-subpath import a pure subpath may make: the shared slice
 // parser pieces, which are pure themselves and are no package export.
 const SHARED_INTERNAL = "../internal/slice.ts";
+// A pure subpath that builds on another pure one may import it by its index.
+const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
+  "src/lock/": ["../db/index.ts"],
+};
+// A name read as a value. A property access (`deps.setInterval(...)`) and a
+// key (`setInterval: …`, `setInterval?: …`) are not the global, and an
+// injected dependency is declared and called exactly that way. AbortSignal is
+// a type the injected `sleep` takes, so it is a value only outside a type
+// annotation (`signal?: AbortSignal`, `| AbortSignal`).
 const FORBIDDEN_GLOBALS =
-  /\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|AbortSignal|crypto|process|console|Bun|globalThis|require)\b/;
+  /(?<![.\w$])\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|crypto|process|console|Bun|globalThis|require)\b(?!\s*\??:)|(?<![.\w$]|:\s?|\|\s?)\bAbortSignal\b/;
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
@@ -105,8 +115,9 @@ describe("pure subpaths (every clock, timer and I/O is injected)", () => {
     const offenders: string[] = [];
     for (const path of await sourceFiles()) {
       if (!PURE_SUBPATHS.some((p) => path.startsWith(p)) || TEST_FILE.test(path)) continue;
+      const extra = Object.entries(PURE_IMPORTS).find(([p]) => path.startsWith(p))?.[1] ?? [];
       for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
-        if (!spec.startsWith("./") && spec !== SHARED_INTERNAL) {
+        if (!spec.startsWith("./") && spec !== SHARED_INTERNAL && !extra.includes(spec)) {
           offenders.push(`${path} imports ${spec}`);
         }
       }

@@ -11,6 +11,8 @@ import {
   testKind,
   testUrl,
 } from "./fixtures.pg-support.ts";
+import { type LockSession, lockSlice } from "./index.ts";
+import { bunSqlLockSession, postgresJsLockSession } from "./session.ts";
 
 // C-S1 (contract §3.2): what each driver does when the backend under a lock
 // session is killed, on a dedicated `max: 1` client and on a pool reservation.
@@ -44,14 +46,49 @@ afterAll(async () => {
   await admin.close();
 });
 
-/** A dedicated `max: 1` lock client of the driver under test, and its closer. */
-function openDedicated(): { sql: Sql; close: () => Promise<void> } {
+const SLICE = lockSlice({
+  profile: "lock",
+  names: ["alpha-sync"],
+  heartbeatSeconds: 5,
+  probeStallSeconds: 10,
+  maxRecoveries: 1,
+  endTimeoutSeconds: 1,
+  wait: { maxMs: 0, pollIntervalMs: 10 },
+});
+
+/** A dedicated `max: 1` lock client of the driver under test, as a lock session. */
+function openDedicated(): LockSession {
+  return driver === "bun-sql"
+    ? bunSqlLockSession(openBunSqlClient(), SLICE)
+    : postgresJsLockSession(openPostgresJsClient(), SLICE);
+}
+
+/** The same, with every driver end/close call counted. */
+function openCounted(): { session: LockSession; ends: () => number } {
+  let ends = 0;
   if (driver === "bun-sql") {
     const c = openBunSqlClient();
-    return { sql: rawSql(c), close: () => c.close() };
+    const counted = Object.assign((s: TemplateStringsArray, ...v: unknown[]) => c(s, ...v), {
+      unsafe: (q: string, p?: unknown[]) => c.unsafe(q, p),
+      close: (o?: { timeout?: number }) => {
+        ends += 1;
+        return c.close(o);
+      },
+    });
+    return { session: bunSqlLockSession(counted, SLICE), ends: () => ends };
   }
   const c = openPostgresJsClient();
-  return { sql: rawSql(c), close: () => c.end({ timeout: 5 }) };
+  const counted = Object.assign(
+    (s: TemplateStringsArray, ...v: unknown[]) => c(s, ...(v as never[])),
+    {
+      unsafe: (q: string, p?: unknown[]) => c.unsafe(q, p as never[]),
+      end: (o?: { timeout?: number }) => {
+        ends += 1;
+        return c.end(o);
+      },
+    },
+  );
+  return { session: postgresJsLockSession(counted, SLICE), ends: () => ends };
 }
 
 async function probe(sql: Sql): Promise<Probe> {
@@ -173,6 +210,30 @@ describe("C-S1: a killed lock backend", () => {
       expect(stderr).toContain("socket.write");
       expect(stdout).toBe("query never settled\n");
       expect(code).toBe(3);
+    }, 15_000);
+  }
+
+  if (kind !== "drizzle") {
+    test("X4: close() on a killed backend is bounded, and a second close() calls no driver", async () => {
+      const { session, ends } = openCounted();
+      const [row] = await session.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
+      await killBackend(adminSql, Number(row?.pid));
+      const started = performance.now();
+      await session.close().catch(() => undefined);
+      expect(performance.now() - started).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+      expect(ends()).toBe(1);
+      expect(await session.close()).toBeUndefined();
+      expect(ends()).toBe(1);
+
+      // A query that outlives the bound: close() still settles within it.
+      const busy = openCounted();
+      await busy.session.sql.unsafe("SELECT 1");
+      const sleeping = busy.session.sql.unsafe("SELECT pg_sleep(30)").catch(() => undefined);
+      await Bun.sleep(100);
+      const t0 = performance.now();
+      await busy.session.close().catch(() => undefined);
+      expect(performance.now() - t0).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+      void sleeping;
     }, 15_000);
   }
 
