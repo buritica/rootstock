@@ -1,4 +1,11 @@
-import { type Brand, isRecord, own, sliceBrand, sliceRefusals } from "../internal/slice.ts";
+import {
+  type Brand,
+  isRecord,
+  own,
+  sliceBrand,
+  sliceRefusals,
+  tableRef,
+} from "../internal/slice.ts";
 
 export interface LockSliceInput {
   /** Where fencing rows live. Default: { schema: <default schema>, name: "run_locks" }. */
@@ -52,19 +59,15 @@ const REQUIRED = [
   "endTimeoutSeconds",
   "wait",
 ] as const;
-const TABLE_KEYS: ReadonlySet<string> = new Set(["schema", "name"]);
 const WAIT_KEYS: ReadonlySet<string> = new Set(["maxMs", "pollIntervalMs"]);
 
-const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 const PROFILE = /^[a-z][a-z0-9-]*$/;
 const GROUP = PROFILE;
 const ENTRY = /^[a-z0-9][a-z0-9:._-]*\*?$/;
 const NAME = /^[a-z0-9][a-z0-9:._-]*$/;
 // The rules are ASCII-only, so characters are bytes.
 const MAX_NAME_BYTES = 200;
-const MAX_IDENTIFIER_BYTES = 63;
 
-const E_IDENTIFIER = "an identifier matching [a-z_][a-z0-9_]* of at most 63 bytes";
 const E_NAMES = "a non-empty array of lock names";
 const E_ENTRY =
   "a lock name matching [a-z0-9][a-z0-9:._-]* (optionally ending in one *) of at most 200 bytes";
@@ -104,25 +107,6 @@ function overlaps(a: string, b: string): boolean {
   const pa = a.slice(0, -1);
   const pb = b.slice(0, -1);
   return pa.startsWith(pb) || pb.startsWith(pa);
-}
-
-function identifier(path: string, value: unknown): string {
-  if (typeof value !== "string" || !IDENTIFIER.test(value) || value.length > MAX_IDENTIFIER_BYTES) {
-    throw refuse.invalid(path, E_IDENTIFIER, value);
-  }
-  return value;
-}
-
-function parseTable(raw: unknown, schema: string): { schema: string; name: string } {
-  if (raw === undefined) return Object.freeze({ schema, name: "run_locks" });
-  const table = refuse.record("table", raw);
-  refuse.refuseUnknownKeys(table, TABLE_KEYS, "table.");
-  const s = own(table, "schema");
-  const n = own(table, "name");
-  return Object.freeze({
-    schema: s === undefined ? schema : identifier("table.schema", s),
-    name: n === undefined ? "run_locks" : identifier("table.name", n),
-  });
 }
 
 function parseNames(raw: unknown): readonly string[] {
@@ -206,7 +190,13 @@ export function lockSlice(input: LockSliceInput, defaults?: { schema?: string })
   for (const key of REQUIRED) {
     if (own(fields, key) === undefined) throw refuse.required(key);
   }
-  const table = parseTable(own(fields, "table"), defaults?.schema ?? "rootstock");
+  const table = tableRef(
+    refuse,
+    own(fields, "table"),
+    "",
+    defaults?.schema ?? "rootstock",
+    "run_locks",
+  );
   const profile = own(fields, "profile");
   if (typeof profile !== "string" || !PROFILE.test(profile)) {
     throw refuse.invalid("profile", "a profile name matching [a-z][a-z0-9-]*", profile);

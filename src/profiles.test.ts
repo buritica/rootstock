@@ -91,6 +91,7 @@ const PURE_SUBPATHS = [
   "src/concurrency/",
   "src/internal/",
   "src/lock/",
+  "src/queue/",
 ] as const;
 // The one cross-subpath import a pure subpath may make: the shared slice
 // parser pieces, which are pure themselves and are no package export.
@@ -98,14 +99,17 @@ const SHARED_INTERNAL = "../internal/slice.ts";
 // A pure subpath that builds on another pure one may import it by its index.
 const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   "src/lock/": ["../db/index.ts"],
+  "src/queue/": ["../db/index.ts"],
 };
 // A name read as a value. A property access (`deps.setInterval(...)`) and a
 // key (`setInterval: …`, `setInterval?: …`) are not the global, and an
 // injected dependency is declared and called exactly that way. AbortSignal is
 // a type the injected `sleep` takes, so it is a value only outside a type
 // annotation (`signal?: AbortSignal`, `| AbortSignal`).
+// `Date` is a clock only when read: `Date.now()`, `new Date()` and `Date()`.
+// `new Date(ms)`, `instanceof Date` and the type are not.
 const FORBIDDEN_GLOBALS =
-  /(?<![.\w$])\b(fetch|Date|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|crypto|process|console|Bun|globalThis|require)\b(?!\s*\??:)|(?<![.\w$]|:\s?|\|\s?)\bAbortSignal\b/;
+  /(?<![.\w$])\b(fetch|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\.random|crypto|process|console|Bun|globalThis|require)\b(?!\s*\??:)|(?<![.\w$]|:\s?|\|\s?)\bAbortSignal\b|(?<![.\w$]|new\s)\bDate\s*(\.\s*now\b|\()|\bnew\s+Date\s*(\(\s*\)|(?!\s*\())/;
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");

@@ -35,6 +35,7 @@
     "./db": "./src/db/index.ts",
     "./migrate": "./src/migrate/index.ts",
     "./lock": "./src/lock/index.ts",
+    "./queue": "./src/queue/index.ts",
     "./concurrency": "./src/concurrency/index.ts",
     "./config": "./src/config/index.ts"
   },

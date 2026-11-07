@@ -90,3 +90,38 @@ export function sliceBrand<T extends object>(type: string, parser: string): Bran
     },
   };
 }
+
+const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
+const MAX_IDENTIFIER_BYTES = 63;
+const E_IDENTIFIER = "an identifier matching [a-z_][a-z0-9_]* of at most 63 bytes";
+const TABLE_KEYS: ReadonlySet<string> = new Set(["schema", "name"]);
+
+/** A Postgres identifier a slice splices through quoteIdentifier, or the refusal. */
+export function identifier(refuse: SliceRefusals, path: string, value: unknown): string {
+  if (typeof value !== "string" || !IDENTIFIER.test(value) || value.length > MAX_IDENTIFIER_BYTES) {
+    throw refuse.invalid(path, E_IDENTIFIER, value);
+  }
+  return value;
+}
+
+/**
+ * A slice's `table: { schema?, name? }` at path `${at}table`, frozen, each
+ * part defaulting to `schema` and `name`.
+ */
+export function tableRef(
+  refuse: SliceRefusals,
+  raw: unknown,
+  at: string,
+  schema: string,
+  name: string,
+): { readonly schema: string; readonly name: string } {
+  if (raw === undefined) return Object.freeze({ schema, name });
+  const table = refuse.record(`${at}table`, raw);
+  refuse.refuseUnknownKeys(table, TABLE_KEYS, `${at}table.`);
+  const s = own(table, "schema");
+  const n = own(table, "name");
+  return Object.freeze({
+    schema: s === undefined ? schema : identifier(refuse, `${at}table.schema`, s),
+    name: n === undefined ? name : identifier(refuse, `${at}table.name`, n),
+  });
+}
