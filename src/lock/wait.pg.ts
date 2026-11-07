@@ -221,17 +221,22 @@ async function heldBy(name: string): Promise<boolean> {
   return (await locksHeld(adminSql, [name])).get(name) === true;
 }
 
-async function blockedPid(): Promise<number> {
+/** The pids blocked in B2 in this database, oldest first, once there are at least `n`. */
+async function blockedPids(n: number): Promise<number[]> {
   const deadline = Date.now() + 5_000;
   for (;;) {
-    const [row] = await adminSql.unsafe(
-      "SELECT pid FROM pg_stat_activity WHERE query = $1 AND wait_event_type = 'Lock'",
+    const rows = await adminSql.unsafe(
+      "SELECT pid FROM pg_stat_activity WHERE query = $1 AND wait_event_type = 'Lock' AND datname = current_database() ORDER BY query_start, pid",
       [B2],
     );
-    if (row !== undefined) return Number(row.pid);
-    if (Date.now() > deadline) throw new Error("no backend blocked in B2");
+    if (rows.length >= n) return rows.map((r) => Number(r.pid));
+    if (Date.now() > deadline) throw new Error(`fewer than ${n} backends blocked in B2`);
     await Bun.sleep(10);
   }
+}
+
+async function blockedPid(): Promise<number> {
+  return (await blockedPids(1))[0] as number;
 }
 
 /** When `pid` left pg_stat_activity (Date.now()), polled every 5 ms. */
@@ -253,11 +258,8 @@ async function fenceHolder(name: string): Promise<string | null> {
   return row === undefined ? null : String(row.holder);
 }
 
-/** What each test measured, printed once at the end (LB3's bounds are a hypothesis, D-S1 H6/H10). */
+/** What each test measured; the bounds assert on it (LB3's bounds are a hypothesis, D-S1 H6/H10). */
 const measured: Record<string, number> = {};
-afterAll(() => {
-  process.stdout.write(`R-D7 block-mode timings (${lockDriver()}): ${JSON.stringify(measured)}\n`);
-});
 
 describe("block mode against a real server (w4d §8.1)", () => {
   test("LB1: block mode acquires after the holder releases; settings restored before L2 and after L2, L3, L5", async () => {
@@ -300,7 +302,7 @@ describe("block mode against a real server (w4d §8.1)", () => {
     const waiting = acquireRunLock(open, blockSlice, "alpha-sync", d, {
       wait: { mode: "block", ms: 3000, turns: createTurnQueue() },
     });
-    await Bun.sleep(200);
+    await blockedPid();
     await holder.release();
     const releasedAt = Date.now();
     const lock = await waiting;
@@ -389,7 +391,7 @@ describe("block mode against a real server (w4d §8.1)", () => {
       const next = acquireRunLock(openBlock, blockSlice, name, deps(nextEvents), {
         wait: { mode: "block", ms: 5000, turns: createTurnQueue() },
       });
-      await Bun.sleep(100);
+      await blockedPids(2);
       const abortedAt = Date.now();
       ac.abort();
       // The holder keeps the lock meanwhile: the ghost ends because the
@@ -427,15 +429,18 @@ describe("block mode against a real server (w4d §8.1)", () => {
       await acquireRunLock(
         () =>
           recording(openBlock(), rec, {
-            after: (q) => {
+            after: (q, rows) => {
               if (q !== B2) return;
-              // The grant answers first, then the abort lands before the
-              // acquire resumes: three hops, after B2's answer has decided
-              // the race (an abort in the same hop would win it instead).
-              void Promise.resolve()
-                .then(() => {})
-                .then(() => {})
-                .then(() => ac.abort());
+              // The grant has answered and decided the race; the abort lands
+              // when the acquire reads the pid, just before its abort check.
+              const row = rows[0] as Record<string, unknown>;
+              const pid = row.pid;
+              Object.defineProperty(row, "pid", {
+                get: () => {
+                  ac.abort();
+                  return pid;
+                },
+              });
             },
           }),
         blockSlice,

@@ -160,6 +160,19 @@ forward on 0.8.x only: an older line can never ship a migration there.
   `endTimeoutSeconds` and frees the in-process turn before closing, so a
   close that hangs never holds the next waiter (the database lock does,
   until that session ends).
+- **Block mode (0.8.0).** `wait: { mode: "block" }` waits in
+  `pg_advisory_lock` with `lock_timeout` set to what is left of the wait, and
+  `client_connection_check_interval` set to `wait.block.checkIntervalMs`, then
+  restores both before fencing. An abort ends the waiting session with
+  `destroy()` (or `close()` when the session has none), so the server drops
+  the waiter instead of granting it later; a grant that races the abort is
+  unlocked at once and refused `ABANDONED`. The connection check works only
+  on a Linux server: elsewhere the server refuses it, the lock waits without
+  it and emits `lock.connection_check_unavailable` once per wait, and a
+  waiter whose client vanished stays queued until `lock_timeout`. A
+  role-level `statement_timeout` shorter than the wait ends the wait as an
+  error, not `HELD`. A session wrapper that spreads a shipped session and
+  overrides only `close` is skipped on abort: wrap `destroy` too.
 - **`open` must make a new client each call.** It runs once for the acquire
   and once more for each stalled-probe recovery, which closes the session it
   replaces. An `open` that wraps one shared client makes that recovery claim

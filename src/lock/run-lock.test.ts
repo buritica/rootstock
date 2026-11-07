@@ -1819,7 +1819,11 @@ describe("w4d §8.2: #39 lock items", () => {
         reason: "displaced",
       });
       expect(await caught(lock.ensureExclusive())).toBe(err);
+      // The claim stacked a level on the backend that still held the lock;
+      // the L6 above freed that one, and release() frees the original.
       await lock.release();
+      expect(s.seen.slice(-1)).toEqual(["L6"]);
+      expect(s.seen.filter((id) => id === "L6")).toHaveLength(2);
     }
   });
 
@@ -1837,8 +1841,10 @@ describe("w4d §8.2: #39 lock items", () => {
     deps.fire();
     await flush();
     s.answer("L4", [{ locked: true, pid: PID, holder: lock.holder }]);
+    s.answer("L3", [{ pid: PID, held: 2 }]);
     await lock.ensureExclusive();
-    expect(s.seen.slice(-1)).toEqual(["L4"]);
+    // The claim stacked a second level on the same backend; it is undone.
+    expect(s.seen.slice(-3)).toEqual(["L4", "L3", "L6"]);
     // No longer suspect: the next gate probes again.
     await lock.ensureExclusive();
     expect(s.seen.slice(-1)).toEqual(["L3"]);
@@ -1946,12 +1952,13 @@ describe("w4d §8.2: #39 lock items", () => {
         expect(e[key as keyof RootstockLockError]).toEqual(value);
       }
     }
-    // The other codes carry only their code.
-    for (const code of [
-      "ERR_ROOTSTOCK_LOCK_WAIT",
-      "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE",
-      "ERR_ROOTSTOCK_LOCK_ABANDONED",
-    ] as const) {
+    // ABANDONED mirrors its waitedMs (§20 A16); the other codes carry only their code.
+    const abandoned = new RootstockLockError("ERR_ROOTSTOCK_LOCK_ABANDONED", "alpha-sync", "x", {
+      waitedMs: 1,
+    });
+    expect(abandoned.details).toEqual({ code: "ERR_ROOTSTOCK_LOCK_ABANDONED", waitedMs: 1 });
+    expect(abandoned.waitedMs).toBe(1);
+    for (const code of ["ERR_ROOTSTOCK_LOCK_WAIT", "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE"] as const) {
       expect(new RootstockLockError(code, "alpha-sync", "x", { waitedMs: 1 }).details).toEqual({
         code,
       });

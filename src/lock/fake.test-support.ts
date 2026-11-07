@@ -2,11 +2,11 @@ import type { Row, Sql } from "../db/index.ts";
 import type { LockEvent } from "./events.ts";
 import type { LockDeps } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
-import { B0, B1, B2, L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
+import { B0, B1, B1L, B2, L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
 
 /**
  * A scripted lock session for the unit suites: `unsafe` answers per
- * statement id (L1-L9, B0-B3, matched by text; B1's text after a B2 is B3)
+ * statement id (L1-L9, B0-B3, B1L/B3L, matched by text; B1's text after a B2 is B3, B1L's is B3L)
  * from a queue, and records the ids it saw. An answer is rows, an Error to
  * reject with, or a function of the params. An id with an empty queue
  * answers its default.
@@ -24,7 +24,9 @@ export type StatementId =
   | "B0"
   | "B1"
   | "B2"
-  | "B3";
+  | "B3"
+  | "B1L"
+  | "B3L";
 export type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[] | Promise<Row[]>);
 
 export interface FakeSession extends LockSession {
@@ -61,6 +63,7 @@ export function fakeSession(
     [B0, "B0"],
     [B1, "B1"],
     [B2, "B2"],
+    [B1L, "B1L"],
   ]);
   const defaults: Record<StatementId, Answer> = {
     L1: [{ locked: true, pid: PID }],
@@ -76,6 +79,8 @@ export function fakeSession(
     B1: [{ lt: "", cc: "" }],
     B2: [{ locked: true, pid: PID }],
     B3: [{ lt: "", cc: "" }],
+    B1L: [{ lt: "" }],
+    B3L: [{ lt: "" }],
   };
   const queues = new Map<StatementId, Answer[]>();
   const seen: StatementId[] = [];
@@ -86,7 +91,13 @@ export function fakeSession(
   const unsafe = async (query: string, params?: readonly unknown[]): Promise<Row[]> => {
     const mapped = ids.get(query);
     if (mapped === undefined) throw new Error(`fake session: unknown statement ${query}`);
-    const id = mapped === "B1" && seen.includes("B2") ? "B3" : mapped;
+    const id = !seen.includes("B2")
+      ? mapped
+      : mapped === "B1"
+        ? "B3"
+        : mapped === "B1L"
+          ? "B3L"
+          : mapped;
     seen.push(id);
     calls.push({ id, params: [...(params ?? [])] });
     const answer = queues.get(id)?.shift() ?? defaults[id];

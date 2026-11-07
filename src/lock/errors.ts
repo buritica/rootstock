@@ -21,6 +21,7 @@ const CODE_SET: ReadonlySet<LockErrorCode> = new Set(CODES);
  */
 export type LockErrorDetails =
   | { readonly code: "ERR_ROOTSTOCK_LOCK_HELD"; readonly waitedMs?: number }
+  | { readonly code: "ERR_ROOTSTOCK_LOCK_ABANDONED"; readonly waitedMs: number }
   | { readonly code: "ERR_ROOTSTOCK_LOCK_MALFUNCTION"; readonly answer: unknown }
   | {
       readonly code: "ERR_ROOTSTOCK_LOCK_CONN";
@@ -30,7 +31,10 @@ export type LockErrorDetails =
   | {
       readonly code: Exclude<
         LockErrorCode,
-        "ERR_ROOTSTOCK_LOCK_HELD" | "ERR_ROOTSTOCK_LOCK_MALFUNCTION" | "ERR_ROOTSTOCK_LOCK_CONN"
+        | "ERR_ROOTSTOCK_LOCK_HELD"
+        | "ERR_ROOTSTOCK_LOCK_MALFUNCTION"
+        | "ERR_ROOTSTOCK_LOCK_CONN"
+        | "ERR_ROOTSTOCK_LOCK_ABANDONED"
       >;
     };
 
@@ -38,6 +42,8 @@ function detailsOf(code: LockErrorCode, extras: Extras): LockErrorDetails {
   switch (code) {
     case "ERR_ROOTSTOCK_LOCK_HELD":
       return Object.freeze("waitedMs" in extras ? { code, waitedMs: extras.waitedMs } : { code });
+    case "ERR_ROOTSTOCK_LOCK_ABANDONED":
+      return Object.freeze({ code, waitedMs: extras.waitedMs as number });
     case "ERR_ROOTSTOCK_LOCK_MALFUNCTION":
       return Object.freeze({ code, answer: extras.answer });
     case "ERR_ROOTSTOCK_LOCK_CONN":

@@ -406,9 +406,17 @@ describe("acquire against a real server", () => {
 });
 
 describe("w4d §8.2: the keepalive reads its fencing row", () => {
-  async function untilEvent(h: Harness, type: LockEvent["type"]): Promise<void> {
-    const deadline = Date.now() + 2_000;
-    while (!h.events.some((e) => e.type === type) && Date.now() < deadline) await Bun.sleep(10);
+  /**
+   * Ticks until `type` appears: a tick while the last one is still in flight
+   * is skipped by the probe guard, so one tick alone can be lost.
+   */
+  async function tickUntil(h: Harness, type: LockEvent["type"]): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!h.events.some((e) => e.type === type)) {
+      if (Date.now() > deadline) throw new Error(`no ${type} within 5 s`);
+      h.tick();
+      await Bun.sleep(20);
+    }
   }
 
   for (const how of ["deleted", "replaced"] as const) {
@@ -425,8 +433,7 @@ describe("w4d §8.2: the keepalive reads its fencing row", () => {
           : `UPDATE "${fenced}".run_locks SET holder = gen_random_uuid() WHERE name = $1`,
         ["beta-sync"],
       );
-      h.tick();
-      await untilEvent(h, "lock.fence_missing");
+      await tickUntil(h, "lock.fence_missing");
       expect(h.events).toContainEqual({
         type: "lock.fence_missing",
         name: "beta-sync",

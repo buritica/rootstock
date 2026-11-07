@@ -29,6 +29,13 @@ export const B0 =
 export const B1 =
   "SELECT set_config('lock_timeout', $1::text, false) AS lt, set_config('client_connection_check_interval', $2::text, false) AS cc";
 
+/**
+ * B1L B1 without the connection check, params [`${remainingMs}ms`], for a
+ * server that refuses client_connection_check_interval (§20 A15). Its
+ * restore is this text with B0's lock_timeout.
+ */
+export const B1L = "SELECT set_config('lock_timeout', $1::text, false) AS lt";
+
 /** B2 block until granted (or lock_timeout), params [name]. */
 export const B2 =
   "SELECT true AS locked, pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(hashtext($1))) AS t";

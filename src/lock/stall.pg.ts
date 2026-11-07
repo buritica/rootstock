@@ -317,6 +317,7 @@ describe("w4d §8.1 with 0.7.0's recovery", () => {
       proxy.freeze({ forwardClose: true });
       await lock.ensureExclusive();
       const recovered = events.find((e) => e.type === "lock.recovered");
+      expect(recovered).toBeDefined();
       expect(recovered?.type === "lock.recovered" && recovered.pid).not.toBe(old);
       expect(opened).toHaveLength(2);
       const replacement = opened[1] as { session: LockSession; sent: string[] };

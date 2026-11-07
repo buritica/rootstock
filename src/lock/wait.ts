@@ -5,7 +5,7 @@ import { ABORT_SIGNAL, type RootstockLockError, refusals } from "./errors.ts";
 import { failure } from "./events.ts";
 import { type Attempt, closeQuietly, fence, pidIn, type RunLock, refused } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
-import { B0, B1, B2, L1, L6 } from "./statements.ts";
+import { B0, B1, B1L, B2, L1, L6 } from "./statements.ts";
 import { enqueueTurn, isTurnQueue, type TurnQueue } from "./turns.ts";
 
 export type LockWait =
@@ -280,6 +280,8 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
     session = open();
     let settings: [string, string];
     let remainingMs: number;
+    /** Whether B1 set the connection check, so B3 restores it too. */
+    let checked = true;
     try {
       const [row] = await bounded(B0, [], `the settings read for ${name}`);
       const { lt, cc } = row ?? {};
@@ -288,11 +290,25 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
       }
       settings = [lt, cc];
       remainingMs = Math.max(1, deadline - deps.now());
-      await bounded(B1, [`${remainingMs}ms`, `${checkIntervalMs}ms`], `the settings for ${name}`);
+      try {
+        await bounded(B1, [`${remainingMs}ms`, `${checkIntervalMs}ms`], `the settings for ${name}`);
+      } catch (err) {
+        // Off Linux the server refuses the connection check (22023): block
+        // without it; an abort still ends the backend through destroy().
+        const code = pgCode(err);
+        if (code !== "22023" && code !== "42704") throw err;
+        checked = false;
+        emit({ type: "lock.connection_check_unavailable", name });
+        await bounded(B1L, [`${remainingMs}ms`], `the settings for ${name}`);
+      }
     } catch (err) {
       return await fail(err);
     }
 
+    if (signal?.aborted) {
+      // Aborted during the open or the settings: never start a wait.
+      return await giveUp("aborted", (ms) => refusals.abandoned(name, ms));
+    }
     let blocked: { value: Row[] } | "timeout" | "aborted";
     try {
       blocked = await within(deps, session.sql.unsafe(B2, [name]), remainingMs + stall, signal);
@@ -330,7 +346,11 @@ export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock>
     }
 
     try {
-      await bounded(B1, settings, `restoring the settings for ${name}`);
+      await bounded(
+        checked ? B1 : B1L,
+        checked ? settings : [settings[0]],
+        `restoring the settings for ${name}`,
+      );
     } catch (err) {
       try {
         const unlocked = await within(deps, session.sql.unsafe(L6, [name]), stall);

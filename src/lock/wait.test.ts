@@ -686,6 +686,73 @@ describe("block mode (w4d §8.1)", () => {
     expect([s.closes, s.destroys]).toEqual([1, 0]);
   });
 
+  test("A15: B1 refused 22023 or 42704 blocks without the connection check, emits once, restores lock_timeout only", async () => {
+    for (const code of ["22023", "42704"]) {
+      const s = fakeSession();
+      s.answer("B0", [{ lt: "5s", cc: "0" }]);
+      s.answer("B1", pgError(code, "client_connection_check_interval must be set to 0"));
+      const deps = fakeDeps();
+      const lock = await blocker(deps, { ms: 800 }, s).acquire;
+      expect(s.calls.map((c) => [c.id, c.params])).toEqual([
+        ["B0", []],
+        ["B1", ["800ms", "200ms"]],
+        ["B1L", ["800ms"]],
+        ["B2", ["alpha-sync"]],
+        ["B3L", ["5s"]],
+        ["L2", ["alpha-sync", lock.holder]],
+      ]);
+      expect(outcomes(deps.events)).toEqual([
+        "lock.connection_check_unavailable",
+        "wait:block:acquired",
+        "lock.acquired",
+      ]);
+      expect(deps.events[0]).toEqual({
+        type: "lock.connection_check_unavailable",
+        name: "alpha-sync",
+      });
+      await lock.release();
+    }
+    // Any other B1 failure is still an error, rethrown untouched.
+    const s = fakeSession();
+    const boom = pgError("42501");
+    s.answer("B1", boom);
+    const deps = fakeDeps();
+    expect(await blocker(deps, {}, s).acquire.catch((e) => e)).toBe(boom);
+    expect(s.seen).toEqual(["B0", "B1"]);
+    expect(outcomes(deps.events)).toEqual(["wait:block:error"]);
+  });
+
+  test("an abort during the settings refuses ABANDONED without sending B2", async () => {
+    const s = fakeSession(undefined, { destroy: true });
+    const ac = new AbortController();
+    s.answer("B1", () => {
+      ac.abort();
+      return [{ lt: "", cc: "" }];
+    });
+    const deps = fakeDeps();
+    const err = await refusal(blocker(deps, { signal: ac.signal }, s).acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+    expect(s.seen).toEqual(["B0", "B1"]);
+    expect([s.closes, s.destroys]).toEqual([1, 0]);
+    expect(outcomes(deps.events)).toEqual(["wait:block:aborted", "ERR_ROOTSTOCK_LOCK_ABANDONED"]);
+  });
+
+  test("A15: an abort while blocked without the connection check still destroys the session", async () => {
+    const s = fakeSession(undefined, { destroy: true });
+    s.answer("B1", pgError("22023"));
+    s.answer("B2", never);
+    const ac = new AbortController();
+    const deps = fakeDeps();
+    const w = blocker(deps, { signal: ac.signal }, s);
+    while (!s.seen.includes("B2")) await Promise.resolve();
+    ac.abort();
+    const err = await refusal(w.acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+    expect(err.details).toEqual({ code: "ERR_ROOTSTOCK_LOCK_ABANDONED", waitedMs: 0 });
+    expect(s.seen).toEqual(["B0", "B1", "B1L", "B2"]);
+    expect(s.destroys).toBe(1);
+  });
+
   test("B1's lock_timeout is what is left of the wait after the turn, never below 1", async () => {
     const deps = manualDeps();
     const turns = createTurnQueue();

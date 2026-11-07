@@ -31,6 +31,8 @@ export type LockEvent =
   | { type: "lock.fence_missing"; name: string; holder: string }
   /** A keepalive tick found the previous tick's probe in flight past probeStallSeconds; `ms` is how long. */
   | { type: "lock.probe_stalled"; name: string; ms: number }
+  /** Block mode on a server that refuses client_connection_check_interval (§20 A15). */
+  | { type: "lock.connection_check_unavailable"; name: string }
   | ({ type: "lock.recovery_retrying"; name: string; attempt: number } & Err)
   | ({ type: "lock.recovery_failed"; name: string; attempt: number } & Err)
   | {

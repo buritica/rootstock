@@ -492,7 +492,14 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
    * `probe`: how the gate's L3 failed. `rejected`: an L4 on the same pid may
    * have stacked a level. `stalled`: the claim goes on a fresh session.
    */
-  async function recover(probe: "lost" | "rejected" | "stalled"): Promise<Recovery> {
+  /**
+   * `stillHeld`: the current backend still holds the lock (a suspect lock,
+   * whose fencing row went missing), so a claim on it stacks a second level.
+   */
+  async function recover(
+    probe: "lost" | "rejected" | "stalled",
+    stillHeld = false,
+  ): Promise<Recovery> {
     if (released) return "released";
     if (recoveries >= slice.maxRecoveries) {
       emit({
@@ -505,7 +512,9 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     }
     recoveries += 1;
     const attempt = recoveries;
-    if (probe !== "stalled") return settle(probe, attempt, await claim(attempt, true), false);
+    if (probe !== "stalled") {
+      return settle(probe, attempt, await claim(attempt, true), false, stillHeld);
+    }
     replacing = true;
     try {
       const reopened = await reopen(attempt);
@@ -526,6 +535,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     attempt: number,
     claimed: { row: Row | undefined } | { stalled: Error } | "released" | "failed",
     own: boolean,
+    stillHeld = false,
   ): Promise<Recovery> {
     if (typeof claimed === "string" || "stalled" in claimed) return claimed;
     const { row } = claimed;
@@ -545,9 +555,12 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // still naming this holder proves no other run took it meanwhile. The
     // advisory lock just taken is not ours to keep, so it goes now.
     holding = true;
+    // On a backend that already held the lock, the claim stacked a level.
+    const stacked = stillHeld && Number(row.pid) === pid;
     if (row.holder !== holder) {
       await unlock(stallMs);
-      holding = false;
+      // The level held before the claim is still there for release() to free.
+      holding = stacked;
       if (released) return "released";
       emit({ type: "lock.recovery_refused", name, attempt, reason: "displaced" });
       return "failed";
@@ -556,7 +569,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned before any further await, so a keepalive tick that reads the
     // new backend compares against it.
     pid = Number(row.pid);
-    if (probe === "rejected" && pid === before) {
+    if ((probe === "rejected" || stacked) && pid === before) {
       const stall = await undoStackedLevel();
       if (released) return "released";
       if (stall !== undefined) return { stalled: stall };
@@ -573,7 +586,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   async function gate(): Promise<void> {
     if (suspect) {
       // The fencing row no longer names this holder: L4 reads that and refuses displaced.
-      const outcome = await recover("lost");
+      const outcome = await recover("lost", true);
       if (outcome === "recovered") {
         suspect = false;
         return;

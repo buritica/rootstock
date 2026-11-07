@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   B0,
   B1,
+  B1L,
   B2,
   L1,
   L3,
@@ -89,6 +90,7 @@ WHERE l.pid = $2
     expect(B1).toBe(
       "SELECT set_config('lock_timeout', $1::text, false) AS lt, set_config('client_connection_check_interval', $2::text, false) AS cc",
     );
+    expect(B1L).toBe("SELECT set_config('lock_timeout', $1::text, false) AS lt");
     expect(B2).toBe(
       "SELECT true AS locked, pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(hashtext($1))) AS t",
     );
@@ -99,6 +101,7 @@ WHERE l.pid = $2
     for (const text of [
       B0,
       B1,
+      B1L,
       B2,
       L1,
       L3,
