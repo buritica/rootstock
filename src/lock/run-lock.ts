@@ -5,6 +5,7 @@ import { lockOwnershipLost } from "./probe.ts";
 import type { LockSession } from "./session.ts";
 import { admits, assertLockSlice, type LockSlice } from "./slice.ts";
 import { L1, L3, L6, type TableStatements, tableStatements } from "./statements.ts";
+import { checkWait, type LockWait, pollAcquire } from "./wait.ts";
 
 export interface LockDeps {
   /** Milliseconds. */
@@ -84,16 +85,19 @@ export function validate(slice: LockSlice, name: string, deps: LockDeps): Attemp
 }
 
 /**
- * Takes the lock with one try-lock, then fences it (§2.5). The session is
- * opened once and closed on every refusal; the keepalive is not started.
+ * Takes the lock with one try-lock, or with `opts.wait` by waiting for the
+ * turn and polling (§2.6), then fences it (§2.5). The session is opened once
+ * and closed on every refusal; the keepalive is not started.
  */
 export async function acquireRunLock(
   open: () => LockSession,
   slice: LockSlice,
   name: string,
   deps: LockDeps,
+  opts?: { wait?: LockWait },
 ): Promise<RunLock> {
   const a = validate(slice, name, deps);
+  if (opts?.wait !== undefined) return pollAcquire(a, open, checkWait(a, opts.wait));
   const session = open();
   let row: Row | undefined;
   try {

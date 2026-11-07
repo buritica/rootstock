@@ -126,5 +126,50 @@ export function fakeDeps(over: Partial<LockDeps> = {}): FakeDeps {
 
 /** Lets every pending microtask and timer-free promise chain settle. */
 export async function flush(): Promise<void> {
-  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+}
+
+export interface ManualDeps extends FakeDeps {
+  /** Moves the clock by ms, waking each due sleeper in time order and settling after each. */
+  advance(ms: number): Promise<void>;
+  /** Sleepers not yet woken. */
+  readonly sleepers: number;
+}
+
+/** fakeDeps whose sleep waits for `advance` (or its signal), for queued waiters. */
+export function manualDeps(over: Partial<LockDeps> = {}): ManualDeps {
+  const pending: { at: number; wake: () => void }[] = [];
+  const base = fakeDeps(over);
+  const deps = base as ManualDeps;
+  deps.sleep = (ms, signal) =>
+    new Promise<void>((resolve) => {
+      if (signal?.aborted) return resolve();
+      const entry = { at: deps.clock + ms, wake: resolve };
+      pending.push(entry);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          pending.splice(pending.indexOf(entry), 1);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  deps.advance = async (ms) => {
+    const target = deps.clock + ms;
+    await flush();
+    for (;;) {
+      pending.sort((x, y) => x.at - y.at);
+      const next = pending[0];
+      if (next === undefined || next.at > target) break;
+      pending.shift();
+      deps.clock = Math.max(deps.clock, next.at);
+      next.wake();
+      await flush();
+    }
+    deps.clock = target;
+    await flush();
+  };
+  Object.defineProperty(deps, "sleepers", { get: () => pending.length });
+  return deps;
 }

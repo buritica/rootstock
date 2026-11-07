@@ -6,6 +6,7 @@ test("lock exports exactly the frozen surface", async () => {
     "RootstockLockError",
     "acquireRunLock",
     "bunSqlLockSession",
+    "createTurnQueue",
     "lockErrorCode",
     "lockNameCollisions",
     "lockOwnershipLost",

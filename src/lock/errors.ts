@@ -72,7 +72,7 @@ export function lockErrorCode(err: unknown): LockErrorCode | undefined {
 }
 
 // The global's name, in pieces: the purity scan reads string text too.
-const ABORT_SIGNAL = ["Abort", "Signal"].join("");
+export const ABORT_SIGNAL = ["Abort", "Signal"].join("");
 
 /** The frozen texts, one builder per refusal. */
 export const refusals = {
