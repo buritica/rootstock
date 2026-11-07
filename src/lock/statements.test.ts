@@ -58,12 +58,22 @@ RETURNING pg_backend_pid() AS pid`);
     expect(s.heartbeat).toBe(
       `UPDATE ${T} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid`,
     );
+    expect(s.terminate).toBe(`SELECT pg_terminate_backend(l.pid) AS terminated
+FROM pg_locks l
+WHERE l.pid = $2
+  AND l.locktype = 'advisory'
+  AND l.granted
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND l.objsubid = 1
+  AND l.classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
+  AND l.objid = (hashtext($1)::bigint & 4294967295)::oid
+  AND EXISTS (SELECT 1 FROM ${T} WHERE name = $1 AND holder = $3::uuid)`);
     expect(Object.isFrozen(s)).toBe(true);
   });
 
   test("no statement carries a comment or a stray dollar", () => {
     const s = tableStatements({ schema: "a", name: "b" });
-    for (const text of [L1, L3, L6, L7, L8, s.fence, s.claim, s.heartbeat]) {
+    for (const text of [L1, L3, L6, L7, L8, s.fence, s.claim, s.heartbeat, s.terminate]) {
       expect(text).not.toContain("--");
       expect(text.replace(/\$\d+/g, "")).not.toContain("$");
     }
