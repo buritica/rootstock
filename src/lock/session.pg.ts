@@ -193,12 +193,13 @@ describe("C-S1: a killed lock backend", () => {
           expect(failed).toBeInstanceOf(Error);
         }
       } finally {
-        // Bun 1.3.14 throws "Connection closed" from release() on a killed
-        // reservation; the pool's close below is the cleanup that matters.
-        try {
-          reserved.release();
-        } catch {}
-        await pool.close({ timeout: 5 });
+        // Bun 1.3.14 rejects with "Connection closed" from release() on a
+        // killed reservation and its pool close waits out the whole timeout;
+        // neither is what this test pins.
+        await Promise.resolve()
+          .then(() => reserved.release())
+          .catch(() => {});
+        await pool.close({ timeout: 1 }).catch(() => {});
       }
     });
   }
