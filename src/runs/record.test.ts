@@ -867,6 +867,8 @@ describe("finish", () => {
       Object.assign(new Error("closed"), { code: "CONNECTION_CLOSED" }),
       Object.assign(new Error("closed"), { code: "ERR_POSTGRES_CONNECTION_CLOSED" }),
       new Error("wrapped", { cause: Object.assign(new Error("reset"), { errno: "ECONNRESET" }) }),
+      Object.assign(new Error("pipe"), { code: "EPIPE" }),
+      new Error("wrapped", { cause: Object.assign(new Error("pipe"), { code: "EPIPE" }) }),
     ];
     for (const failure of lost) {
       const fake = fakeSql(SLICE);

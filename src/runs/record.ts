@@ -230,13 +230,13 @@ const CONNECTION_STATE = /^(08...|57P0[123])$/;
 const CONNECTION_CODE =
   /^(CONNECTION_(CLOSED|ENDED|DESTROYED)|CONNECT_TIMEOUT|ERR_POSTGRES_(CONNECTION_CLOSED|CONNECTION_TIMEOUT|IDLE_TIMEOUT|LIFETIME_TIMEOUT)|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTCONN|EHOSTUNREACH|ENETUNREACH)$/;
 
-/** Whether `err` is a lost connection: R2 is retried once on one (§20 A13). */
+/** Whether `err` is a lost connection: R2 is retried on one (§20 A13). */
 function connectionLost(err: unknown): boolean {
-  const state = pgCode(err);
-  if (state !== undefined) return CONNECTION_STATE.test(state);
+  // Driver and socket codes first: pgCode reads any 5-character code, EPIPE
+  // included, as a SQLSTATE.
   let current: unknown = err;
   for (let hop = 0; hop < 5; hop += 1) {
-    if (typeof current !== "object" || current === null) return false;
+    if (typeof current !== "object" || current === null) break;
     try {
       const { code, errno, cause } = current as {
         code?: unknown;
@@ -245,13 +245,14 @@ function connectionLost(err: unknown): boolean {
       };
       if (typeof code === "string" && CONNECTION_CODE.test(code)) return true;
       if (typeof errno === "string" && CONNECTION_CODE.test(errno)) return true;
-      if (cause === undefined || cause === current) return false;
+      if (cause === undefined || cause === current) break;
       current = cause;
     } catch {
-      return false;
+      break;
     }
   }
-  return false;
+  const state = pgCode(err);
+  return state !== undefined && CONNECTION_STATE.test(state);
 }
 
 /** `s` cut to its first `max` characters (code points, so no surrogate is split). */

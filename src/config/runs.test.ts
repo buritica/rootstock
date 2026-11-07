@@ -163,13 +163,14 @@ describe("RC2: the runs built-in invariants", () => {
   });
 
   test("RC2 a family job's family lock must name every member's lock within 200 bytes", () => {
-    const long = `${"l".repeat(188)}:*`; // prefix 189 + a 62-character suffix > 200
+    // delta:* members are "delta:" (6) plus up to 58 characters of a 64-character
+    // job name, so a lock prefix of 142 fits exactly (142 + 58 = 200) and 143 does not.
+    const long = `${"l".repeat(142)}:*`;
     const names = ["alpha-sync", "shared-write", long];
     expect(failure(input({ lock: { names }, runs: jobLock("delta:*", long) }))).toBe(
       `runs-job-locks: jobs delta:* (lock "${long}" cannot name every member's lock in 200 bytes) run under locks the lock slice does not admit: acquireRunLock would refuse them`,
     );
-    // 138 + 62 = 200: the longest member's lock name just fits.
-    const fits = `${"l".repeat(137)}:*`;
+    const fits = `${"l".repeat(141)}:*`;
     expect(() =>
       defineRootstockConfig(
         input({
@@ -188,7 +189,7 @@ describe("RC2: the runs built-in invariants", () => {
     expect(
       failure(input({ lock: { heartbeatSeconds: 20, probeStallSeconds: 81 }, runs: { jobs } })),
     ).toBe(
-      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted between two beats",
+      "runs-stale-heartbeat: jobs alpha-sync (120), gamma-push (120), delta:* (120) have staleHeartbeatSeconds below 121, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted during a stalled probe",
     );
   });
 

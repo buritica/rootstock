@@ -59,7 +59,7 @@ export const runsLockTable: Invariant = Object.freeze({
 });
 
 // Job names are at most 64 characters and lock names at most 200 bytes, both
-// ASCII, so the longest member of a job family derives a lock name this long.
+// ASCII: a family lock must fit its prefix plus the longest member suffix.
 const MAX_JOB_CHARS = 64;
 const MAX_LOCK_BYTES = 200;
 
@@ -134,6 +134,6 @@ export const runsStaleHeartbeat: Invariant = Object.freeze({
       job.staleHeartbeatSeconds < floor ? [`${key} (${job.staleHeartbeatSeconds})`] : [],
     );
     if (offenders.length === 0) return null;
-    return `jobs ${offenders.join(", ")} have staleHeartbeatSeconds below ${floor}, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted between two beats`;
+    return `jobs ${offenders.join(", ")} have staleHeartbeatSeconds below ${floor}, the lock slice's probeStallSeconds plus twice its heartbeatSeconds: a live run would read interrupted during a stalled probe`;
   },
 });

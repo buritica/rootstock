@@ -162,14 +162,14 @@ describe("lock, queue and runs composed (§13.11)", () => {
       randomUUID: () => crypto.randomUUID(),
       onEvent: (e: RunsEvent) => events.push(e),
     };
-    const acquire = async (): Promise<RunLock> => {
+    const acquire = async (name = "alpha-sync"): Promise<RunLock> => {
       const run = await acquireRunLock(
         () =>
           lockDriver() === "bun-sql"
             ? bunSqlLockSession(openBunSqlClient(), lock)
             : postgresJsLockSession(openPostgresJsClient(), lock),
         lock,
-        "alpha-sync",
+        name,
         lockDeps,
       );
       held.push(run);
@@ -313,6 +313,18 @@ describe("lock, queue and runs composed (§13.11)", () => {
     if (after === undefined) throw new Error("no snapshot for alpha-sync");
     expect([after.total, after.newestOk?.id, after.running.length]).toEqual([3, three.id, 0]);
     expect(verdictFor(after, decl, { now: Date.now(), live: 100 }).verdict).toBe("ok");
+
+    // A family member runs under the lock its family declares: the lock slice
+    // admits "delta:one" and startRun accepts it (runs-job-locks agrees).
+    const deltaLock = await acquire("delta:one");
+    const delta = await startRun(
+      sql,
+      runs,
+      { job: "delta:one", mode: "manual", lock: deltaLock },
+      deps,
+    );
+    expect(delta.lockName).toBe("delta:one");
+    expect(await delta.discard()).toEqual({ written: false, why: "discarded" });
 
     const status = await migrationStatus(sql, config.migrate, [source]);
     expect(status.red).toBe(false);
