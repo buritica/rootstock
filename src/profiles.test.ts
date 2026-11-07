@@ -3,12 +3,13 @@ import pkg from "../package.json";
 
 const ROOT = `${import.meta.dir}/..`;
 const OFFICE_PEERS = new Set(["jszip", "mammoth", "unpdf"]);
-// Unit tests, DB suites (`*.pg.ts`) and their support modules (`*.pg-support.ts`)
-// import drivers and read the environment by design; every scan skips them.
-const TEST_FILE = /\.(test|pg|pg-support)\.ts$/;
+// Unit tests, DB suites (`*.pg.ts`) and their support modules (`*.pg-support.ts`,
+// `*.test-support.ts`) import drivers and read the environment by design; every
+// scan skips them.
+const TEST_FILE = /\.(test|pg|pg-support|test-support)\.ts$/;
 
 test("the published files exclude every test-file suffix", () => {
-  for (const suffix of ["test", "pg", "pg-support"]) {
+  for (const suffix of ["test", "pg", "pg-support", "test-support"]) {
     expect(TEST_FILE.test(`x.${suffix}.ts`)).toBe(true);
     expect(pkg.files).toContain(`!src/**/*.${suffix}.ts`);
   }
@@ -221,7 +222,8 @@ test("no non-test file imports a test file", async () => {
     if (TEST_FILE.test(path)) continue;
     for (const spec of specifiers(await Bun.file(`${ROOT}/${path}`).text())) {
       // Bundler resolution lets a specifier drop its `.ts`, so match the stem too.
-      if (/\.(test|pg|pg-support)(\.ts)?$/.test(spec)) offenders.push(`${path} imports ${spec}`);
+      if (/\.(test|pg|pg-support|test-support)(\.ts)?$/.test(spec))
+        offenders.push(`${path} imports ${spec}`);
     }
   }
   expect(offenders).toEqual([]);

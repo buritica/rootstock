@@ -16,7 +16,8 @@
     "src",
     "!src/**/*.test.ts",
     "!src/**/*.pg.ts",
-    "!src/**/*.pg-support.ts"
+    "!src/**/*.pg-support.ts",
+    "!src/**/*.test-support.ts"
   ],
   "exports": {
     "./golden": "./src/golden/index.ts",

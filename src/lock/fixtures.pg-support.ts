@@ -93,3 +93,32 @@ export async function killBackend(admin: Sql, pid: number): Promise<void> {
     await Bun.sleep(10);
   }
 }
+
+/**
+ * R10's origin: a byte-copy of the acquire statements a pre-rootstock lock
+ * sends, as synthetic SQL. The fence names `run_locks` unqualified, so the
+ * origin's session sets its search_path first.
+ */
+export const ORIGIN_L1 =
+  "SELECT pg_try_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid";
+export const ORIGIN_FENCE = `INSERT INTO run_locks (name, holder, acquired_at, heartbeat_at)
+VALUES ($1, $2::uuid, now(), now())
+ON CONFLICT (name) DO UPDATE SET holder = $2::uuid, acquired_at = now(), heartbeat_at = now()
+RETURNING pg_backend_pid() AS pid`;
+
+/** A raw `max` client of the lock driver under test, for side sessions. */
+export function openRaw(max = 1): { sql: Sql; end: () => Promise<void> } {
+  if (lockDriver() === "bun-sql") {
+    const c = openBunSqlClient(max);
+    return { sql: rawSql(c), end: () => c.close({ timeout: 1 }) };
+  }
+  const c = openPostgresJsClient(max);
+  return { sql: rawSql(c), end: () => c.end({ timeout: 1 }) };
+}
+
+/** The test database's URL with another database name. */
+export function otherDatabaseUrl(database: string): string {
+  const u = new URL(testUrl());
+  u.pathname = `/${database}`;
+  return u.toString();
+}
