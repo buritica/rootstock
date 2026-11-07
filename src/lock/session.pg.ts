@@ -172,8 +172,10 @@ describe("C-S1: a killed lock backend", () => {
   }
 
   if (kind === "bun-sql") {
-    // Observed 2026-11-07, Bun 1.4.2: every query on the reservation after
-    // the kill rejects with "connection must be a PostgresSQLConnection".
+    // Observed 2026-11-07: every query on the reservation after the kill
+    // rejects. Bun 1.4.2 says "connection must be a PostgresSQLConnection",
+    // Bun 1.3.14 "Connection closed"; the claim pinned is that it never
+    // recovers, whatever the message.
     test("X2: a Bun.SQL pool.reserve() handle fails every later query", async () => {
       const pool = openBunSqlClient(2);
       const reserved = await pool.reserve();
@@ -189,7 +191,6 @@ describe("C-S1: a killed lock backend", () => {
             failed = err;
           }
           expect(failed).toBeInstanceOf(Error);
-          expect((failed as Error).message).toContain("connection must be a PostgresSQLConnection");
         }
       } finally {
         reserved.release();
@@ -199,11 +200,12 @@ describe("C-S1: a killed lock backend", () => {
   }
 
   if (kind === "postgres-js") {
-    // Observed 2026-11-07, Bun 1.4.2 and postgres 3.4.9: the driver throws an
-    // uncaught `TypeError: null is not an object (evaluating
-    // 'socket.write')` from its write path, and the query never settles. The
-    // process does not exit on its own; the child's watchdog ends it (3).
-    test("X3: a postgres.js pool.reserve() handle hits an uncaught TypeError", async () => {
+    // Observed 2026-11-07 with postgres 3.4.9: on Bun 1.4.2 the driver throws
+    // an uncaught `TypeError: null is not an object (evaluating
+    // 'socket.write')` from its write path and the query never settles (the
+    // child's watchdog exits 3); on Bun 1.3.14 the query rejects (exit 4).
+    // The claim pinned is that the handle never answers on a fresh backend.
+    test("X3: a postgres.js pool.reserve() handle never answers after its backend is killed", async () => {
       const child = Bun.spawn(
         [process.execPath, `${import.meta.dir}/reserve-child.pg-support.ts`],
         {
@@ -217,10 +219,14 @@ describe("C-S1: a killed lock backend", () => {
         new Response(child.stderr).text(),
         child.exited,
       ]);
-      expect(stderr).toContain("TypeError");
-      expect(stderr).toContain("socket.write");
-      expect(stdout).toBe("query never settled\n");
-      expect(code).toBe(3);
+      expect(stdout).not.toBe("query resolved\n");
+      if (code === 3) {
+        expect(stdout).toBe("query never settled\n");
+        expect(stderr).toContain("TypeError");
+      } else {
+        expect(code).toBe(4);
+        expect(stdout).toStartWith("query rejected: ");
+      }
     }, 15_000);
   }
 
