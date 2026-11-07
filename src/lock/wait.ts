@@ -1,15 +1,8 @@
 import { intIn, isRecord } from "../internal/slice.ts";
+import { pause, within } from "./bound.ts";
 import { ABORT_SIGNAL, type RootstockLockError, refusals } from "./errors.ts";
 import { failure } from "./events.ts";
-import {
-  type Attempt,
-  closeQuietly,
-  fence,
-  pause,
-  pidIn,
-  type RunLock,
-  refused,
-} from "./run-lock.ts";
+import { type Attempt, closeQuietly, fence, pidIn, type RunLock, refused } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
 import { L1, L6 } from "./statements.ts";
 import { enqueueTurn, isTurnQueue, type TurnQueue } from "./turns.ts";
@@ -103,6 +96,13 @@ export async function pollAcquire(
     return waitedMs;
   };
 
+  /**
+   * How long a statement of the wait may take: what is left of the wait, but
+   * never less than the slice's probe stall, so the last poll at the deadline
+   * (and every poll of an `ms: 0` wait) still gets its answer.
+   */
+  const statementMs = () => Math.max(deadline - deps.now(), slice.probeStallSeconds * 1000);
+
   const turn = enqueueTurn(wait.turns, name);
   a.releaseTurn = turn.done;
   /** Open and not yet closed or handed to the fence. */
@@ -125,8 +125,10 @@ export async function pollAcquire(
     session = open();
     for (;;) {
       let row: Record<string, unknown> | undefined;
+      let polled: { value: Record<string, unknown>[] } | "timeout" | "aborted";
       try {
-        [row] = await session.sql.unsafe(L1, [name]);
+        // An L1 in flight is bounded too: a hung one must not hold the turn.
+        polled = await within(deps, session.sql.unsafe(L1, [name]), statementMs(), signal);
       } catch (err) {
         const s = session;
         session = undefined;
@@ -134,6 +136,12 @@ export async function pollAcquire(
         report("error");
         throw err;
       }
+      if (polled === "aborted")
+        return await giveUp("aborted", (ms) => refusals.abandoned(name, ms));
+      if (polled === "timeout") {
+        return await giveUp("timeout", (ms) => refusals.heldAfterWait(name, ms));
+      }
+      [row] = polled.value;
       const locked = row?.locked;
       if (locked === true) {
         if (signal?.aborted) {
@@ -152,7 +160,14 @@ export async function pollAcquire(
         report("acquired");
         const s = session;
         session = undefined;
-        const lock = await fence(a, s, pid);
+        const lock = await fence(a, s, pid, {
+          ms: statementMs,
+          signal,
+          refusal: (why, cause) =>
+            why === "aborted"
+              ? refusals.abandoned(name, deps.now() - start)
+              : refusals.unfenced(slice, name, cause),
+        });
         if (signal?.aborted) {
           // The abort landed during the fence: the lock goes back.
           await lock.release();

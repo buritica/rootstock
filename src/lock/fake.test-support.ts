@@ -119,10 +119,23 @@ export function fakeDeps(over: Partial<LockDeps> = {}): FakeDeps {
       uuids += 1;
       return uuid(uuids);
     },
-    sleep: async (ms, signal) => {
-      if (signal?.aborted) return;
-      deps.clock += ms;
-    },
+    // One macrotask, then the clock moves: a statement the fake answers wins
+    // any race against a bound, and an abort ends the sleep early without
+    // moving the clock (so a bound that lost costs no simulated time).
+    sleep: (ms, signal) =>
+      new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve();
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          deps.clock += ms;
+          resolve();
+        }, 0);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }),
     onEvent: (e) => events.push(e),
     fire() {
       for (const fn of [...timers.values()]) fn();
@@ -160,7 +173,9 @@ export function manualDeps(over: Partial<LockDeps> = {}): ManualDeps {
       signal?.addEventListener(
         "abort",
         () => {
-          pending.splice(pending.indexOf(entry), 1);
+          // A sleeper already woken is gone: splice(-1) would drop another's.
+          const at = pending.indexOf(entry);
+          if (at >= 0) pending.splice(at, 1);
           resolve();
         },
         { once: true },

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { Row } from "../db/index.ts";
 import { RootstockLockError } from "./errors.ts";
 import type { LockEvent } from "./events.ts";
 import {
@@ -478,5 +479,99 @@ describe("hardening: a waited acquire cleans up on every path", () => {
     const err = await refusal(acquireRunLock(() => s, SLICE, "alpha-sync", fakeDeps(), { wait }));
     expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
     expect(s.seen).toEqual(["L1"]);
+  });
+});
+
+describe("round 2: nothing in flight holds the turn", () => {
+  const LONG = lockSlice({
+    profile: "lock",
+    names: ["alpha-sync"],
+    heartbeatSeconds: 30,
+    probeStallSeconds: 60,
+    maxRecoveries: 5,
+    endTimeoutSeconds: 5,
+    wait: { maxMs: 120_000, pollIntervalMs: 50 },
+  });
+
+  function longWaiter(deps: LockDeps, wait: Partial<LockWait> & { turns: TurnQueue }) {
+    const session = fakeSession();
+    const acquire = acquireRunLock(() => session, LONG, "alpha-sync", deps, {
+      wait: { mode: "poll", ms: 100_000, ...wait },
+    });
+    acquire.catch(() => {});
+    return { session, acquire };
+  }
+
+  test("release frees the turn before a close that hangs: the next waiter reaches L1", async () => {
+    const deps = manualDeps();
+    const turns = createTurnQueue();
+    const s = fakeSession();
+    const hung = { sql: s.sql, close: () => new Promise<void>(() => {}) };
+    const first = acquireRunLock(() => hung, SLICE, "alpha-sync", deps, {
+      wait: { mode: "poll", ms: 1000, turns },
+    });
+    const lock = await first;
+    const next = waiter(deps, { turns });
+    void lock.release();
+    await deps.advance(10);
+    expect(s.seen.at(-1)).toBe("L6");
+    expect(next.session.seen[0]).toBe("L1");
+    await (await next.acquire).release();
+  });
+
+  test("a hung L1 refuses HELD at the deadline, closes, and frees the turn", async () => {
+    const deps = manualDeps();
+    const turns = createTurnQueue();
+    const w = longWaiter(deps, { turns });
+    w.session.answer("L1", () => new Promise<Row[]>(() => {}));
+    const next = longWaiter(deps, { turns, ms: 110_000 });
+    await deps.advance(99_999);
+    expect(next.session.seen).toEqual([]);
+    await deps.advance(1);
+    const err = await refusal(w.acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
+    expect(err.waitedMs).toBe(100_000);
+    expect(w.session.closes).toBe(1);
+    await deps.advance(1);
+    expect(next.session.seen[0]).toBe("L1");
+    await (await next.acquire).release();
+  });
+
+  test("an abort during a hung L1 refuses ABANDONED at once", async () => {
+    const deps = manualDeps();
+    const ac = new AbortController();
+    const w = longWaiter(deps, { turns: createTurnQueue(), signal: ac.signal });
+    w.session.answer("L1", () => new Promise<Row[]>(() => {}));
+    await deps.advance(10);
+    ac.abort();
+    const err = await refusal(w.acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+    expect(w.session.closes).toBe(1);
+  });
+
+  test("an ms: 0 wait still gets its one L1 answered", async () => {
+    const deps = manualDeps();
+    const w = longWaiter(deps, { turns: createTurnQueue(), ms: 0 });
+    await deps.advance(1);
+    await (await w.acquire).release();
+    expect(w.session.seen).toEqual(["L1", "L2", "L6"]);
+  });
+
+  test("a hung fence refuses UNFENCED with a timeout cause, and frees the turn", async () => {
+    const deps = manualDeps();
+    const turns = createTurnQueue();
+    const w = longWaiter(deps, { turns, ms: 1000 });
+    w.session.answer("L2", () => new Promise<Row[]>(() => {}));
+    const next = longWaiter(deps, { turns });
+    await deps.advance(60_000);
+    const err = await refusal(w.acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNFENCED");
+    expect((err.cause as Error).message).toBe(
+      "rootstock lock: the fence for alpha-sync did not settle within 60000 ms",
+    );
+    expect(w.session.closes).toBe(1);
+    await deps.advance(1);
+    expect(next.session.seen[0]).toBe("L1");
+    await (await next.acquire).release();
   });
 });

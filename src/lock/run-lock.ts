@@ -1,6 +1,7 @@
 import type { Sql } from "../db/index.ts";
 import { perSlice } from "../internal/slice.ts";
-import { type RootstockLockError, refusals } from "./errors.ts";
+import { pause, stalled, within } from "./bound.ts";
+import { RootstockLockError, refusals } from "./errors.ts";
 import { type Emit, emitter, failure, type LockEvent } from "./events.ts";
 import { lockOwnershipLost } from "./probe.ts";
 import type { LockSession } from "./session.ts";
@@ -66,20 +67,6 @@ export async function closeQuietly(
     await session.close();
   } catch (error) {
     a.emit({ type: "lock.end_failed", name: a.name, phase, ...failure(error) });
-  }
-}
-
-/**
- * `deps.sleep`, made safe: true when it resolved, false when it threw or
- * rejected (a sleep built on timers/promises rejects on abort). A broken
- * sleep must not leak a session or a turn, so nothing here ever throws.
- */
-export async function pause(deps: LockDeps, ms: number, signal?: AbortSignal): Promise<boolean> {
-  try {
-    await deps.sleep(ms, signal);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -152,12 +139,26 @@ export async function acquireRunLock(
   return fence(a, session, pid);
 }
 
+/** What bounds a waited acquire's fence: the wait's deadline and signal (§2.6). */
+export interface FenceBound {
+  /** Milliseconds the fence may take, read when it is sent. */
+  readonly ms: () => number;
+  readonly signal?: AbortSignal;
+  /** The refusal for a fence that did not answer in time, or whose wait was aborted. */
+  readonly refusal: (why: "timeout" | "aborted", cause: Error) => RootstockLockError;
+}
+
 /**
  * Steps 5-7: write the fencing row on the backend that took the lock, and
  * hand the lock out. Owns the session from here: every throw closes it and
  * releases the turn first.
  */
-export async function fence(a: Attempt, session: LockSession, pid: number): Promise<RunLock> {
+export async function fence(
+  a: Attempt,
+  session: LockSession,
+  pid: number,
+  bound?: FenceBound,
+): Promise<RunLock> {
   const { name } = a;
   let holder: string;
   try {
@@ -170,8 +171,20 @@ export async function fence(a: Attempt, session: LockSession, pid: number): Prom
   }
   let row: Row | undefined;
   try {
-    [row] = await session.sql.unsafe(a.statements.fence, [name, holder]);
+    const work = session.sql.unsafe(a.statements.fence, [name, holder]);
+    if (bound === undefined) {
+      [row] = await work;
+    } else {
+      const ms = bound.ms();
+      const fenced = await within(a.deps, work, ms, bound.signal);
+      if (fenced === "timeout" || fenced === "aborted") {
+        await closeQuietly(a, session, "refusal");
+        throw refused(a, bound.refusal(fenced, stalled(`the fence for ${name}`, ms)));
+      }
+      [row] = fenced.value;
+    }
   } catch (err) {
+    if (err instanceof RootstockLockError) throw err;
     await closeQuietly(a, session, "refusal");
     throw refused(a, refusals.unfenced(a.slice, name, err));
   }
@@ -202,9 +215,16 @@ function probeGuard(stallMs: number, now: () => number): () => (() => void) | nu
   };
 }
 
+/** Thrown by a statement the lock was about to send after release() began; never escapes. */
+class AfterRelease extends Error {}
+
+/** How a recovery ended: `stalled` carries the timeout that made it unverifiable. */
+type Recovery = "recovered" | "failed" | "released" | { stalled: Error };
+
 function held(a: Attempt, session: LockSession, firstPid: number, holder: string): RunLock {
   const { name, slice, deps, emit, statements } = a;
   const sql: Sql = session.sql;
+  const stallMs = slice.probeStallSeconds * 1000;
   let pid = firstPid;
   let recoveries = 0;
   let keepalive: { handle: unknown } | undefined;
@@ -213,40 +233,69 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
   let terminal: RootstockLockError | undefined;
   /** The gate in flight, shared by concurrent callers so one blip recovers once. */
   let gating: Promise<void> | undefined;
-  /** The last statement on this session rejected: rest before the next one. */
-  let rejected = false;
-  const begin = probeGuard(slice.probeStallSeconds * 1000, deps.now);
+  /** A statement rejected: every statement sent before this time rests until it (C-S1). */
+  let restUntil = Number.NEGATIVE_INFINITY;
+  const begin = probeGuard(stallMs, deps.now);
 
-  /** Every statement after the fence goes through here (the C-S1 settle). */
+  /**
+   * Every statement after the fence goes through here: it rests out the
+   * settle after any rejection on the session, whichever statement rejected,
+   * and after release() began it sends nothing but L6.
+   */
   async function run(text: string, params?: readonly unknown[]): Promise<Row[]> {
-    if (rejected) {
-      rejected = false;
-      await pause(deps, SETTLE_MS);
-    }
+    const rest = restUntil - deps.now();
+    if (rest > 0) await pause(deps, rest);
+    if (released && text !== L6) throw new AfterRelease();
     try {
       return await sql.unsafe(text, params);
     } catch (err) {
-      rejected = true;
+      restUntil = deps.now() + SETTLE_MS;
       throw err;
     }
   }
 
-  /** L6, best effort: a failure is `lock.unlock_failed`. */
-  async function unlock(): Promise<void> {
+  /** L6 bounded by `ms`, best effort: a rejection or a timeout is `lock.unlock_failed`. */
+  async function unlock(ms: number): Promise<void> {
     try {
-      await run(L6, [name]);
+      if ((await within(deps, run(L6, [name]), ms)) === "timeout") {
+        emit({ type: "lock.unlock_failed", name, ...failure(stalled(`unlocking ${name}`, ms)) });
+      }
     } catch (error) {
       emit({ type: "lock.unlock_failed", name, ...failure(error) });
     }
   }
 
-  async function claimOnce(): Promise<Row | undefined> {
-    const [row] = await run(statements.claim, [name]);
-    return row;
+  /** L4 bounded by the stall: the row, or the timeout as a stall. */
+  async function claimOnce(): Promise<{ row: Row | undefined } | { stalled: Error }> {
+    const claimed = await within(deps, run(statements.claim, [name]), stallMs);
+    if (claimed === "timeout")
+      return { stalled: stalled(`the recovery claim for ${name}`, stallMs) };
+    return { row: claimed.value[0] };
   }
 
-  async function recover(): Promise<boolean> {
-    if (released) return false;
+  /**
+   * After an L4 on the backend the lock already had, following a probe that
+   * REJECTED: the level stacked only if the backend now holds two. Anything
+   * less (a backend restarted onto the same pid, an unlock_all) is a fresh
+   * take and the only level, so it stays. A re-probe that rejects cannot tell,
+   * so the level stays too: release()'s close frees a stacked one.
+   */
+  async function undoStackedLevel(): Promise<Error | undefined> {
+    let rows: Row[];
+    try {
+      const probed = await within(deps, run(L3), stallMs);
+      if (probed === "timeout") return stalled(`the ownership probe for ${name}`, stallMs);
+      rows = probed.value;
+    } catch {
+      return undefined;
+    }
+    if (Number(rows[0]?.pid) === pid && Number(rows[0]?.held) >= 2) await unlock(stallMs);
+    return undefined;
+  }
+
+  /** `probeRejected`: the gate's L3 rejected, so an L4 on the same pid may have stacked a level. */
+  async function recover(probeRejected: boolean): Promise<Recovery> {
+    if (released) return "released";
     if (recoveries >= slice.maxRecoveries) {
       emit({
         type: "lock.recovery_exhausted",
@@ -254,43 +303,55 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
         recoveries,
         max: slice.maxRecoveries,
       });
-      return false;
+      return "failed";
     }
     recoveries += 1;
     const attempt = recoveries;
-    let row: Row | undefined;
+    let claimed: { row: Row | undefined } | { stalled: Error };
     try {
-      row = await claimOnce();
+      claimed = await claimOnce();
     } catch (first) {
+      if (released) return "released";
       // The first query on a severed session may be the one that pays for
       // the reconnect, so one retry, with no second increment.
       emit({ type: "lock.recovery_retrying", name, attempt, ...failure(first) });
       try {
-        row = await claimOnce();
+        claimed = await claimOnce();
       } catch (second) {
+        if (released) return "released";
         emit({ type: "lock.recovery_failed", name, attempt, ...failure(second) });
-        return false;
+        return "failed";
       }
     }
+    if (released) return "released";
+    if ("stalled" in claimed) {
+      emit({ type: "lock.recovery_failed", name, attempt, ...failure(claimed.stalled) });
+      return claimed;
+    }
+    const { row } = claimed;
     if (row?.locked !== true) {
       emit({ type: "lock.recovery_refused", name, attempt, reason: "held" });
-      return false;
+      return "failed";
     }
     // Taking the lock again says nothing about the gap: only a fencing row
     // still naming this holder proves no other run took it meanwhile. The
     // advisory lock just taken is not ours to keep, so it goes now.
     if (row.holder !== holder) {
-      await unlock();
+      await unlock(stallMs);
       emit({ type: "lock.recovery_refused", name, attempt, reason: "displaced" });
-      return false;
+      return "failed";
     }
-    const next = Number(row.pid);
-    // The same backend means the lock was never lost and L4 stacked a second
-    // level on it: undo that one, so release()'s single L6 frees it.
-    if (next === pid) await unlock();
-    pid = next;
+    const before = pid;
+    // Assigned before any further await, so a keepalive tick that reads the
+    // new backend compares against it.
+    pid = Number(row.pid);
+    if (probeRejected && pid === before) {
+      const stall = await undoStackedLevel();
+      if (released) return "released";
+      if (stall !== undefined) return { stalled: stall };
+    }
     emit({ type: "lock.recovered", name, attempt, max: slice.maxRecoveries, pid });
-    return true;
+    return "recovered";
   }
 
   function latch(err: RootstockLockError): RootstockLockError {
@@ -299,28 +360,44 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
   }
 
   async function gate(): Promise<void> {
-    let row: Row | undefined;
+    let probe: { rows: Row[] } | { error: unknown } | "timeout";
     try {
-      [row] = await run(L3);
-    } catch (err) {
-      if (await recover()) return;
-      throw latch(refusals.unverifiable(name, err));
+      const probed = await within(deps, run(L3), stallMs);
+      probe = probed === "timeout" ? probed : { rows: probed.value };
+    } catch (error) {
+      probe = { error };
     }
-    if (lockOwnershipLost(row, pid)) {
-      if (await recover()) return;
-      throw latch(refusals.lost(name));
+    // After release() the lock is not held, whatever the probe read.
+    if (released) throw latch(refusals.lost(name));
+    if (probe === "timeout") {
+      throw latch(refusals.unverifiable(name, stalled(`the ownership probe for ${name}`, stallMs)));
     }
+    const refusal =
+      "error" in probe
+        ? refusals.unverifiable(name, probe.error)
+        : lockOwnershipLost(probe.rows[0], pid)
+          ? refusals.lost(name)
+          : undefined;
+    if (refusal === undefined) return;
+    const outcome = await recover("error" in probe);
+    if (outcome === "released") throw latch(refusals.lost(name));
+    if (outcome === "recovered") return;
+    throw latch(outcome === "failed" ? refusal : refusals.unverifiable(name, outcome.stalled));
   }
 
   function tick(): void {
     if (released || terminal !== undefined) return;
     const done = begin();
     if (done === null) return;
+    const asked = pid;
     void (async () => {
       try {
         const [row] = await run(L3);
         if (released) return;
         if (lockOwnershipLost(row, pid)) {
+          // A gate in flight owns this answer (it may be moving the lock to
+          // a new backend right now), so the tick reports nothing then.
+          if (gating !== undefined || pid !== asked) return;
           // Reported, never recovered: only the gate recovers.
           emit({
             type: "lock.session_lost",
@@ -351,29 +428,6 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     }
   }
 
-  /** L6, bounded by endTimeoutSeconds: a hung unlock is `lock.unlock_failed`, then close goes on. */
-  async function boundedUnlock(): Promise<void> {
-    const ms = slice.endTimeoutSeconds * 1000;
-    const cancel = new AbortController();
-    const unlocked = run(L6, [name]).then(() => "done" as const);
-    unlocked.catch(() => {});
-    const never = new Promise<never>(() => {});
-    try {
-      const outcome = await Promise.race([
-        unlocked,
-        pause(deps, ms, cancel.signal).then((slept) => (slept ? ("timeout" as const) : never)),
-      ]);
-      if (outcome === "timeout") {
-        const error = new Error(`rootstock lock: unlocking ${name} did not settle within ${ms} ms`);
-        emit({ type: "lock.unlock_failed", name, ...failure(error) });
-      }
-    } catch (error) {
-      emit({ type: "lock.unlock_failed", name, ...failure(error) });
-    } finally {
-      cancel.abort();
-    }
-  }
-
   return Object.freeze({
     name,
     holder,
@@ -396,10 +450,13 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
       released = true;
       try {
         stopKeepalive();
-        await boundedUnlock();
+        await unlock(slice.endTimeoutSeconds * 1000);
       } finally {
-        await closeQuietly(a, session, "release");
+        // The turn goes as soon as L6 is done or out of time: a close that
+        // hangs must not hold the next waiter (the database lock still does,
+        // until the session ends). The close is bounded by the driver.
         a.releaseTurn();
+        await closeQuietly(a, session, "release");
       }
     },
   });
