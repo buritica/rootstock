@@ -2,7 +2,7 @@ import type { Sql } from "../db/index.ts";
 import { perSlice } from "../internal/slice.ts";
 import { guarded } from "./errors.ts";
 import { type Emit, emitter, type QueueHooks } from "./events.ts";
-import { refuse, text } from "./input.ts";
+import { jsonValue, refuse, text } from "./input.ts";
 import { assertCursorTable, type CursorTable } from "./slice.ts";
 import { type CursorStatements, cursorStatements } from "./statements.ts";
 
@@ -20,23 +20,14 @@ function bound(emit: Emit, t: CursorTable, value: CursorValue): string {
   if (t.value === "text") {
     return text(emit, value, t.maxValueChars, "cursor value", "cursor_value_invalid");
   }
-  const bad =
-    value === undefined ||
-    typeof value === "function" ||
-    typeof value === "symbol" ||
-    typeof value === "bigint" ||
-    (typeof value === "number" && !Number.isFinite(value));
-  let json: string | undefined;
-  if (!bad) {
-    try {
-      json = JSON.stringify(value);
-    } catch {
-      json = undefined;
-    }
-  }
-  if (json === undefined) {
-    throw refuse(emit, "cursor_value_invalid", "cursor value must be a JSON value");
-  }
+  // The payload walk's rules, strict: a value JSON.stringify would drop,
+  // rewrite (NaN as null, a Map as {}) or the server would reject (NUL, a lone
+  // surrogate: 22P05, 22P02) refuses before any I/O.
+  const json = JSON.stringify(
+    jsonValue(value, true, () => {
+      throw refuse(emit, "cursor_value_invalid", "cursor value must be a JSON value");
+    }),
+  );
   if (json.length > t.maxValueChars) {
     throw refuse(
       emit,

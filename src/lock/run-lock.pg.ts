@@ -270,6 +270,40 @@ describe("acquire against a real server", () => {
     await lock.release();
   });
 
+  test("a gate right after a kill, with no settle, settles: recovered, LOST or UNVERIFIABLE", async () => {
+    // C-S1: postgres.js wedges a statement sent in the same turn as an
+    // ECONNRESET rejection. The gate rests after any rejection, so with no
+    // settle here it must still answer, and within a bound.
+    const BOUND_MS = 5_000;
+    for (let i = 0; i < 5; i += 1) {
+      const h = harness();
+      const lock = await take("alpha-sync", slice(), h);
+      await adminSql.unsafe("SELECT pg_terminate_backend($1)", [pidOf(h.events)]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        lock.ensureExclusive().then(
+          () => "recovered",
+          (err: unknown) => (err instanceof RootstockLockError ? err.code : String(err)),
+        ),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve("wedged"), BOUND_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+      expect(["recovered", "ERR_ROOTSTOCK_LOCK_LOST", "ERR_ROOTSTOCK_LOCK_UNVERIFIABLE"]).toContain(
+        outcome,
+      );
+      if (outcome === "recovered") {
+        expect(h.events.map((e) => e.type)).toContain("lock.recovered");
+      }
+      const releasedIn = Date.now();
+      await lock.release();
+      expect(Date.now() - releasedIn).toBeLessThan(BOUND_MS);
+      taken.splice(taken.indexOf(lock), 1);
+      expect(await held("alpha-sync")).toBe(false);
+    }
+  });
+
   test("R7: a pool of 2 posing as a session puts L1 and L2 on two backends: CONN", async () => {
     const s = slice();
     let l1Pid: number | undefined;

@@ -307,6 +307,25 @@ describe("QD2: claim", () => {
     expect((await q.row("alpha:quiet"))?.last_error).toBe("ExpiredClaim");
     expect(q.events.at(-1)).toMatchObject({ type: "queue.drained", claimed: 1, deadLettered: 2 });
   });
+
+  test("a reclaim at maxAttempts - 2 charges an attempt and does not dead-letter", async () => {
+    const q = await fresh();
+    await q.put("alpha:edge");
+    await claim(sql, q.s, { source: "alpha", limit: 1, worker: "worker-old" });
+    await sql.unsafe(
+      `UPDATE ${q.T} SET claimed_at = claimed_at - interval '31 minutes', attempts = 6`,
+    );
+    const rows = await claim(sql, q.s, { source: "alpha", limit: 1, worker: W }, q.hooks);
+    expect(rows.map((r) => [r.key, r.attempts, r.claimedBy])).toEqual([["alpha:edge", 7, W]]);
+    expect(q.types().slice(1)).toEqual(["queue.reclaimed", "queue.claimed", "queue.drained"]);
+    expect(await q.row("alpha:edge")).toMatchObject({
+      dead: false,
+      claimed: true,
+      claimed_by: W,
+      attempts: 7,
+      last_error: "ExpiredClaim",
+    });
+  });
 });
 
 describe("QD3: concurrent claimers", () => {
@@ -338,6 +357,9 @@ describe("QD3: concurrent claimers", () => {
 });
 
 describe("QD3: a held claim", () => {
+  // The SKIP LOCKED detector: without it the second claimer blocks on the
+  // first's uncommitted row locks. The 200-row duplicate check above stays
+  // green either way, because a blocked FOR UPDATE re-checks and skips.
   test("a claimer takes other rows at once while another's claim is uncommitted", async () => {
     const q = await fresh();
     await sql.unsafe(
@@ -637,6 +659,56 @@ describe("QD8: enqueue inside a caller's transaction", () => {
     });
     expect(setting).toBe("7s");
     expect(await q.row("alpha:tx")).toBeDefined();
+  });
+
+  test("a contended enqueue leaves the caller's transaction usable, lock_timeout unchanged", async () => {
+    const q = await fresh();
+    await q.put("alpha:held", { payload: { v: 1 } });
+    const holder = openSecond();
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => {
+      locked = r;
+    });
+    let release!: () => void;
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    const holding = holder.transactor.begin(async (tx) => {
+      await tx.unsafe(`SELECT key FROM ${q.T} WHERE key = 'alpha:held' FOR UPDATE`);
+      locked();
+      await hold;
+    });
+    try {
+      await isLocked;
+      const after = await main.transactor.begin(async (tx) => {
+        await tx.unsafe("SET LOCAL lock_timeout = '7s'");
+        const r = await enqueue(
+          tx,
+          q.s,
+          {
+            key: "alpha:held",
+            source: "alpha",
+            kind: "put",
+            payload: { v: 2 },
+            debounceSeconds: 0,
+          },
+          q.hooks,
+        );
+        const [lt] = await tx.unsafe("SELECT current_setting('lock_timeout') AS v");
+        await tx.unsafe(
+          `INSERT INTO ${q.T} (key, source, kind) VALUES ('alpha:after', 'alpha', 'put')`,
+        );
+        return { r, lockTimeout: lt?.v };
+      });
+      expect(after).toEqual({ r: "contended", lockTimeout: "7s" });
+      expect(q.events.at(-1)).toMatchObject({ type: "queue.contended", key: "alpha:held" });
+    } finally {
+      release();
+      await holding;
+      await holder.close();
+    }
+    expect(await q.row("alpha:after")).toBeDefined();
+    expect((await q.row("alpha:held"))?.payload).toEqual({ v: 1 });
   });
 
   test("under drizzle, through a transactor built over a drizzle transaction", async () => {

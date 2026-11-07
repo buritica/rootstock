@@ -71,6 +71,8 @@ const num = (v: unknown): number | null => (v === null || v === undefined ? null
 const date = (v: unknown): Date | null =>
   v === null || v === undefined ? null : new Date(Number(v));
 const str = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
+/** A boolean column: a driver that hands back text gives "t" or "true". */
+const bool = (v: unknown): boolean => v === true || v === "t" || v === "true";
 
 /**
  * Q1. Enqueues or coalesces one row under a bounded lock wait, in one scope:
@@ -105,7 +107,9 @@ export async function enqueue(
       try {
         await tx.unsafe(LOCK_TIMEOUT_SET, [String(current?.v ?? "0")]);
       } catch {
-        // The scope is already failing; its own error is the one to report.
+        // On a failing scope its own error is the one to report. On the
+        // success path a failed restore leaves the transaction aborted, so
+        // the commit or savepoint release that follows rejects and reports it.
       }
     }
   };
@@ -119,8 +123,7 @@ export async function enqueue(
     emit({ type: "queue.contended", key: c.key, source: c.source, kind: c.kind });
     return "contended";
   }
-  const result =
-    row?.on_dead === true ? "on_dead" : row?.inserted === true ? "inserted" : "coalesced";
+  const result = bool(row?.on_dead) ? "on_dead" : bool(row?.inserted) ? "inserted" : "coalesced";
   emit({
     type: "queue.enqueued",
     key: c.key,
@@ -166,7 +169,7 @@ export async function claim(
     const source = String(r.source);
     const kind = String(r.kind);
     const attempts = Number(r.attempts);
-    if (r.dead === true) {
+    if (bool(r.dead)) {
       deadLettered += 1;
       emit({
         type: "queue.dead",
@@ -291,7 +294,7 @@ export async function fail(
     attempts,
     error: errorClass,
   });
-  const dead = row.dead === true;
+  const dead = bool(row.dead);
   if (dead) {
     emit({
       type: "queue.dead",

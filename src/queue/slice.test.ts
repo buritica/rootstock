@@ -234,7 +234,7 @@ describe("queueSlice", () => {
 describe("cursorTable", () => {
   test("parses under its own parser name and defaults", () => {
     const t = cursorTable(
-      { value: "text", maxNameChars: 10, maxValueChars: 20 },
+      { value: "jsonb", maxNameChars: 10, maxValueChars: 20 },
       { schema: "app" },
     );
     expect(t.table).toEqual({ schema: "app", name: "cursors" });
@@ -245,5 +245,40 @@ describe("cursorTable", () => {
     expect(
       refusal(() => cursorTable({ value: "x", maxNameChars: 1, maxValueChars: 1 } as never)),
     ).toBe('cursorTable: value must be "text" or "jsonb" — got "x"');
+  });
+
+  test('"text" on the shipped (jsonb) table refuses; a named text table parses', () => {
+    const shipped =
+      'cursorTable: value must be "jsonb" for the shipped cursors table (its value column is jsonb); name your own text table in table.name to use "text" — got "text"';
+    for (const table of [undefined, {}, { schema: "app" }]) {
+      expect(
+        refusal(() => cursorTable({ table, value: "text", maxNameChars: 1, maxValueChars: 1 })),
+      ).toBe(shipped);
+    }
+    expect(
+      refusal(() =>
+        queueSlice({
+          ...QUEUE_INPUT,
+          cursors: { value: "text", maxNameChars: 1, maxValueChars: 1 },
+        }),
+      ),
+    ).toBe(shipped.replace("cursorTable: value", "queueSlice: cursors.value"));
+    const t = cursorTable({
+      table: { name: "text_cursors" },
+      value: "text",
+      maxNameChars: 1,
+      maxValueChars: 1,
+    });
+    expect(t.table).toEqual({ schema: "rootstock", name: "text_cursors" });
+  });
+
+  test("a default schema that is not an identifier refuses at table.schema", () => {
+    const input = { value: "jsonb", maxNameChars: 1, maxValueChars: 1 } as const;
+    expect(refusal(() => cursorTable(input, { schema: "Bad" }))).toBe(
+      `cursorTable: table.schema must be ${E_ID} — got "Bad"`,
+    );
+    expect(refusal(() => queueSlice(QUEUE_INPUT, { schema: 'x"; DROP' }))).toBe(
+      `queueSlice: table.schema must be ${E_ID} — got "x\\"; DROP"`,
+    );
   });
 });

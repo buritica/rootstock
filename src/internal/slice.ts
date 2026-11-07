@@ -211,13 +211,14 @@ export function tableRef(
   schema: string,
   name: string,
 ): { readonly schema: string; readonly name: string } {
-  if (raw === undefined) return Object.freeze({ schema, name });
-  const table = refuse.record(`${at}table`, raw);
+  const table = raw === undefined ? {} : refuse.record(`${at}table`, raw);
   refuse.refuseUnknownKeys(table, TABLE_KEYS, `${at}table.`);
+  // The default schema comes from the caller's `defaults`, so it is checked
+  // like a given one: a direct slice caller can pass anything there.
   const s = own(table, "schema");
   const n = own(table, "name");
   return Object.freeze({
-    schema: s === undefined ? schema : identifier(refuse, `${at}table.schema`, s),
-    name: n === undefined ? name : identifier(refuse, `${at}table.name`, n),
+    schema: identifier(refuse, `${at}table.schema`, s === undefined ? schema : s),
+    name: identifier(refuse, `${at}table.name`, n === undefined ? name : n),
   });
 }

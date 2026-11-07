@@ -65,7 +65,9 @@ export const refusals = {
   name: (slice: LockSlice, name: unknown) =>
     new RootstockLockError(
       "ERR_ROOTSTOCK_LOCK_NAME",
-      String(name),
+      // String() throws on an object whose toString does; q never throws (but
+      // answers undefined for undefined and functions).
+      typeof name === "string" ? name : (q(name) ?? "undefined"),
       `rootstock lock: ${q(name)} is not a lock this config declares — declared: ${slice.names.join(", ")}`,
     ),
   wait: (slice: LockSlice, name: string, summary: unknown) =>

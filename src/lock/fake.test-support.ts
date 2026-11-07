@@ -15,13 +15,17 @@ export type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[] | Pr
 
 export interface FakeSession extends LockSession {
   readonly seen: StatementId[];
+  /** Each statement's id with the params it was sent, in order. */
+  readonly calls: { id: StatementId; params: readonly unknown[] }[];
   readonly closes: number;
   answer(id: StatementId, ...answers: Answer[]): void;
   failClose(err: Error): void;
 }
 
 export const PID = 4242;
+/** The first uuid each fakeDeps hands out; later ones count up from it. */
 export const HOLDER = "00000000-0000-4000-8000-000000000001";
+const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
 
 export function fakeSession(table = { schema: "rootstock", name: "run_locks" }): FakeSession {
   const t = tableStatements(table);
@@ -47,12 +51,14 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
   };
   const queues = new Map<StatementId, Answer[]>();
   const seen: StatementId[] = [];
+  const calls: { id: StatementId; params: readonly unknown[] }[] = [];
   let closes = 0;
   let closeError: Error | undefined;
   const unsafe = async (query: string, params?: readonly unknown[]): Promise<Row[]> => {
     const id = ids.get(query);
     if (id === undefined) throw new Error(`fake session: unknown statement ${query}`);
     seen.push(id);
+    calls.push({ id, params: [...(params ?? [])] });
     const answer = queues.get(id)?.shift() ?? defaults[id];
     if (answer instanceof Error) throw answer;
     return typeof answer === "function" ? answer(params ?? []) : answer;
@@ -66,6 +72,7 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
   return {
     sql,
     seen,
+    calls,
     get closes() {
       return closes;
     },
@@ -94,6 +101,7 @@ export function fakeDeps(over: Partial<LockDeps> = {}): FakeDeps {
   const events: LockEvent[] = [];
   const timers = new Map<number, () => void>();
   let next = 1;
+  let uuids = 0;
   const deps: FakeDeps = {
     clock: 1_000_000,
     events,
@@ -107,7 +115,10 @@ export function fakeDeps(over: Partial<LockDeps> = {}): FakeDeps {
     clearInterval: (handle) => {
       timers.delete(handle as number);
     },
-    randomUUID: () => HOLDER,
+    randomUUID: () => {
+      uuids += 1;
+      return uuid(uuids);
+    },
     sleep: async (ms, signal) => {
       if (signal?.aborted) return;
       deps.clock += ms;

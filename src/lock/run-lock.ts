@@ -69,6 +69,33 @@ export async function closeQuietly(
   }
 }
 
+/**
+ * `deps.sleep`, made safe: true when it resolved, false when it threw or
+ * rejected (a sleep built on timers/promises rejects on abort). A broken
+ * sleep must not leak a session or a turn, so nothing here ever throws.
+ */
+export async function pause(deps: LockDeps, ms: number, signal?: AbortSignal): Promise<boolean> {
+  try {
+    await deps.sleep(ms, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How long a session rests after a rejected statement before it sends the
+ * next one. postgres.js wedges a query sent in the same turn as an ECONNRESET
+ * rejection (C-S1, session.pg.ts X1w); 5 ms was enough in every measured case.
+ */
+export const SETTLE_MS = 20;
+
+/** The backend pid off an L1 row, or undefined when it is not a positive integer. */
+export function pidIn(row: Row | undefined): number | undefined {
+  const pid = Number(row?.pid);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 /** Step 0's checks that need no I/O: the brand, then the name. */
 function validate(slice: LockSlice, name: string, deps: LockDeps): Attempt {
   const statements = statementsOf("acquireRunLock", slice);
@@ -115,13 +142,32 @@ export async function acquireRunLock(
     await closeQuietly(a, session, "refusal");
     throw refused(a, refusals.malfunction(name, locked));
   }
-  return fence(a, session, Number(row?.pid));
+  const pid = pidIn(row);
+  if (pid === undefined) {
+    // A lock taken on a backend that cannot name itself is a malfunction,
+    // not a pool: the answer is the pid it gave.
+    await closeQuietly(a, session, "refusal");
+    throw refused(a, refusals.malfunction(name, row?.pid));
+  }
+  return fence(a, session, pid);
 }
 
-/** Steps 5-7: write the fencing row on the backend that took the lock, and hand the lock out. */
+/**
+ * Steps 5-7: write the fencing row on the backend that took the lock, and
+ * hand the lock out. Owns the session from here: every throw closes it and
+ * releases the turn first.
+ */
 export async function fence(a: Attempt, session: LockSession, pid: number): Promise<RunLock> {
   const { name } = a;
-  const holder = a.deps.randomUUID();
+  let holder: string;
+  try {
+    // Postgres prints a uuid in lowercase; the recovery compare is by text.
+    holder = String(a.deps.randomUUID()).toLowerCase();
+  } catch (err) {
+    await closeQuietly(a, session, "acquire-error");
+    a.releaseTurn();
+    throw err;
+  }
   let row: Row | undefined;
   try {
     [row] = await session.sql.unsafe(a.statements.fence, [name, holder]);
@@ -163,14 +209,44 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
   let recoveries = 0;
   let keepalive: { handle: unknown } | undefined;
   let released = false;
+  /** Set once a gate refuses: every later gate rethrows it, with no I/O. */
+  let terminal: RootstockLockError | undefined;
+  /** The gate in flight, shared by concurrent callers so one blip recovers once. */
+  let gating: Promise<void> | undefined;
+  /** The last statement on this session rejected: rest before the next one. */
+  let rejected = false;
   const begin = probeGuard(slice.probeStallSeconds * 1000, deps.now);
 
+  /** Every statement after the fence goes through here (the C-S1 settle). */
+  async function run(text: string, params?: readonly unknown[]): Promise<Row[]> {
+    if (rejected) {
+      rejected = false;
+      await pause(deps, SETTLE_MS);
+    }
+    try {
+      return await sql.unsafe(text, params);
+    } catch (err) {
+      rejected = true;
+      throw err;
+    }
+  }
+
+  /** L6, best effort: a failure is `lock.unlock_failed`. */
+  async function unlock(): Promise<void> {
+    try {
+      await run(L6, [name]);
+    } catch (error) {
+      emit({ type: "lock.unlock_failed", name, ...failure(error) });
+    }
+  }
+
   async function claimOnce(): Promise<Row | undefined> {
-    const [row] = await sql.unsafe(statements.claim, [name]);
+    const [row] = await run(statements.claim, [name]);
     return row;
   }
 
   async function recover(): Promise<boolean> {
+    if (released) return false;
     if (recoveries >= slice.maxRecoveries) {
       emit({
         type: "lock.recovery_exhausted",
@@ -202,22 +278,48 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     }
     // Taking the lock again says nothing about the gap: only a fencing row
     // still naming this holder proves no other run took it meanwhile. The
-    // advisory lock just taken goes when the session closes.
+    // advisory lock just taken is not ours to keep, so it goes now.
     if (row.holder !== holder) {
+      await unlock();
       emit({ type: "lock.recovery_refused", name, attempt, reason: "displaced" });
       return false;
     }
-    pid = Number(row.pid);
+    const next = Number(row.pid);
+    // The same backend means the lock was never lost and L4 stacked a second
+    // level on it: undo that one, so release()'s single L6 frees it.
+    if (next === pid) await unlock();
+    pid = next;
     emit({ type: "lock.recovered", name, attempt, max: slice.maxRecoveries, pid });
     return true;
   }
 
+  function latch(err: RootstockLockError): RootstockLockError {
+    terminal ??= err;
+    return terminal;
+  }
+
+  async function gate(): Promise<void> {
+    let row: Row | undefined;
+    try {
+      [row] = await run(L3);
+    } catch (err) {
+      if (await recover()) return;
+      throw latch(refusals.unverifiable(name, err));
+    }
+    if (lockOwnershipLost(row, pid)) {
+      if (await recover()) return;
+      throw latch(refusals.lost(name));
+    }
+  }
+
   function tick(): void {
+    if (released || terminal !== undefined) return;
     const done = begin();
     if (done === null) return;
     void (async () => {
       try {
-        const [row] = await sql.unsafe(L3);
+        const [row] = await run(L3);
+        if (released) return;
         if (lockOwnershipLost(row, pid)) {
           // Reported, never recovered: only the gate recovers.
           emit({
@@ -229,9 +331,9 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
           });
           return;
         }
-        await sql.unsafe(statements.heartbeat, [name, holder]);
+        await run(statements.heartbeat, [name, holder]);
       } catch (error) {
-        emit({ type: "lock.keepalive_failed", name, ...failure(error) });
+        if (!released) emit({ type: "lock.keepalive_failed", name, ...failure(error) });
       } finally {
         done();
       }
@@ -249,38 +351,56 @@ function held(a: Attempt, session: LockSession, firstPid: number, holder: string
     }
   }
 
+  /** L6, bounded by endTimeoutSeconds: a hung unlock is `lock.unlock_failed`, then close goes on. */
+  async function boundedUnlock(): Promise<void> {
+    const ms = slice.endTimeoutSeconds * 1000;
+    const cancel = new AbortController();
+    const unlocked = run(L6, [name]).then(() => "done" as const);
+    unlocked.catch(() => {});
+    const never = new Promise<never>(() => {});
+    try {
+      const outcome = await Promise.race([
+        unlocked,
+        pause(deps, ms, cancel.signal).then((slept) => (slept ? ("timeout" as const) : never)),
+      ]);
+      if (outcome === "timeout") {
+        const error = new Error(`rootstock lock: unlocking ${name} did not settle within ${ms} ms`);
+        emit({ type: "lock.unlock_failed", name, ...failure(error) });
+      }
+    } catch (error) {
+      emit({ type: "lock.unlock_failed", name, ...failure(error) });
+    } finally {
+      cancel.abort();
+    }
+  }
+
   return Object.freeze({
     name,
     holder,
-    async ensureExclusive(): Promise<void> {
-      let row: Row | undefined;
-      try {
-        [row] = await sql.unsafe(L3);
-      } catch (err) {
-        if (await recover()) return;
-        throw refusals.unverifiable(name, err);
-      }
-      if (lockOwnershipLost(row, pid)) {
-        if (await recover()) return;
-        throw refusals.lost(name);
-      }
+    ensureExclusive(): Promise<void> {
+      if (terminal !== undefined) return Promise.reject(terminal);
+      // After release() the lock is not held; saying so needs no I/O.
+      if (released) return Promise.reject(latch(refusals.lost(name)));
+      gating ??= gate().finally(() => {
+        gating = undefined;
+      });
+      return gating;
     },
     startKeepalive(): void {
-      if (keepalive !== undefined || released) return;
+      if (keepalive !== undefined || released || terminal !== undefined) return;
       keepalive = { handle: deps.setInterval(tick, slice.heartbeatSeconds * 1000) };
     },
     stopKeepalive,
     async release(): Promise<void> {
       if (released) return;
       released = true;
-      stopKeepalive();
       try {
-        await sql.unsafe(L6, [name]);
-      } catch (error) {
-        emit({ type: "lock.unlock_failed", name, ...failure(error) });
+        stopKeepalive();
+        await boundedUnlock();
+      } finally {
+        await closeQuietly(a, session, "release");
+        a.releaseTurn();
       }
-      await closeQuietly(a, session, "release");
-      a.releaseTurn();
     },
   });
 }

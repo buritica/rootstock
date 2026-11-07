@@ -96,8 +96,9 @@ describe("poll wait against a real server", () => {
       wait: { mode: "poll", ms: 2000, turns: createTurnQueue() },
     });
     await Bun.sleep(200);
-    const releasedAt = Date.now();
     await holder.release();
+    // Measured from release()'s resolution: its close is not the waiter's lag.
+    const releasedAt = Date.now();
     const lock = await waiting;
     const lag = Date.now() - releasedAt;
     expect(lag).toBeLessThanOrEqual(POLL_MS + 25);

@@ -106,24 +106,41 @@ const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
 };
 // A name read as a value. A property access (`deps.setInterval(...)`) and a
 // key (`setInterval: …`, `setInterval?: …`) are not the global, and an
-// injected dependency is declared and called exactly that way. A ternary
-// branch (`slow ? setTimeout : noop`) looks like a key but is a read, so a
-// name right after `?` is a read whatever follows it. AbortSignal is a type
-// the injected `sleep` takes, so it is a value only outside a type annotation
-// (`signal?: AbortSignal`, `| AbortSignal`); a regex cannot tell an annotation
-// from a ternary's `: AbortSignal` branch, which is why shipped code spells
-// the name in pieces where it needs the text.
-// `Date` is a clock only when read: `Date.now()`, `new Date()` and `Date()`.
-// `new Date(ms)`, `instanceof Date` and the type are not.
+// injected dependency is declared and called exactly that way. A name before
+// `:` is a key only in key position: at the start of a line or right after
+// `{`, `,`, `;` or `(`. Anywhere else (`slow ? setTimeout : noop`,
+// `slow ? 0 || setTimeout : noop`) it is a ternary branch, so a read.
 const GLOBAL_NAMES =
   "fetch|setTimeout|setInterval|setImmediate|queueMicrotask|performance|Math\\.random|crypto|process|console|Bun|globalThis|require";
+const NOT_MEMBER = "(?<![.\\w$])";
+const KEY_POSITION = "(?:^|[{,;(])\\s*";
+// AbortSignal and Date are also types, and a type is no read. A type position
+// is after `:`, `<`, `as`, `satisfies`, or a single `|` or `&` (never
+// `||`/`&&`), and the type
+// ends at a terminator. Member access (`AbortSignal.timeout`, `Date['now']`)
+// is a read whatever precedes it; `X[]` is the array type. A regex cannot
+// tell an annotation from a ternary's `: AbortSignal;` branch, which is why
+// shipped code spells the name in pieces where it needs the text.
+const TYPE_POSITION = "(?:[:<]|(?<![|&])[|&]|\\b(?:as|satisfies)\\s)\\s*";
+const TYPE_END = "(?=\\s*(?:[;,)|&>=\\]}]|\\[\\s*\\]|$))";
+const MEMBER = "\\s*(?:\\??\\.|\\[(?!\\s*\\]))";
+const NO_MEMBER_OR_CALL = "(?!\\s*(?:\\??\\.|\\[|\\())";
+// `Date` is a clock when read as a value: `Date.now()`, `Date['now']`,
+// `Date()`, `new Date()`, `new Date` and `const D = Date`. `new Date(ms)`,
+// `Date.UTC(...)`, `instanceof Date` and the type are not.
 const FORBIDDEN_GLOBALS = new RegExp(
   [
-    `(?<![.\\w$])\\b(${GLOBAL_NAMES})\\b(?!\\s*\\??:)`,
-    `(?<=\\?\\s*)(?<![.\\w$])\\b(${GLOBAL_NAMES})\\b`,
-    "(?<![.\\w$]|:\\s?|\\|\\s?)\\bAbortSignal\\b",
-    "(?<![.\\w$]|new\\s)\\bDate\\s*(\\.\\s*now\\b|\\()",
+    `${NOT_MEMBER}\\b(${GLOBAL_NAMES})\\b(?!\\s*\\??:)`,
+    `(?<!${KEY_POSITION})${NOT_MEMBER}\\b(${GLOBAL_NAMES})\\b(?=\\s*\\??:)`,
+    `${NOT_MEMBER}\\bAbortSignal${MEMBER}`,
+    `${NOT_MEMBER}(?<!${TYPE_POSITION})\\bAbortSignal\\b(?!\\s*(?:\\??\\.|\\[))`,
+    `(?<=${TYPE_POSITION})\\bAbortSignal\\b(?!${TYPE_END}|${MEMBER})`,
+    `${NOT_MEMBER}\\bDate\\s*\\??\\.\\s*now\\b`,
+    `${NOT_MEMBER}\\bDate\\s*\\[(?!\\s*\\])`,
+    `${NOT_MEMBER}(?<!\\bnew\\s+)\\bDate\\s*\\(`,
     "\\bnew\\s+Date\\s*(\\(\\s*\\)|(?!\\s*\\())",
+    `${NOT_MEMBER}(?<!\\bnew\\s+|\\binstanceof\\s+|${TYPE_POSITION})\\bDate\\b${NO_MEMBER_OR_CALL}`,
+    `(?<=${TYPE_POSITION})\\bDate\\b(?!${TYPE_END}|\\s*\\??\\.|\\s*\\[)`,
   ].join("|"),
 );
 
@@ -132,26 +149,119 @@ test("the purity scan tells a read from a key", () => {
     "const t = slow ? setTimeout : noop;",
     "const t = slow?setTimeout:noop;",
     "const t = slow ? noop : setTimeout;",
+    "const t = slow ? 0 || setTimeout : noop;",
+    "    ? setTimeout : noop",
     "setInterval(fn, 1);",
     "const r = Math.random();",
     "x instanceof AbortSignal",
+    "fn({ signal: AbortSignal.timeout(1000) });",
+    "const s = a || AbortSignal.timeout(5);",
+    "const s = a | AbortSignal.any([]);",
+    "const s = AbortSignal['timeout'](5);",
+    "const S = AbortSignal;",
+    "const S = a || AbortSignal;",
     "const now = Date.now();",
+    "const now = Date['now']();",
+    "const now = Date?.now();",
+    "const D = Date;",
+    "const D = a || Date;",
+    "const s = Date();",
     "const d = new Date();",
+    "const d = new Date;",
   ];
   const keys = [
     "setInterval: (fn: () => void, ms: number) => unknown;",
     "  setTimeout?: typeof noop,",
+    "{ setTimeout: st, fetch: f }",
     "deps.setInterval(tick, 5);",
     "a?.setTimeout(fn)",
     "sleep: (ms: number, signal?: AbortSignal) => Promise<void>;",
+    "signal: AbortSignal | undefined,",
+    "{ signal: AbortSignal }",
+    "const all: AbortSignal[] = [];",
+    "type T = Promise<AbortSignal>;",
+    "type U = X & AbortSignal;",
     "const d = new Date(ms);",
+    "if (node instanceof Date) return node.toISOString();",
+    "at: Date;",
+    "notBefore: date(ms) as Date,",
+    "const t = Date.UTC(2026, 0, 1);",
+    "const u = 'http://example.test/';",
   ];
   expect(reads.filter((line) => !FORBIDDEN_GLOBALS.test(line))).toEqual([]);
   expect(keys.filter((line) => FORBIDDEN_GLOBALS.test(line))).toEqual([]);
 });
 
+test("the scan reads code: comments and quoted text go, templates, regexes and lines stay", () => {
+  const src = [
+    'const u = "http://x"; fetch(u);',
+    "const v = 'a//b'; // gone",
+    "const w = `c//d`; /* gone",
+    "still gone */ const re = /\\/\\//; setTimeout(f); // gone",
+  ].join("\n");
+  expect(stripComments(src).split("\n")).toEqual([
+    'const u = "        "; fetch(u);',
+    "const v = '    '; ",
+    "const w = `c//d`; ",
+    " const re = /\\/\\//; setTimeout(f); ",
+  ]);
+});
+
+// A `/` starts a regex literal after one of these (or at the start), and is
+// division after anything else (an identifier, a number, `)` or `]`).
+const REGEX_PRECEDER = /^$|[(,=:[!&|?{};+\-*%<>~^]$/;
+
+// The index just past the string, template or regex literal opened at `start`.
+function literalEnd(source: string, start: number): number {
+  const open = source[start];
+  let inClass = false;
+  let i = start + 1;
+  while (i < source.length) {
+    const c = source[i];
+    if (c === "\\") {
+      i += 2;
+      continue;
+    }
+    if (c === "\n" && open !== "`") return i;
+    if (open === "/" && c === "[") inClass = true;
+    else if (open === "/" && c === "]") inClass = false;
+    else if (c === open && !inClass) return i + 1;
+    i++;
+  }
+  return i;
+}
+
+// The code a scan reads: `//` and `/* */` comments outside literals are
+// dropped (a block comment keeps its newlines, so line numbers stay true) and
+// a quoted string's text is blanked, since `"Date"` names nothing.
 function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  let out = "";
+  let prev = "";
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i] ?? "";
+    const next = source[i + 1];
+    if (c === "/" && next === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+    } else if (c === "/" && next === "*") {
+      const close = source.indexOf("*/", i + 2);
+      const end = close < 0 ? source.length : close + 2;
+      out += source.slice(i, end).replace(/[^\n]/g, "");
+      i = end;
+    } else if (c === '"' || c === "'" || c === "`" || (c === "/" && REGEX_PRECEDER.test(prev))) {
+      const end = literalEnd(source, i);
+      const text = source.slice(i, end);
+      // A quoted string's text is no code; a template's `${…}` is, so it stays.
+      out += c === '"' || c === "'" ? `${c}${" ".repeat(Math.max(0, text.length - 2))}${c}` : text;
+      prev = c;
+      i = end;
+    } else {
+      out += c;
+      if (!/\s/.test(c)) prev = c;
+      i++;
+    }
+  }
+  return out;
 }
 
 describe("pure subpaths (every clock, timer and I/O is injected)", () => {

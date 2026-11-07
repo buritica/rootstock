@@ -346,3 +346,137 @@ describe("poll", () => {
     await lock.release();
   });
 });
+
+describe("hardening: a waited acquire cleans up on every path", () => {
+  /** fakeDeps whose sleep rejects, with a clock that moves on every read. */
+  const rejectingSleep = () => {
+    const deps = fakeDeps({
+      sleep: async () => {
+        throw new Error("sleep");
+      },
+    });
+    deps.now = () => {
+      deps.clock += 10;
+      return deps.clock;
+    };
+    return deps;
+  };
+
+  test("a rejecting sleep between polls closes the session and frees the turn", async () => {
+    const turns = createTurnQueue();
+    const s = fakeSession();
+    s.answer("L1", ...Array.from({ length: 500 }, () => [{ locked: false, pid: PID }]));
+    const first = waiter(rejectingSleep(), { turns, ms: 200 }, s);
+    expect((await refusal(first.acquire)).code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
+    expect(s.closes).toBe(1);
+    const next = waiter(fakeDeps(), { turns });
+    await next.acquire;
+    expect(next.opens()).toBe(1);
+  });
+
+  test("a rejecting sleep while queued gives up and frees the turn", async () => {
+    const turns = createTurnQueue();
+    const holder = waiter(fakeDeps(), { turns });
+    const ahead = await holder.acquire;
+    const quitter = waiter(rejectingSleep(), { turns });
+    expect((await refusal(quitter.acquire)).code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
+    expect(quitter.opens()).toBe(0);
+    const deps = manualDeps();
+    const next = waiter(deps, { turns });
+    await ahead.release();
+    await deps.advance(0);
+    expect(next.opens()).toBe(1);
+    await (await next.acquire).release();
+  });
+
+  test("a throwing randomUUID after a successful poll closes the session and frees the turn", async () => {
+    const turns = createTurnQueue();
+    const boom = new Error("no entropy");
+    const deps = fakeDeps({
+      randomUUID: () => {
+        throw boom;
+      },
+    });
+    const w = waiter(deps, { turns });
+    expect(await caught(w.acquire)).toBe(boom);
+    expect(w.session.closes).toBe(1);
+    const next = waiter(fakeDeps(), { turns });
+    await next.acquire;
+    expect(next.opens()).toBe(1);
+  });
+
+  test("an abort that lands during the fence gives the lock back and refuses ABANDONED", async () => {
+    const s = fakeSession();
+    const ac = new AbortController();
+    s.answer("L2", () => {
+      ac.abort();
+      return [{ pid: PID }];
+    });
+    const deps = fakeDeps();
+    const turns = createTurnQueue();
+    const err = await refusal(waiter(deps, { turns, signal: ac.signal }, s).acquire);
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+    expect(s.seen).toEqual(["L1", "L2", "L6"]);
+    expect(s.closes).toBe(1);
+    expect(deps.events.map((e) => e.type)).toEqual(["lock.wait", "lock.acquired", "lock.refused"]);
+    const next = waiter(fakeDeps(), { turns });
+    await next.acquire;
+    expect(next.opens()).toBe(1);
+  });
+
+  test("an abort wins over a deadline reached in the same poll", async () => {
+    const s = fakeSession();
+    const ac = new AbortController();
+    s.answer("L1", () => {
+      ac.abort();
+      return [{ locked: false, pid: PID }];
+    });
+    const err = await refusal(
+      waiter(fakeDeps(), { turns: createTurnQueue(), signal: ac.signal, ms: 0 }, s).acquire,
+    );
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_ABANDONED");
+  });
+
+  test("a forged signal refuses WAIT", async () => {
+    const forged = { [Symbol.toStringTag]: "AbortSignal" };
+    let opens = 0;
+    const err = await refusal(
+      acquireRunLock(
+        () => {
+          opens += 1;
+          return fakeSession();
+        },
+        SLICE,
+        "alpha-sync",
+        fakeDeps(),
+        {
+          wait: {
+            mode: "poll",
+            ms: 10,
+            turns: createTurnQueue(),
+            signal: forged as unknown as AbortSignal,
+          },
+        },
+      ),
+    );
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_WAIT");
+    expect(opens).toBe(0);
+  });
+
+  test("the wait is read once: a getter cannot widen ms after validation", async () => {
+    let reads = 0;
+    const wait = {
+      mode: "poll" as const,
+      turns: createTurnQueue(),
+      get ms() {
+        reads += 1;
+        return reads === 1 ? 0 : 1000;
+      },
+    };
+    const s = fakeSession();
+    s.answer("L1", ...Array.from({ length: 50 }, () => [{ locked: false, pid: PID }]));
+    const err = await refusal(acquireRunLock(() => s, SLICE, "alpha-sync", fakeDeps(), { wait }));
+    expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_HELD");
+    expect(s.seen).toEqual(["L1"]);
+  });
+});

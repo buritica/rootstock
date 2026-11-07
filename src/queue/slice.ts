@@ -179,6 +179,15 @@ function parseCursor(
     1,
     1_048_576,
   );
+  // Last, after every field: a defaulted name is rootstock's shipped table, whose value column is jsonb.
+  const raw = own(fields, "table");
+  if (value === "text" && (!isRecord(raw) || own(raw, "name") === undefined)) {
+    throw refuse.invalid(
+      `${at}value`,
+      '"jsonb" for the shipped cursors table (its value column is jsonb); name your own text table in table.name to use "text"',
+      value,
+    );
+  }
   return cursorBrand.mark(
     Object.freeze({ table, value, maxNameChars, maxValueChars }) as unknown as CursorTable,
   );

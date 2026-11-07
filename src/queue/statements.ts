@@ -5,7 +5,9 @@ import { quoteTable } from "../internal/slice.ts";
  * table. Statements carry no comment and no `$` outside a placeholder.
  * JSON parameters are bound as text and cast server-side
  * (`$n::text::jsonb`): bound straight to a jsonb parameter, both drivers
- * would encode the string again and store a JSON string.
+ * would encode the string again and store a JSON string. A text cursor binds
+ * `$2::text`, so a text table that is really jsonb fails 42804 on every driver
+ * instead of storing a quoted string on some and raising 22P02 on another.
  */
 
 export const LOCK_TIMEOUT_READ = "SELECT current_setting('lock_timeout') AS v";
@@ -173,7 +175,7 @@ export function cursorStatements(
   value: "text" | "jsonb",
 ): CursorStatements {
   const C = quoteTable(table);
-  const V = value === "text" ? "$2" : "$2::text::jsonb";
+  const V = value === "text" ? "$2::text" : "$2::text::jsonb";
   return Object.freeze({
     get: `SELECT value::text AS value FROM ${C} WHERE name = $1`,
     set: `INSERT INTO ${C} (name, value, updated_at)

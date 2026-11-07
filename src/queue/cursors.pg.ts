@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { Sql } from "../db/index.ts";
+import { pgCode, type Sql } from "../db/index.ts";
 import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-support.ts";
 import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
@@ -121,6 +121,26 @@ describe("KD1: cursors", () => {
     expect(r.events).toEqual([
       { type: "queue.refused", key: null, source: null, reason: "cursor_value_invalid" },
     ]);
+  });
+
+  test("a text cursor naming a jsonb table fails 42804 on every driver, storing nothing", async () => {
+    const wrong = cursorTable(
+      { table: { name: "cursors" }, value: "text", maxNameChars: 128, maxValueChars: 512 },
+      { schema: jsonT.table.schema },
+    );
+    for (const call of [
+      () => setCursor(sql, wrong, "text-on-jsonb", "v"),
+      () => touchCursor(sql, wrong, "text-on-jsonb", "v"),
+    ]) {
+      let err: unknown;
+      try {
+        await call();
+      } catch (e) {
+        err = e;
+      }
+      expect(pgCode(err)).toBe("42804");
+    }
+    expect(await getCursor(sql, jsonT, "text-on-jsonb")).toBeUndefined();
   });
 
   test("a missing cursor table refuses NOTABLE, naming it", async () => {

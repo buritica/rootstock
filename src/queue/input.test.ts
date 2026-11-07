@@ -164,6 +164,41 @@ describe("QI1: every reason, its text and its event", () => {
       "payload for alpha:1 holds a function at depth 1",
       { key: "alpha:1", source: "alpha" },
     ],
+    [
+      "payload_bad_type",
+      { payload: { a: ["ok", "x\ud800"] } },
+      "payload_bad_type",
+      "payload for alpha:1 holds a string with a lone surrogate at depth 2",
+      { key: "alpha:1", source: "alpha" },
+    ],
+    [
+      "payload_bad_type",
+      { payload: { a: { "\udc00k": 1 } } },
+      "payload_bad_type",
+      "payload for alpha:1 has a lone surrogate in a key at depth 1",
+      { key: "alpha:1", source: "alpha" },
+    ],
+    [
+      "payload_non_finite",
+      { payload: { at: new Date(Number.NaN) } },
+      "payload_non_finite",
+      "payload for alpha:1 holds an invalid Date at depth 1",
+      { key: "alpha:1", source: "alpha" },
+    ],
+    [
+      "payload_not_an_object",
+      { payload: new Date(0) },
+      "payload_not_an_object",
+      "payload for alpha:1 must be an object, not a Date",
+      { key: "alpha:1", source: "alpha" },
+    ],
+    [
+      "key_invalid",
+      { key: "alpha:\ud83d" },
+      "key_invalid",
+      "key contains a lone UTF-16 surrogate",
+      { key: null, source: null },
+    ],
   ];
   for (const [label, over, reason, detail, fields] of cases) {
     test(`${label}: ${detail}`, async () => {
@@ -293,7 +328,12 @@ describe("QI2: the payload walk", () => {
 
 describe("QI1: cursor reasons", () => {
   const jsonT = cursorTable({ value: "jsonb", maxNameChars: 8, maxValueChars: 10 });
-  const textT = cursorTable({ value: "text", maxNameChars: 8, maxValueChars: 10 });
+  const textT = cursorTable({
+    table: { name: "text_cursors" },
+    value: "text",
+    maxNameChars: 8,
+    maxValueChars: 10,
+  });
 
   test("cursor_name_invalid in all three functions", async () => {
     for (const run of [
@@ -327,5 +367,62 @@ describe("QI1: cursor reasons", () => {
     await expect(touchCursor(noSql, textT, "n", "x".repeat(11))).rejects.toThrow(
       "rootstock queue: cursor value is 11 characters, over the 10 cap",
     );
+  });
+
+  test("cursor_value_invalid: a jsonb value JSON or the server would alter or reject", async () => {
+    const sparse: unknown[] = [1];
+    sparse[2] = 3;
+    for (const bad of [
+      "a\0b",
+      { s: "a\0" },
+      { n: Number.NaN },
+      [Number.NEGATIVE_INFINITY],
+      { f: () => 1 },
+      { u: undefined },
+      sparse,
+      { m: new Map() },
+      { d: new Date(Number.NaN) },
+      "x\udfff",
+      { "\ud800": 1 },
+    ]) {
+      const { err, events } = await refused((onEvent) =>
+        setCursor(noSql, jsonT, "n", bad, { onEvent }),
+      );
+      expect(err.reason).toBe("cursor_value_invalid");
+      expect(err.detail).toBe("cursor value must be a JSON value");
+      expect(events).toEqual([
+        { type: "queue.refused", key: null, source: null, reason: "cursor_value_invalid" },
+      ]);
+    }
+    await expect(touchCursor(noSql, jsonT, "n", { n: Number.NaN })).rejects.toThrow(
+      "rootstock queue: cursor value must be a JSON value",
+    );
+  });
+
+  test("a text cursor value or a name with a lone surrogate refuses", async () => {
+    const v = await refused((onEvent) => setCursor(noSql, textT, "n", "\ud800", { onEvent }));
+    expect(v.err.reason).toBe("cursor_value_invalid");
+    expect(v.err.detail).toBe("cursor value contains a lone UTF-16 surrogate");
+    const n = await refused((onEvent) => getCursor(noSql, jsonT, "\udc00", { onEvent }));
+    expect(n.err.reason).toBe("cursor_name_invalid");
+  });
+});
+
+describe("boolean columns a driver hands back as text", () => {
+  test('"t" reads true for on_dead and dead, on enqueue, claim and fail', async () => {
+    const events: QueueEvent[] = [];
+    const onEvent = (e: QueueEvent) => events.push(e);
+    const tx = { unsafe: async () => [{ v: "0", inserted: "f", on_dead: "t" }] };
+    const scope = { begin: async (fn: (t: unknown) => unknown) => fn(tx) } as unknown as Transactor;
+    await enqueue(scope, S, base, { onEvent });
+    expect(events.at(-1)).toMatchObject({ type: "queue.enqueued", result: "on_dead" });
+    const row = { key: "alpha:1", source: "alpha", kind: "put", attempts: "8", last_error: null };
+    const deadSql = { unsafe: async () => [{ ...row, dead: "t" }] } as unknown as Sql;
+    expect(
+      await claim(deadSql, S, { source: "alpha", limit: 1, worker: "w" }, { onEvent }),
+    ).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: "queue.drained", deadLettered: 1 });
+    const failed = await fail(deadSql, S, { key: "alpha:1", worker: "w", errorClass: "E" });
+    expect(failed).toEqual({ result: "dead", attempts: 8 });
   });
 });
