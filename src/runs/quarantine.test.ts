@@ -244,8 +244,26 @@ describe("quarantine: INPUT before any query (QD6's unit half)", () => {
     ] as const) {
       const err = await caught(quarantine(noSql, T, { ...PUT, [field]: value } as never));
       expect(err.code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
-      expect(err.detail).toStartWith(`quarantine(): ${field} must be a string`);
+      expect(err.detail).toStartWith(
+        field === "runId"
+          ? "quarantine(): runId must be a uuid"
+          : `quarantine(): ${field} must be a string`,
+      );
     }
+  });
+
+  test("NUL in job or externalId, and a runId that is not a uuid, refuse INPUT; NUL in reason becomes U+FFFD", async () => {
+    for (const [field, value] of [
+      ["job", "a\u0000b"],
+      ["externalId", "x\u0000"],
+      ["runId", "not-a-uuid"],
+    ] as const) {
+      const err = await caught(quarantine(noSql, T, { ...PUT, [field]: value } as never));
+      expect(err.code).toBe("ERR_ROOTSTOCK_RUNS_INPUT");
+    }
+    const r = recording();
+    await quarantine(r.sql, T, { ...PUT, reason: "bad\u0000byte" });
+    expect(r.calls[0]?.params[3]).toBe("bad\ufffdbyte");
   });
 
   test("the reason is cut to maxReasonChars, never through a surrogate pair", async () => {

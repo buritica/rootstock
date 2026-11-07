@@ -122,7 +122,8 @@ describe("QD1: put, repeat put, resolve, pending", () => {
 
   test("QD1 pending lists the job's pending rows, with and without ids; resolve counts only pending", async () => {
     const job = "beta-sync";
-    for (const id of ["b-1", "b-2", "b-3"]) {
+    // Inserted in reverse id order, so the order back is by failure time, not id.
+    for (const id of ["b-3", "b-2", "b-1"]) {
       await quarantine(sql, T, { job, externalId: id, payload: { id }, reason: `why ${id}` });
       await sql.unsafe("SELECT pg_sleep(0.002)");
     }
@@ -135,16 +136,16 @@ describe("QD1: put, repeat put, resolve, pending", () => {
 
     const all = await pendingQuarantine(sql, T, { job });
     expect(all.map((p) => [p.externalId, p.reason])).toEqual([
-      ["b-1", "why b-1"],
-      ["b-2", "why b-2"],
       ["b-3", "why b-3"],
+      ["b-2", "why b-2"],
+      ["b-1", "why b-1"],
     ]);
     for (const p of all) {
       expect(p.failedAt).toBeInstanceOf(Date);
       expect(Number.isFinite(p.failedAt.getTime())).toBe(true);
     }
     const some = await pendingQuarantine(sql, T, { job, externalIds: ["b-3", "b-1", "nope"] });
-    expect(some.map((p) => p.externalId)).toEqual(["b-1", "b-3"]);
+    expect(some.map((p) => p.externalId)).toEqual(["b-3", "b-1"]);
     expect(await pendingQuarantine(sql, T, { job, externalIds: [] })).toEqual([]);
 
     const r = recorder();
@@ -193,7 +194,7 @@ describe("QD2: an origin-shaped table through QU1′", () => {
     ).toEqual(["o-1"]);
     expect(await resolveQuarantine(sql, t, { job: "delta:one", externalIds: ["o-1"] })).toBe(1);
     expect(await pendingQuarantine(sql, t, { job: "delta:one" })).toEqual([]);
-    expect(r.events.map((e) => e.type === "runs.quarantined" && e.runId)).toEqual([RUN, null]);
+    expect(r.events.map((e) => e.type === "runs.quarantined" && e.runId)).toEqual([null, null]);
   });
 });
 

@@ -139,8 +139,9 @@ export function parseQuarantine(
 /**
  * Parses a quarantine table into a frozen, branded object: where a job's
  * unloadable records live and what its columns are called. The table must
- * have a unique index on (job, externalId) and a status column taking
- * 'pending' / 'resolved'; that is not checked here.
+ * have a unique index on (job, externalId), a status column taking
+ * 'pending' / 'resolved', and NOT NULL reason and failure-time columns
+ * (pendingQuarantine reads them as values); that is not checked here.
  */
 export function quarantineTable(
   input: QuarantineTableInput,
@@ -219,9 +220,9 @@ const statementsOf = perSlice(assertQuarantineTable, quarantineStatements);
 
 /** One pending quarantine row (QU3). */
 export interface PendingRow {
-  externalId: string;
-  reason: string;
-  failedAt: Date;
+  readonly externalId: string;
+  readonly reason: string;
+  readonly failedAt: Date;
 }
 
 /** What `quarantine` and `quarantineSafe` take. */
@@ -243,18 +244,26 @@ interface PutArgs {
 
 const utf8 = new TextEncoder();
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A string the server can store: Postgres text refuses NUL, on both attempts of a safe put. */
 function text(fn: string, field: string, value: unknown, job?: string): string {
-  if (typeof value === "string") return value;
-  throw refusals.input(`${fn}(): ${field} must be a string — got ${q(value)}`, job);
+  if (typeof value === "string" && !value.includes("\u0000")) return value;
+  throw refusals.input(`${fn}(): ${field} must be a string without NUL — got ${q(value)}`, job);
 }
 
 function putArgs(fn: string, t: QuarantineTable, a: PutInput): PutArgs {
   const job = text(fn, "job", a.job);
   const externalId = text(fn, "externalId", a.externalId, job);
-  const full = text(fn, "reason", a.reason, job);
+  if (typeof a.reason !== "string") {
+    throw refusals.input(`${fn}(): reason must be a string — got ${q(a.reason)}`, job);
+  }
+  // A reason is usually upstream error text, where a stray NUL lands; the
+  // server refuses NUL in text, so it becomes U+FFFD rather than losing the row.
+  const full = a.reason.replaceAll("\u0000", "\ufffd");
   const runId = a.runId ?? null;
-  if (runId !== null && typeof runId !== "string") {
-    throw refusals.input(`${fn}(): runId must be a string or null — got ${q(runId)}`, job);
+  if (runId !== null && (typeof runId !== "string" || !UUID.test(runId))) {
+    throw refusals.input(`${fn}(): runId must be a uuid or null — got ${q(runId)}`, job);
   }
   let reason = full.slice(0, t.maxReasonChars);
   // A cut never leaves half a surrogate pair behind.
@@ -297,7 +306,9 @@ async function put(
   const params: (string | null)[] = [args.job, args.externalId, json, args.reason];
   if (st.putTakesRunId) params.push(args.runId);
   await guarded(t.table, () => tx.unsafe(st.put, params), args.job);
-  emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId: args.runId });
+  // The run id the row stores: none on a table without a run column.
+  const runId = st.putTakesRunId ? args.runId : null;
+  emit({ type: "runs.quarantined", job: args.job, externalId: args.externalId, runId });
 }
 
 /**
@@ -352,7 +363,10 @@ export async function quarantineSafe(
     if (isNoTable(err)) throw err;
   }
   try {
-    await attempt(JSON.stringify({ externalId: args.externalId, truncated: true }));
+    // The fallback holds to the same cap (a long external id could break it).
+    await attempt(
+      payloadJson("quarantineSafe", t, args, { externalId: args.externalId, truncated: true }),
+    );
     return true;
   } catch (err) {
     if (isNoTable(err)) throw err;
