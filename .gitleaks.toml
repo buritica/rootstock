@@ -12,3 +12,14 @@ condition = "AND"
 paths = ['''(^|/)src/.+\.test\.ts$''']
 regexTarget = "secret"
 regexes = ['''^(v0=|sha256=)?[0-9a-f]{64}$''']
+
+# Queue claim tokens in tests are random UUIDs bound next to a `token` key,
+# which trips generic-api-key. A canonical UUID is an identifier, not a
+# credential: allow exactly that shape, and only in test files.
+[[allowlists]]
+description = "canonical UUIDs in test files"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)src/.+\.(test|pg)\.ts$''']
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$''']

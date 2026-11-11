@@ -3,6 +3,7 @@ import type { clientSlice } from "../db/index.ts";
 import type { lockSlice } from "../lock/index.ts";
 import type { migrateSlice } from "../migrate/index.ts";
 import type { queueSlice } from "../queue/index.ts";
+import type { runsSlice } from "../runs/index.ts";
 
 /** The slice parsers config composes, in the order it calls them. */
 export interface SliceParsers {
@@ -11,6 +12,7 @@ export interface SliceParsers {
   concurrencySlice: typeof concurrencySlice;
   lockSlice: typeof lockSlice;
   queueSlice: typeof queueSlice;
+  runsSlice: typeof runsSlice;
 }
 
 type Slice<K extends keyof SliceParsers> = ReturnType<SliceParsers[K]>;
@@ -21,9 +23,11 @@ export type MigrateInput = Input<"migrateSlice">;
 export type ConcurrencyInput = Input<"concurrencySlice">;
 export type LockInput = Input<"lockSlice">;
 export type QueueInput = Input<"queueSlice">;
+export type RunsInput = Input<"runsSlice">;
 
 export type ClientSlice = Slice<"clientSlice">;
 export type MigrateSlice = Slice<"migrateSlice">;
 export type ConcurrencySlice = Slice<"concurrencySlice">;
 export type LockSlice = Slice<"lockSlice">;
 export type QueueSlice = Slice<"queueSlice">;
+export type RunsSlice = Slice<"runsSlice">;

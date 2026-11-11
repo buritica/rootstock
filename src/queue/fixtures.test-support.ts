@@ -16,5 +16,6 @@ export const QUEUE_INPUT: QueueSliceInput = {
   maxPayloadBytes: 65536,
   maxClaimLimit: 500,
   enqueueLockTimeoutMs: 2000,
+  ackLockTimeoutMs: 2000,
   cursors: { value: "jsonb", maxNameChars: 128, maxValueChars: 512 },
 };

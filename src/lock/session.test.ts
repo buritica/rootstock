@@ -58,6 +58,21 @@ describe("lock sessions", () => {
       expect(ends).toEqual([{ timeout: 7 }]);
     });
 
+    test(`${label}: destroy ends the client at once (timeout 0), through close's once-only guard`, async () => {
+      const a = fakeClient([]);
+      const destroyed = make(a.client, SLICE);
+      expect(destroyed.destroy).toBeFunction();
+      await destroyed.destroy?.();
+      await destroyed.destroy?.();
+      await destroyed.close();
+      expect(a.ends).toEqual([{ timeout: 0 }]);
+      const b = fakeClient([]);
+      const closed = make(b.client, SLICE);
+      await closed.close();
+      await closed.destroy?.();
+      expect(b.ends).toEqual([{ timeout: 7 }]);
+    });
+
     test(`${label}: a rejecting close rejects once; the second close resolves`, async () => {
       const { client } = fakeClient([]);
       const boom = new Error("end failed");

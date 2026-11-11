@@ -18,6 +18,28 @@ export const L3 = `SELECT pg_backend_pid() AS pid,
 /** L6 unlock, params [name]. */
 export const L6 = "SELECT pg_advisory_unlock(hashtext($1))";
 
+/** B0 block mode's settings read, no params: the texts B3 restores. */
+export const B0 =
+  "SELECT current_setting('lock_timeout') AS lt, current_setting('client_connection_check_interval') AS cc";
+
+/**
+ * B1 block mode's settings, params [`${remainingMs}ms`, `${checkIntervalMs}ms`].
+ * B3, the restore, is this text with B0's two answers as the params.
+ */
+export const B1 =
+  "SELECT set_config('lock_timeout', $1::text, false) AS lt, set_config('client_connection_check_interval', $2::text, false) AS cc";
+
+/**
+ * B1L B1 without the connection check, params [`${remainingMs}ms`], for a
+ * server that refuses client_connection_check_interval (§20 A15). Its
+ * restore is this text with B0's lock_timeout.
+ */
+export const B1L = "SELECT set_config('lock_timeout', $1::text, false) AS lt";
+
+/** B2 block until granted (or lock_timeout), params [name]. */
+export const B2 =
+  "SELECT true AS locked, pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(hashtext($1))) AS t";
+
 /**
  * The pg_locks test for "some session in this database holds the one-key
  * advisory lock hashtext($1)", for a consumer that embeds it in its own SQL.
@@ -50,7 +72,7 @@ export interface TableStatements {
   readonly fence: string;
   /** L4 recovery claim, params [name]. */
   readonly claim: string;
-  /** L5 heartbeat, params [name, holder]. */
+  /** L5 heartbeat, params [name, holder]: no row when the fencing row no longer names holder. */
   readonly heartbeat: string;
   /**
    * L9 end a stalled backend, params [name, pid, holder]: terminates `pid`
@@ -71,7 +93,7 @@ ON CONFLICT (name) DO UPDATE SET holder = $2::uuid, acquired_at = now(), heartbe
 RETURNING pg_backend_pid() AS pid`,
     claim: `SELECT pg_try_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid,
        (SELECT holder::text FROM ${t} WHERE name = $1) AS holder`,
-    heartbeat: `UPDATE ${t} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid`,
+    heartbeat: `UPDATE ${t} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid RETURNING 1 AS ok`,
     terminate: `SELECT pg_terminate_backend(l.pid) AS terminated
 FROM pg_locks l
 WHERE l.pid = $2

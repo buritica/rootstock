@@ -4,6 +4,7 @@ import * as db from "../db/index.ts";
 import * as lock from "../lock/index.ts";
 import * as migrate from "../migrate/index.ts";
 import * as queue from "../queue/index.ts";
+import * as runs from "../runs/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type RootstockConfigInput } from "./define.ts";
 import { printRootstockConfig } from "./print.ts";
@@ -33,6 +34,7 @@ const parsers: SliceParsers = {
   concurrencySlice: concurrency.concurrencySlice,
   lockSlice: lock.lockSlice,
   queueSlice: queue.queueSlice,
+  runsSlice: runs.runsSlice,
 };
 
 describe("defineRootstockConfig", () => {

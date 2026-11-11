@@ -17,11 +17,12 @@ const ALL: [string, string, number][] = [
   ["Q1 (b)", LOCK_TIMEOUT_SET, 1],
   ["Q1 (c)", q.enqueue, 7],
   ["Q2", q.claim, 6],
-  ["Q3", q.ack, 2],
-  ["Q4", q.fail, 6],
+  ["Q3", q.ack, 4],
+  ["Q4", q.fail, 7],
   ["Q5", q.retryDead, 1],
   ["Q6", q.listDead, 2],
   ["Q7", q.depth, 1],
+  ["Q8", q.extendClaim, 3],
   ["K1 text", textCursor.get, 1],
   ["K2 text", textCursor.set, 2],
   ["K3 text", textCursor.touch, 2],
@@ -54,6 +55,7 @@ describe("QT1: built statements", () => {
 
   test("every table-bound statement names the table", () => {
     for (const [id, text] of ALL.slice(2)) expect(text, id).toContain('"rs_a"."wq"');
+    expect(q.extendClaim.split('"rs_a"."wq"').length).toBe(3);
   });
 
   test("a text cursor binds the value as text; a jsonb one casts it through text", () => {
@@ -64,14 +66,16 @@ describe("QT1: built statements", () => {
 });
 
 /**
- * The text of contract §4.4, verbatim (`<T>`, `<C>`, `<V>` as written there).
- * Copy it from the contract, never from statements.ts: this is what catches a
+ * The text of Stage C contract §4.4, verbatim (`<T>`, `<C>`, `<V>` as written
+ * there), with Stage D §9.3's changes: Q1, Q3's CTEs and Q8 are §9.3's text;
+ * Q2, Q4 and Q7 are §4.4's text with §9.3's edits applied as it states them.
+ * Copy it from the contracts, never from statements.ts: this is what catches a
  * statement drifting from the frozen one, e.g. a dropped SKIP LOCKED.
  */
 const FROZEN: Record<string, string> = {
   Q1: `INSERT INTO <T> AS q (key, source, kind, payload, not_before, enqueued_at, updated_at)
 VALUES (
-  $1, $2, $3, $4::jsonb,
+  $1, $2, $3, $4::text::jsonb,
   clock_timestamp() + make_interval(secs => $5::double precision),
   clock_timestamp(), clock_timestamp()
 )
@@ -81,9 +85,10 @@ ON CONFLICT (key) DO UPDATE SET
       greatest(excluded.not_before, q.not_before),
       q.enqueued_at + make_interval(secs => $6::double precision))
     ELSE greatest(excluded.not_before, q.not_before) END,
-  kind = CASE WHEN q.kind = $7::text THEN q.kind ELSE excluded.kind END,
-  payload = CASE WHEN q.kind = $7::text AND excluded.kind <> $7::text
+  kind = CASE WHEN q.kind = $7::text AND q.claimed_at IS NULL THEN q.kind ELSE excluded.kind END,
+  payload = CASE WHEN q.kind = $7::text AND q.claimed_at IS NULL AND excluded.kind <> $7::text
                  THEN q.payload ELSE excluded.payload END,
+  version = q.version + 1,
   updated_at = clock_timestamp()
 RETURNING (xmax = 0) AS inserted, dead_at IS NOT NULL AS on_dead`,
   Q2: `WITH candidates AS (
@@ -111,17 +116,20 @@ taken AS (
                       THEN NULL ELSE clock_timestamp() END,
     claimed_by = CASE WHEN c.prev_claimed_at IS NOT NULL
                        AND q.attempts + 1 >= $5::int
-                      THEN NULL ELSE $6::text END
+                      THEN NULL ELSE $6::text END,
+    claim_token = CASE WHEN c.prev_claimed_at IS NOT NULL
+                        AND q.attempts + 1 >= $5::int
+                       THEN NULL ELSE gen_random_uuid() END
   FROM candidates c
   WHERE q.key = c.key
   RETURNING q.key, q.source, q.kind, q.payload, q.attempts, q.last_error, q.dead_at,
-            q.not_before, q.claimed_at, q.claimed_by, c.prev_claimed_by
+            q.not_before, q.claimed_at, q.claimed_by, c.prev_claimed_by, q.claim_token, q.version
 )
 SELECT key, source, kind, payload::text AS payload, attempts::text AS attempts,
        last_error, dead_at IS NOT NULL AS dead,
        floor(extract(epoch FROM not_before) * 1000)::text AS not_before_ms,
        floor(extract(epoch FROM claimed_at) * 1000)::text AS claimed_at_ms,
-       claimed_by, prev_claimed_by
+       claimed_by, prev_claimed_by, claim_token::text AS claim_token, version::text AS version
 FROM taken
 ORDER BY not_before, key`,
   Q3: `WITH before AS (
@@ -129,14 +137,15 @@ ORDER BY not_before, key`,
 ),
 deleted AS (
   DELETE FROM <T>
-  WHERE key = $1 AND claimed_by = $2 AND dead_at IS NULL AND updated_at <= claimed_at
+  WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
+    AND version = $4::text::bigint AND updated_at <= claimed_at
   RETURNING key, source, kind
 ),
 released AS (
   UPDATE <T> SET
-    claimed_at = NULL, claimed_by = NULL, attempts = 0, last_error = NULL,
+    claimed_at = NULL, claimed_by = NULL, claim_token = NULL, attempts = 0, last_error = NULL,
     enqueued_at = clock_timestamp()
-  WHERE key = $1 AND claimed_by = $2 AND dead_at IS NULL
+  WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
     AND NOT EXISTS (SELECT 1 FROM deleted)
   RETURNING key, source, kind
 )
@@ -154,9 +163,10 @@ FROM released`,
   last_error = $3,
   claimed_at = NULL,
   claimed_by = NULL,
+  claim_token = NULL,
   not_before = clock_timestamp() + make_interval(mins => ($4::jsonb ->> (least(attempts + 1, $5::int) - 1))::int),
   dead_at = CASE WHEN attempts + 1 >= $6::int THEN clock_timestamp() ELSE dead_at END
-WHERE key = $1 AND claimed_by = $2
+WHERE key = $1 AND claimed_by = $2 AND claim_token = $7::uuid
 RETURNING source, kind, attempts::text AS attempts, dead_at IS NOT NULL AS dead`,
   Q5: `UPDATE <T> SET
   dead_at = NULL, attempts = 0, last_error = NULL,
@@ -186,7 +196,8 @@ LIMIT $2::int`,
            AND (claimed_at IS NULL
                 OR claimed_at < clock_timestamp() - make_interval(mins => $1::int))
        ))) / 60)::text AS oldest_due_minutes,
-       (count(*) FILTER (WHERE dead_at IS NULL AND claimed_at IS NOT NULL))::text AS claimed,
+       (count(*) FILTER (WHERE dead_at IS NULL AND claimed_at IS NOT NULL
+                          AND claimed_at >= clock_timestamp() - make_interval(mins => $1::int)))::text AS claimed,
        (count(*) FILTER (WHERE dead_at IS NOT NULL))::text AS dead,
        floor(extract(epoch FROM min(not_before) FILTER (WHERE dead_at IS NULL)) * 1000)::text AS oldest_not_before_ms,
        (extract(epoch FROM (clock_timestamp() - min(enqueued_at) FILTER (WHERE dead_at IS NULL))) / 3600)::text AS oldest_wait_hours,
@@ -194,6 +205,14 @@ LIMIT $2::int`,
 FROM <T>
 GROUP BY source
 ORDER BY source`,
+  Q8: `WITH e AS (
+  UPDATE <T> SET claimed_at = clock_timestamp()
+  WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
+    AND updated_at <= claimed_at
+  RETURNING 1
+)
+SELECT (SELECT count(*) FROM e)::text AS extended,
+       (SELECT count(*) FROM <T> WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid)::text AS held`,
   K1: `SELECT value::text AS value FROM <C> WHERE name = $1`,
   K2: `INSERT INTO <C> (name, value, updated_at)
 VALUES ($1, <V>, clock_timestamp())
@@ -207,11 +226,12 @@ ON CONFLICT (name) DO UPDATE SET updated_at = clock_timestamp()`,
 /**
  * The recorded deviations from §4.4, applied to the frozen text: JSON bound as
  * text and cast server-side (deviations.md, R-C5), and a text cursor bound
- * `$2::text` (deviations-queue-fix.md). Nothing else may differ.
+ * `$2::text` (deviations-queue-fix.md). Q1's §9.3 text already carries the
+ * first. Nothing else may differ.
  */
 function expected(id: string, v: "$2::text" | "$2::text::jsonb" = "$2::text::jsonb"): string {
   let text = FROZEN[id] as string;
-  if (id === "Q1" || id === "Q4") text = text.replace("$4::jsonb", "$4::text::jsonb");
+  if (id === "Q4") text = text.replace("$4::jsonb", "$4::text::jsonb");
   return text
     .replaceAll("<T>", '"rootstock"."work_queue"')
     .replaceAll("<C>", '"rootstock"."cursors"')
@@ -231,6 +251,7 @@ describe("QT1: the statements are §4.4's text, byte for byte", () => {
     ["Q5", pq.retryDead, expected("Q5")],
     ["Q6", pq.listDead, expected("Q6")],
     ["Q7", pq.depth, expected("Q7")],
+    ["Q8", pq.extendClaim, expected("Q8")],
     ["K1 text", pt.get, expected("K1")],
     ["K1 jsonb", pj.get, expected("K1")],
     ["K2 text", pt.set, expected("K2", "$2::text")],

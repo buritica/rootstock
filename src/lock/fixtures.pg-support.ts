@@ -23,6 +23,16 @@ export function lockDriver(): LockDriver {
   return testKind() === "bun-sql" ? "bun-sql" : "postgres-js";
 }
 
+/**
+ * w4d §20 A38: before Bun 1.4.4, Bun.SQL's `close({ timeout: 0 })` waits for
+ * an in-flight query instead of sending the FIN, so a block-mode `destroy()`
+ * returns only once B2 ends (at lock_timeout or the grant). Cases that time
+ * the at-once FIN assert the late bound on those cells instead.
+ */
+export function lateBunSqlDestroy(): boolean {
+  return lockDriver() === "bun-sql" && Bun.semver.order(Bun.version, "1.4.4") < 0;
+}
+
 /** The lock profile every lock suite opens its session with. */
 export const LOCK_CLIENT = clientSlice({
   profiles: {

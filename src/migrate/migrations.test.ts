@@ -95,6 +95,74 @@ CREATE TABLE cursors (
 `,
 };
 
+// The three Stage D files (0.8.0), byte for byte as the D1 contract freezes them.
+const STAGE_D: Readonly<Record<string, string>> = {
+  "20261107145200_runs.sql": `-- rootstock-migration: additive
+-- The run record: one row per run, written when the run starts and settled when
+-- it ends. A row still 'running' whose lock has moved on was interrupted. Run
+-- with search_path set to the target schema, so nothing here is schema-qualified.
+CREATE TABLE runs (
+  id uuid PRIMARY KEY,
+  job text NOT NULL,
+  mode text NOT NULL,
+  status text NOT NULL,
+  phase text,
+  lock_name text NOT NULL,
+  holder uuid NOT NULL,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz,
+  listed integer,
+  written integer,
+  unchanged integer,
+  quarantined integer,
+  excluded_count integer,
+  reconciled boolean,
+  excluded_reasons jsonb NOT NULL DEFAULT '{}'::jsonb,
+  counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+  tokens jsonb NOT NULL DEFAULT '{}'::jsonb,
+  cost_usd numeric,
+  cost_note text,
+  scope jsonb,
+  scope_excluded jsonb,
+  overrides jsonb NOT NULL DEFAULT '[]'::jsonb,
+  reason text,
+  CONSTRAINT runs_status_check
+    CHECK (status IN ('running', 'ok', 'failed', 'refused', 'interrupted')),
+  CONSTRAINT runs_settled_check CHECK ((status = 'running') = (finished_at IS NULL))
+);
+CREATE INDEX runs_job_started_idx ON runs (job, started_at DESC);
+CREATE INDEX runs_running_idx ON runs (lock_name) WHERE status = 'running';
+CREATE INDEX runs_job_ok_idx ON runs (job, started_at DESC, id DESC) WHERE status = 'ok';
+`,
+  "20261107145201_quarantine.sql": `-- rootstock-migration: additive
+-- Records a run could not load, one row per (job, external id). A repeat failure
+-- updates the row; a later success resolves it. Run with search_path set to the
+-- target schema.
+CREATE TABLE quarantine (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  job text NOT NULL,
+  external_id text NOT NULL,
+  payload jsonb NOT NULL,
+  reason text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  failed_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  run_id uuid,
+  CONSTRAINT quarantine_status_check CHECK (status IN ('pending', 'resolved'))
+);
+CREATE UNIQUE INDEX quarantine_job_external_idx ON quarantine (job, external_id);
+CREATE INDEX quarantine_pending_idx ON quarantine (job) WHERE status = 'pending';
+`,
+  "20261107145202_work_queue_claim_fence.sql": `-- rootstock-migration: additive
+-- The claim fence: a token per claim that ack and fail must present, and a
+-- version every enqueue bumps, so an ack never deletes work that arrived after
+-- its claim. Run with search_path set to the target schema.
+ALTER TABLE work_queue
+  ADD COLUMN version bigint NOT NULL DEFAULT 0,
+  ADD COLUMN claim_token uuid;
+`,
+};
+
 describe("the Stage C files", () => {
   for (const [file, text] of Object.entries(STAGE_C)) {
     test(`${file} is byte-equal to the frozen text`, () => {
@@ -103,8 +171,24 @@ describe("the Stage C files", () => {
   }
 
   test("they follow the first file in the manifest, in order, as one statement each", () => {
-    expect(MANIFEST.slice(1)).toEqual(Object.keys(STAGE_C));
-    for (const m of rootstockMigrations().slice(1)) {
+    expect(MANIFEST.slice(1, 4)).toEqual(Object.keys(STAGE_C));
+    for (const m of rootstockMigrations().slice(1, 4)) {
+      expect(m.kind).toBe("additive");
+      expect(m.statements).toHaveLength(1);
+    }
+  });
+});
+
+describe("the Stage D files", () => {
+  for (const [file, text] of Object.entries(STAGE_D)) {
+    test(`${file} is byte-equal to the frozen text`, () => {
+      expect(readFileSync(new URL(file, DIR), "utf8")).toBe(text);
+    });
+  }
+
+  test("they follow the Stage C files, in order, all additive", () => {
+    expect(MANIFEST.slice(4)).toEqual(Object.keys(STAGE_D));
+    for (const m of rootstockMigrations().slice(4)) {
       expect(m.kind).toBe("additive");
       expect(m.statements).toHaveLength(1);
     }

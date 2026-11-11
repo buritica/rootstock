@@ -28,6 +28,8 @@ import {
   RootstockLockError,
 } from "./index.ts";
 import { bunSqlLockSession, postgresJsLockSession } from "./session.ts";
+import { B0, B1, B2 } from "./statements.ts";
+import { createTurnQueue } from "./turns.ts";
 
 // #41: a gate probe that stalls recovers on a fresh session. The lock session
 // goes through a TCP proxy that can black-hole a connection the way a silently
@@ -39,6 +41,8 @@ let adminSql: Sql;
 const { schema, dropAll } = schemaFactory("rs_st");
 const driver = lockDriver();
 let slice: LockSlice;
+/** The same slice with block mode (w4d §8.1), for LB3c. */
+let blockSlice: LockSlice;
 
 interface Link {
   frozen: boolean;
@@ -166,6 +170,16 @@ beforeAll(async () => {
     endTimeoutSeconds: 1,
     wait: { maxMs: 0, pollIntervalMs: 50 },
   });
+  blockSlice = lockSlice({
+    table: { schema: s },
+    profile: "lock",
+    names: ["stall-d"],
+    heartbeatSeconds: 5,
+    probeStallSeconds: 6,
+    maxRecoveries: 3,
+    endTimeoutSeconds: 1,
+    wait: { maxMs: 5000, pollIntervalMs: 50, block: { checkIntervalMs: 200 } },
+  });
 });
 
 afterAll(async () => {
@@ -260,5 +274,66 @@ describe("#41: a stalled probe recovers on a fresh session", () => {
       proxy.stop();
     }
     expect((await locksHeld(adminSql, ["stall-c"])).get("stall-c")).toBe(false);
+  }, 30_000);
+});
+
+describe("w4d §8.1 with 0.7.0's recovery", () => {
+  test("LB3c: a block-mode lock whose gate probe stalls recovers on a fresh session that ran no B statement", async () => {
+    const proxy = startProxy();
+    const events: LockEvent[] = [];
+    /** Every session the lock opened, with the texts it was sent. */
+    const opened: { session: LockSession; sent: string[] }[] = [];
+    const recordingOpen = () => {
+      const base =
+        driver === "bun-sql"
+          ? bunSqlLockSession(openBunSqlClient(1, proxy.url), blockSlice)
+          : postgresJsLockSession(openPostgresJsClient(1, proxy.url), blockSlice);
+      const sent: string[] = [];
+      const unsafe = (q: string, p?: readonly unknown[]) => {
+        sent.push(q);
+        return base.sql.unsafe(q, p);
+      };
+      const session: LockSession = {
+        ...base,
+        sql: Object.assign(
+          (strings: TemplateStringsArray, ...values: unknown[]) => base.sql(strings, ...values),
+          { unsafe },
+        ) as unknown as Sql,
+      };
+      opened.push({ session: base, sent });
+      return session;
+    };
+    const lock = await acquireRunLock(recordingOpen, blockSlice, "stall-d", deps(events), {
+      wait: { mode: "block", ms: 1000, turns: createTurnQueue() },
+    });
+    const fresh = openRaw();
+    try {
+      const old = acquiredPid(events);
+      expect(events.find((e) => e.type === "lock.wait")).toMatchObject({
+        mode: "block",
+        outcome: "acquired",
+      });
+      expect(opened[0]?.sent.slice(0, 4)).toEqual([B0, B1, B2, B1]);
+      proxy.freeze({ forwardClose: true });
+      await lock.ensureExclusive();
+      const recovered = events.find((e) => e.type === "lock.recovered");
+      expect(recovered).toBeDefined();
+      expect(recovered?.type === "lock.recovered" && recovered.pid).not.toBe(old);
+      expect(opened).toHaveLength(2);
+      const replacement = opened[1] as { session: LockSession; sent: string[] };
+      for (const b of [B0, B1, B2]) expect(replacement.sent).not.toContain(b);
+      const [defaults] = await fresh.sql.unsafe("SELECT current_setting('lock_timeout') AS lt");
+      const [now] = await replacement.session.sql.unsafe(
+        "SELECT current_setting('lock_timeout') AS lt",
+      );
+      expect(now?.lt).toBe(defaults?.lt);
+      await lock.ensureExclusive();
+      expect((await locksHeld(adminSql, ["stall-d"])).get("stall-d")).toBe(true);
+    } finally {
+      await lock.release();
+      await fresh.end();
+      proxy.stop();
+    }
+    expect((await locksHeld(adminSql, ["stall-d"])).get("stall-d")).toBe(false);
   }, 30_000);
 });

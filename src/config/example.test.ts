@@ -5,6 +5,8 @@ import { lockSlice } from "../lock/index.ts";
 import { migrateSlice } from "../migrate/index.ts";
 import { QUEUE_INPUT } from "../queue/fixtures.test-support.ts";
 import { queueSlice } from "../queue/index.ts";
+import { runsInputWithStaleHeartbeat } from "../runs/fixtures.test-support.ts";
+import { runsSlice } from "../runs/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
@@ -39,6 +41,7 @@ const unfrozen = {
     }) as unknown as ConcurrencySlice,
   lockSlice,
   queueSlice,
+  runsSlice,
 } satisfies SliceParsers;
 
 const define = defineRootstockConfig;
@@ -169,6 +172,20 @@ const exampleWithLockAndQueue: RootstockConfigInput = {
   queue: QUEUE_INPUT,
 };
 
+// Every slice: the lock admits each job's lock, and the runs slice declares a
+// quarantine table, so RC3 sees every field a runs print can carry.
+const exampleWithEverySlice: RootstockConfigInput = {
+  ...exampleWithLockAndQueue,
+  lock: {
+    ...(exampleWithLockAndQueue.lock as NonNullable<RootstockConfigInput["lock"]>),
+    names: ["alpha-sync", "gamma-*", "shared-write", "delta:*"],
+  },
+  runs: {
+    ...runsInputWithStaleHeartbeat(450),
+    quarantine: { maxPayloadBytes: 65_536, maxReasonChars: 500 },
+  },
+};
+
 const EXAMPLE_LOCK_QUEUE_PRINT = `{
   "client": {
     "profiles": {
@@ -254,6 +271,7 @@ const EXAMPLE_LOCK_QUEUE_PRINT = `{
     "schema": "rootstock"
   },
   "queue": {
+    "ackLockTimeoutMs": 2000,
     "backoffMinutes": [
       1,
       5,
@@ -324,13 +342,45 @@ describe("print", () => {
     expect(printRootstockConfig(define(exampleWithLockAndQueue))).toBe(EXAMPLE_LOCK_QUEUE_PRINT);
   });
 
+  test("RC1: a config without runs prints no runs key, byte-identical to the stored base prints", () => {
+    // EXAMPLE_PRINT and EXAMPLE_LOCK_QUEUE_PRINT are the base's prints, kept
+    // unchanged, so no consumer's config golden moves with the runs slice.
+    for (const [input, stored] of [
+      [exampleInput, EXAMPLE_PRINT],
+      [exampleWithLockAndQueue, EXAMPLE_LOCK_QUEUE_PRINT],
+    ] as const) {
+      const config = define(input);
+      expect(config.runs).toBeNull();
+      const text = printRootstockConfig(config);
+      expect(text).toBe(stored);
+      expect(Object.hasOwn(JSON.parse(text), "runs")).toBe(false);
+    }
+  });
+
+  test("RC1: runs prints after queue, its jobs and every other map sorted by key", () => {
+    const text = printRootstockConfig(define(exampleWithEverySlice));
+    const at = (needle: string) => text.indexOf(needle);
+    // canonicalJson sorts the top-level keys too: queue, runner, runs.
+    expect(at('\n  "queue": {')).toBeLessThan(at('\n  "runner": "absent"'));
+    expect(at('\n  "runner": "absent"')).toBeLessThan(at('\n  "runs": {'));
+    // Declared alpha-sync, beta-sync, gamma-push, delta:*; printed sorted.
+    const jobs = Object.keys(JSON.parse(text).runs.jobs);
+    expect(jobs).toEqual(["alpha-sync", "beta-sync", "delta:*", "gamma-push"]);
+    const order = jobs.map((job) => at(`\n      "${job}": {`));
+    expect(order.every((i) => i > 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
   test("absent-slices-printed", () => {
     const view = JSON.parse(printRootstockConfig(define(exampleInput)));
     for (const name of ["embed", "lock", "queue", "runner"]) expect(view[name]).toBe("absent");
   });
 
-  test("print-carries-no-url-host-or-credential", () => {
-    const view = JSON.parse(printRootstockConfig(define(exampleInput)));
+  test.each([
+    ["the example", exampleInput],
+    ["RC3: the example with every slice, runs included", exampleWithEverySlice],
+  ])("print-carries-no-url-host-or-credential: %s", (_name, input) => {
+    const view = JSON.parse(printRootstockConfig(define(input)));
     const text = JSON.stringify(view);
     expect(text).not.toContain("://");
     expect(text).not.toContain("@");
@@ -340,7 +390,11 @@ describe("print", () => {
       if (typeof v === "string") {
         if (hostLike.test(v)) offenders.push(v);
       } else if (v !== null && typeof v === "object") {
-        for (const child of Object.values(v)) walk(child);
+        // Keys too: a map key (a job, a model) is configured text like a value.
+        for (const [key, child] of Object.entries(v)) {
+          if (hostLike.test(key)) offenders.push(key);
+          walk(child);
+        }
       }
     };
     // Invariant ids are dotted by design, so only their array is exempt.
@@ -383,6 +437,7 @@ describe("print", () => {
       },
       lockSlice,
       queueSlice,
+      runsSlice,
     } satisfies SliceParsers;
     expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
   });
@@ -434,6 +489,10 @@ describe("define", () => {
       queueSlice: (i, d) => {
         calls.push("queue");
         return queueSlice(i, d);
+      },
+      runsSlice: (i, d) => {
+        calls.push("runs");
+        return runsSlice(i, d);
       },
     };
     let caught: unknown;
@@ -602,6 +661,7 @@ describe("brand and failure paths", () => {
       concurrencySlice: (i: ConcurrencyInput) => (made.concurrency = concurrencySlice(i)),
       lockSlice,
       queueSlice,
+      runsSlice,
     } satisfies SliceParsers;
     const config = composeRootstockConfig(recording, exampleInput);
     expect(config.client).toBe(made.client as typeof config.client);
@@ -777,6 +837,7 @@ describe("brand and failure paths", () => {
       },
       lockSlice,
       queueSlice,
+      runsSlice,
     } satisfies SliceParsers;
     let caught: unknown;
     try {

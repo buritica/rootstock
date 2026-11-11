@@ -153,6 +153,49 @@ describe("S2: unknown key, then required, then value, at every level", () => {
   });
 });
 
+describe("wait.block (w4d §8.1, LB5's slice half)", () => {
+  const block = (b: unknown) => ({ wait: { maxMs: 1000, pollIntervalMs: 50, block: b } });
+
+  test("absent, the key is missing from the parsed wait", () => {
+    const s = lockSlice(BASE);
+    expect(Object.keys(s.wait)).toEqual(["maxMs", "pollIntervalMs"]);
+    expect(s.wait.block).toBeUndefined();
+  });
+
+  test("given, it parses frozen, with its edges", () => {
+    for (const checkIntervalMs of [100, 1000, 10_000]) {
+      const s = lockSlice(input(block({ checkIntervalMs })));
+      expect(s.wait.block).toEqual({ checkIntervalMs });
+      expect(Object.isFrozen(s.wait.block)).toBe(true);
+    }
+  });
+
+  test("out of range or not an integer refuses with its path", () => {
+    for (const bad of [99, 10_001, 150.5, "1000", null]) {
+      expect(parse(block({ checkIntervalMs: bad }))).toBe(
+        `lockSlice: wait.block.checkIntervalMs must be an integer from 100 to 10000 — got ${JSON.stringify(bad)}`,
+      );
+    }
+  });
+
+  test("unknown key, then required, then value; not an object refuses", () => {
+    expect(parse(block({ other: 1, checkIntervalMs: 1 }))).toBe(
+      "lockSlice: wait.block.other is not a known key",
+    );
+    expect(parse(block({}))).toBe("lockSlice: wait.block.checkIntervalMs is required");
+    expect(parse(block(1000))).toBe("lockSlice: wait.block must be an object — got 1000");
+  });
+
+  test("withNames keeps it, and keeps it absent", () => {
+    const s = lockSlice(input(block({ checkIntervalMs: 500 })));
+    expect(withNames(s, ["delta-sync"]).wait.block).toEqual({ checkIntervalMs: 500 });
+    expect(Object.keys(withNames(lockSlice(BASE), ["delta-sync"]).wait)).toEqual([
+      "maxMs",
+      "pollIntervalMs",
+    ]);
+  });
+});
+
 describe("S3-S6: what the names admit", () => {
   test('S3: "gamma-*" admits a longer name of the class, nothing else', () => {
     const s = lockSlice(input({ groups: { g: ["gamma-x", "gamma-a.b:c"] } }));

@@ -72,7 +72,20 @@ export type QueueEvent =
       attempts: number;
       error: string;
     }
-  | { type: "queue.lost"; key: string; worker: string; operation: "ack" | "fail"; error?: string }
+  | {
+      type: "queue.lost";
+      key: string;
+      worker: string;
+      operation: "ack" | "fail" | "extend";
+      error?: string;
+    }
+  | {
+      type: "queue.ack_contended";
+      key: string;
+      worker: string;
+      operation: "ack" | "fail" | "extend";
+    }
+  | { type: "queue.claim_extended"; key: string; worker: string }
   | { type: "queue.retried"; key: string; source: string; kind: string }
   | { type: "queue.retry_noop"; key: string }
   | { type: "queue.cursor_read"; name: string; value: unknown }

@@ -7,7 +7,7 @@ import { lockOwnershipLost } from "./probe.ts";
 import type { LockSession } from "./session.ts";
 import { admits, assertLockSlice, type LockSlice } from "./slice.ts";
 import { L1, L3, L6, type TableStatements, tableStatements } from "./statements.ts";
-import { checkWait, type LockWait, pollAcquire } from "./wait.ts";
+import { blockAcquire, checkWait, type LockWait, pollAcquire } from "./wait.ts";
 
 export interface LockDeps {
   /** Milliseconds. */
@@ -108,8 +108,8 @@ function validate(
 
 /**
  * Takes the lock with one try-lock, or with `opts.wait` by waiting for the
- * turn and polling (§2.6), then fences it (§2.5). The session is closed on
- * every refusal; the keepalive is not started. `open` is called once for the
+ * turn and polling (§2.6) or blocking (w4d §8.1), then fences it (§2.5).
+ * The session is closed on every refusal; the keepalive is not started. `open` is called once for the
  * acquire and once more for each recovery after a stalled probe, so each call
  * must return a session on a new dedicated client, never a shared one.
  */
@@ -121,7 +121,10 @@ export async function acquireRunLock(
   opts?: { wait?: LockWait },
 ): Promise<RunLock> {
   const a = validate(open, slice, name, deps);
-  if (opts?.wait !== undefined) return pollAcquire(a, checkWait(a, opts.wait));
+  if (opts?.wait !== undefined) {
+    const wait = checkWait(a, opts.wait);
+    return wait.mode === "block" ? blockAcquire(a, wait) : pollAcquire(a, wait);
+  }
   const session = open();
   let row: Row | undefined;
   try {
@@ -209,18 +212,27 @@ export async function fence(
 /**
  * The compare-and-clear in-flight guard: a probe in flight blocks the next
  * one until it settles or stalls, and a stalled probe that settles late
- * cannot disarm the guard a newer probe holds.
+ * cannot disarm the guard a newer probe holds. `stalledMs`: how long the
+ * probe this one steps past had been in flight, when there was one.
  */
-function probeGuard(stallMs: number, now: () => number): () => (() => void) | null {
+function probeGuard(
+  stallMs: number,
+  now: () => number,
+): () => { done: () => void; stalledMs: number | undefined } | null {
   let startedAt: number | null = null;
   let generation = 0;
   return () => {
-    if (startedAt !== null && now() - startedAt < stallMs) return null;
-    startedAt = now();
+    const at = now();
+    if (startedAt !== null && at - startedAt < stallMs) return null;
+    const stalledMs = startedAt === null ? undefined : at - startedAt;
+    startedAt = at;
     generation += 1;
     const mine = generation;
-    return () => {
-      if (generation === mine) startedAt = null;
+    return {
+      done: () => {
+        if (generation === mine) startedAt = null;
+      },
+      stalledMs,
     };
   };
 }
@@ -258,6 +270,8 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   let released = false;
   /** Set once a gate refuses: every later gate rethrows it, with no I/O. */
   let terminal: RootstockLockError | undefined;
+  /** A keepalive L5 updated no row: the next gate skips L3 and recovers as lost (w4d §8.2). */
+  let suspect = false;
   /** The gate in flight, shared by concurrent callers so one blip recovers once. */
   let gating: Promise<void> | undefined;
   /** A statement rejected: every statement sent before this time rests until it (C-S1). */
@@ -478,7 +492,14 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
    * `probe`: how the gate's L3 failed. `rejected`: an L4 on the same pid may
    * have stacked a level. `stalled`: the claim goes on a fresh session.
    */
-  async function recover(probe: "lost" | "rejected" | "stalled"): Promise<Recovery> {
+  /**
+   * `stillHeld`: the current backend still holds the lock (a suspect lock,
+   * whose fencing row went missing), so a claim on it stacks a second level.
+   */
+  async function recover(
+    probe: "lost" | "rejected" | "stalled",
+    stillHeld = false,
+  ): Promise<Recovery> {
     if (released) return "released";
     if (recoveries >= slice.maxRecoveries) {
       emit({
@@ -491,7 +512,9 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     }
     recoveries += 1;
     const attempt = recoveries;
-    if (probe !== "stalled") return settle(probe, attempt, await claim(attempt, true), false);
+    if (probe !== "stalled") {
+      return settle(probe, attempt, await claim(attempt, true), false, stillHeld);
+    }
     replacing = true;
     try {
       const reopened = await reopen(attempt);
@@ -512,6 +535,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     attempt: number,
     claimed: { row: Row | undefined } | { stalled: Error } | "released" | "failed",
     own: boolean,
+    stillHeld = false,
   ): Promise<Recovery> {
     if (typeof claimed === "string" || "stalled" in claimed) return claimed;
     const { row } = claimed;
@@ -531,9 +555,12 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // still naming this holder proves no other run took it meanwhile. The
     // advisory lock just taken is not ours to keep, so it goes now.
     holding = true;
+    // On a backend that already held the lock, the claim stacked a level.
+    const stacked = stillHeld && Number(row.pid) === pid;
     if (row.holder !== holder) {
       await unlock(stallMs);
-      holding = false;
+      // The level held before the claim is still there for release() to free.
+      holding = stacked;
       if (released) return "released";
       emit({ type: "lock.recovery_refused", name, attempt, reason: "displaced" });
       return "failed";
@@ -542,7 +569,7 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
     // Assigned before any further await, so a keepalive tick that reads the
     // new backend compares against it.
     pid = Number(row.pid);
-    if (probe === "rejected" && pid === before) {
+    if ((probe === "rejected" || stacked) && pid === before) {
       const stall = await undoStackedLevel();
       if (released) return "released";
       if (stall !== undefined) return { stalled: stall };
@@ -557,6 +584,16 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
   }
 
   async function gate(): Promise<void> {
+    if (suspect) {
+      // The fencing row no longer names this holder: L4 reads that and refuses displaced.
+      const outcome = await recover("lost", true);
+      if (outcome === "recovered") {
+        suspect = false;
+        return;
+      }
+      if (outcome === "released" || outcome === "failed") throw latch(refusals.lost(name));
+      throw latch(refusals.unverifiable(name, outcome.stalled));
+    }
     let probe: { rows: Row[] } | { error: unknown } | "timeout";
     try {
       const probed = await within(deps, run(L3), stallMs);
@@ -592,8 +629,11 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
 
   function tick(): void {
     if (released || terminal !== undefined || replacing) return;
-    const done = begin();
-    if (done === null) return;
+    const guard = begin();
+    if (guard === null) return;
+    const { done, stalledMs } = guard;
+    // Only the keepalive's own probe: a gate's stall is its recovery's to report.
+    if (stalledMs !== undefined) emit({ type: "lock.probe_stalled", name, ms: stalledMs });
     const asked = pid;
     const on = session;
     /** A recovery is replacing, or has replaced, the session this tick went to: the gate owns the answer. */
@@ -616,7 +656,10 @@ function held(a: Attempt, firstSession: LockSession, firstPid: number, holder: s
           });
           return;
         }
-        await run(statements.heartbeat, [name, holder]);
+        const beat = await run(statements.heartbeat, [name, holder]);
+        if (stale() || beat.length > 0) return;
+        suspect = true;
+        emit({ type: "lock.fence_missing", name, holder });
       } catch (error) {
         if (!stale()) emit({ type: "lock.keepalive_failed", name, ...failure(error) });
       } finally {

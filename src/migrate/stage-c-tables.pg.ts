@@ -9,10 +9,12 @@ import { rootstockMigrationStatus } from "./status.ts";
 
 // R-C1: the three Stage C tables, applied by the real applier as part of
 // rootstock's own source, once per transactor kind, each case in schemas of
-// its own.
+// its own. R-D1 (0.8.0) adds the Stage D files: two tables and two
+// work_queue columns.
 
 const SHIPPED = rootstockMigrations();
-const STAGE_C = SHIPPED.slice(1).map((m) => m.filename);
+const STAGE_C = SHIPPED.slice(1, 4).map((m) => m.filename);
+const STAGE_D = SHIPPED.slice(4).map((m) => m.filename);
 
 let main: TestTransactor;
 let sql: Sql;
@@ -74,6 +76,8 @@ const SHAPE: Column[] = [
   { table: "work_queue", column: "dead_at", type: TS, nullable: "YES", default: null },
   { table: "work_queue", column: "enqueued_at", type: TS, nullable: "NO", default: "now()" },
   { table: "work_queue", column: "updated_at", type: TS, nullable: "NO", default: "now()" },
+  { table: "work_queue", column: "version", type: "bigint", nullable: "NO", default: "0" },
+  { table: "work_queue", column: "claim_token", type: "uuid", nullable: "YES", default: null },
 ];
 
 async function applied(s: string): Promise<string[]> {
@@ -123,18 +127,18 @@ describe("the Stage C tables", () => {
     const slice = migrateSlice({ schema: schema() });
     await applyMigrationList(main.transactor, slice, SHIPPED.slice(0, 3));
     const rerun = await applyRootstockMigrations(main.transactor, slice);
-    expect(rerun.applied).toEqual(STAGE_C.slice(2));
+    expect(rerun.applied).toEqual([...STAGE_C.slice(2), ...STAGE_D]);
     expect((await rootstockMigrationStatus(sql, slice)).red).toBe(false);
   });
 
-  test("a schema at the previous release's state upgrades with the three files", async () => {
+  test("a schema at the 0.5.x state upgrades with the Stage C and Stage D files", async () => {
     const s = schema();
     const slice = migrateSlice({ schema: s });
     await applyMigrationList(main.transactor, slice, SHIPPED.slice(0, 1));
     const status = await rootstockMigrationStatus(sql, slice);
-    expect(status.pending.map((m) => m.filename)).toEqual(STAGE_C);
+    expect(status.pending.map((m) => m.filename)).toEqual([...STAGE_C, ...STAGE_D]);
     const upgrade = await applyRootstockMigrations(main.transactor, slice);
-    expect(upgrade.applied).toEqual(STAGE_C);
+    expect(upgrade.applied).toEqual([...STAGE_C, ...STAGE_D]);
     expect(await applied(s)).toEqual(SHIPPED.map((m) => m.filename));
   });
 
@@ -151,5 +155,124 @@ describe("the Stage C tables", () => {
     );
     expect(inB?.n).toBe(0);
     expect(await columns(b)).toEqual(SHAPE);
+  });
+});
+
+describe("the Stage D tables (R-D1)", () => {
+  test("a schema at the 0.7.0 state upgrades with the three files, and its queue rows read version 0 and no token", async () => {
+    const s = schema();
+    const slice = migrateSlice({ schema: s });
+    await applyMigrationList(main.transactor, slice, SHIPPED.slice(0, 4));
+    await sql.unsafe(
+      `INSERT INTO "${s}".work_queue (key, source, kind) VALUES ('alpha:1', 'alpha', 'put')`,
+    );
+    const fileNode = async () =>
+      (
+        await sql.unsafe<{ f: string }>(
+          "SELECT relfilenode::text AS f FROM pg_class WHERE oid = to_regclass(quote_ident($1) || '.work_queue')",
+          [s],
+        )
+      )[0]?.f;
+    const before = await fileNode();
+    const status = await rootstockMigrationStatus(sql, slice);
+    expect(status.pending.map((m) => m.filename)).toEqual(STAGE_D);
+    const upgrade = await applyRootstockMigrations(main.transactor, slice);
+    expect(upgrade.applied).toEqual(STAGE_D);
+    expect((await rootstockMigrationStatus(sql, slice)).red).toBe(false);
+    const [row] = await sql.unsafe<{ version: string; token: string | null }>(
+      `SELECT version::text AS version, claim_token::text AS token FROM "${s}".work_queue`,
+    );
+    expect(row).toEqual({ version: "0", token: null });
+    // The claim fence columns are catalog-only: the table is not rewritten.
+    expect(await fileNode()).toBe(before);
+  });
+
+  test("runs and quarantine: columns, checks and indexes equal the contract", async () => {
+    const s = schema();
+    await applyRootstockMigrations(main.transactor, migrateSlice({ schema: s }));
+    const cols = await sql.unsafe<{
+      t: string;
+      c: string;
+      type: string;
+      n: string;
+      d: string | null;
+    }>(
+      `SELECT table_name AS t, column_name AS c, data_type AS type, is_nullable AS n, column_default AS d
+       FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name IN ('runs', 'quarantine')
+       ORDER BY table_name, ordinal_position`,
+      [s],
+    );
+    expect(cols.map((r) => `${r.t}.${r.c} ${r.type} ${r.n} ${r.d ?? "-"}`)).toEqual([
+      "quarantine.id uuid NO gen_random_uuid()",
+      "quarantine.job text NO -",
+      "quarantine.external_id text NO -",
+      "quarantine.payload jsonb NO -",
+      "quarantine.reason text NO -",
+      "quarantine.status text NO 'pending'::text",
+      `quarantine.failed_at ${TS} NO now()`,
+      `quarantine.resolved_at ${TS} YES -`,
+      "quarantine.run_id uuid YES -",
+      "runs.id uuid NO -",
+      "runs.job text NO -",
+      "runs.mode text NO -",
+      "runs.status text NO -",
+      "runs.phase text YES -",
+      "runs.lock_name text NO -",
+      "runs.holder uuid NO -",
+      `runs.started_at ${TS} NO now()`,
+      `runs.finished_at ${TS} YES -`,
+      "runs.listed integer YES -",
+      "runs.written integer YES -",
+      "runs.unchanged integer YES -",
+      "runs.quarantined integer YES -",
+      "runs.excluded_count integer YES -",
+      "runs.reconciled boolean YES -",
+      "runs.excluded_reasons jsonb NO '{}'::jsonb",
+      "runs.counts jsonb NO '{}'::jsonb",
+      "runs.tokens jsonb NO '{}'::jsonb",
+      "runs.cost_usd numeric YES -",
+      "runs.cost_note text YES -",
+      "runs.scope jsonb YES -",
+      "runs.scope_excluded jsonb YES -",
+      "runs.overrides jsonb NO '[]'::jsonb",
+      "runs.reason text YES -",
+    ]);
+    const checks = await sql.unsafe<{ name: string }>(
+      `SELECT conname AS name FROM pg_constraint
+       WHERE connamespace = to_regnamespace($1::text) AND contype = 'c'
+         AND conrelid IN (to_regclass(quote_ident($1) || '.runs'), to_regclass(quote_ident($1) || '.quarantine'))
+       ORDER BY conname`,
+      [s],
+    );
+    expect(checks.map((r) => r.name)).toEqual([
+      "quarantine_status_check",
+      "runs_settled_check",
+      "runs_status_check",
+    ]);
+    const indexes = await sql.unsafe<{ name: string; def: string }>(
+      `SELECT indexname AS name, indexdef AS def FROM pg_indexes
+       WHERE schemaname = $1 AND tablename IN ('runs', 'quarantine') AND indexname NOT LIKE '%_pkey'
+       ORDER BY indexname`,
+      [s],
+    );
+    expect(indexes.map((r) => r.def)).toEqual([
+      `CREATE UNIQUE INDEX quarantine_job_external_idx ON ${s}.quarantine USING btree (job, external_id)`,
+      `CREATE INDEX quarantine_pending_idx ON ${s}.quarantine USING btree (job) WHERE (status = 'pending'::text)`,
+      `CREATE INDEX runs_job_ok_idx ON ${s}.runs USING btree (job, started_at DESC, id DESC) WHERE (status = 'ok'::text)`,
+      `CREATE INDEX runs_job_started_idx ON ${s}.runs USING btree (job, started_at DESC)`,
+      `CREATE INDEX runs_running_idx ON ${s}.runs USING btree (lock_name) WHERE (status = 'running'::text)`,
+    ]);
+    // The settled check: a running row has no finish time, a settled one has one.
+    const bad = await sql
+      .unsafe(
+        `INSERT INTO "${s}".runs (id, job, mode, status, lock_name, holder)
+         VALUES (gen_random_uuid(), 'alpha-sync', 'manual', 'ok', 'alpha-sync', gen_random_uuid())`,
+      )
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(bad).not.toBeNull();
   });
 });

@@ -89,6 +89,24 @@ application connects as a different role, grant it:
 Without them the lock refuses `UNFENCED` (the fence cannot write its row) and
 the queue and cursor calls fail with the driver's permission error.
 
+**Run record.** The `runs` subpath (0.8.0) adds two more tables, `runs` and
+`quarantine`, owned by the migrating role like the others. When the writers
+connect as another role, grant it `SELECT`, `INSERT`, `UPDATE`, `DELETE` on
+`rootstock.runs` and `rootstock.quarantine` (or on your own quarantine table,
+when you pass one). 0.8.0 also adds two columns to `work_queue`,
+`version bigint NOT NULL DEFAULT 0` and `claim_token uuid`; a consumer that
+passes its own queue table adds the same two columns, with the same types and
+default, in its own additive migration applied before the 0.8.0 code serves.
+Start that migration with `SET lock_timeout = '5s';`: the `ALTER TABLE` needs
+an exclusive lock for a moment, and without a timeout it queues behind any
+open reader of a busy queue table and stalls every queue statement behind it.
+Existing table grants on `work_queue` cover the new columns. Altering
+`work_queue` needs the migrating role to **own** it (creating tables needed
+only `CREATE` on the schema): check `SELECT tableowner FROM pg_tables WHERE
+schemaname = 'rootstock'` before the first 0.8.0 deploy. A role that only
+reads run history (dashboards, freshness checks) needs `SELECT` on
+`rootstock.runs`.
+
 ### Rolling back
 
 Rolling a consumer back to 0.5.x after 0.6.0 migrated its database leaves
@@ -96,6 +114,13 @@ applied migrations that release has no files for: `migrate status` reads the
 database as ahead (so a drift monitor pages) and `apply --manual` refuses
 until the consumer is on 0.6.0 again. A deploy's `apply --deploy` still goes
 through. Fix forward with a release, not by reverting the migrations.
+
+The same holds for any pre-0.8 release after 0.8.0 migrated a database: three
+files read as ahead, `apply --deploy` goes through, `status` and `apply
+--manual` stay red until the consumer is on 0.8.x again. A pre-0.8 image
+ignores the new tables and columns (a claim token it leaves on a released row
+is overwritten by the next 0.8 claim). Once 0.8.0 migrated a database, fix
+forward on 0.8.x only: an older line can never ship a migration there.
 
 ### Run lock
 
@@ -135,6 +160,28 @@ through. Fix forward with a release, not by reverting the migrations.
   `endTimeoutSeconds` and frees the in-process turn before closing, so a
   close that hangs never holds the next waiter (the database lock does,
   until that session ends).
+- **Block mode (0.8.0).** `wait: { mode: "block" }` waits in
+  `pg_advisory_lock` with `lock_timeout` set to what is left of the wait, and
+  `client_connection_check_interval` set to `wait.block.checkIntervalMs`, then
+  restores both before fencing. An abort ends the waiting session with
+  `destroy()` (or `close()` when the session has none), so the server drops
+  the waiter instead of granting it later; a grant that races the abort is
+  unlocked at once and refused `ABANDONED`. The connection check works only
+  on a Linux server: elsewhere the server refuses it, the lock waits without
+  it and emits `lock.connection_check_unavailable` once per wait, and a
+  waiter whose client vanished stays queued until `lock_timeout`. A
+  role-level `statement_timeout` shorter than the wait ends the wait as an
+  error, not `HELD`. A session wrapper that spreads a shipped session and
+  overrides only `close` is skipped on abort: wrap `destroy` too. Block
+  mode needs PostgreSQL 14 or later. On a server that refuses the connection
+  check, `lock.connection_check_unavailable` fires on every block wait; that
+  is expected there. An abort that lands while the session is still opening
+  or setting up is honoured once that step returns (bounded by
+  `probeStallSeconds`), not at once. Over Bun.SQL the abort is prompt only on
+  Bun 1.4.4 or later: before that, `close({ timeout: 0 })` waits for the
+  waiting statement, so an aborted wait refuses `ABANDONED` only when
+  `lock_timeout` fires or the lock is granted (and then freed as the session
+  closes). postgres.js is prompt on every supported Bun.
 - **`open` must make a new client each call.** It runs once for the acquire
   and once more for each stalled-probe recovery, which closes the session it
   replaces. An `open` that wraps one shared client makes that recovery claim
@@ -153,6 +200,15 @@ through. Fix forward with a release, not by reverting the migrations.
 - **`"contended"` means retry.** `enqueue` returns `"contended"` when another
   writer held the row past `enqueueLockTimeoutMs`. Nothing was written, so
   the caller retries (or drops the event knowingly).
+- **A contended ack leaves the row claimed.** `ack`, `fail` and
+  `extendClaim` (0.8.0) wait at most `ackLockTimeoutMs` for the row; past
+  that they emit `queue.ack_contended` and rethrow the 55P03. The row stays
+  claimed and is reclaimed when the claim expires, with an attempt charged.
+- **Present the claim.** `ack`, `fail` and `extendClaim` take the `claim`
+  the row came back with from `claim`; a stale holder whose row was
+  reclaimed matches nothing and gets `missing`. `extendClaim` answering
+  `"changed"` means new work arrived since the claim: keep going, and the
+  ack releases the row for its next run instead of deleting it.
 - **An enqueue on a dead key is parked.** When the key is dead-lettered, the
   enqueue coalesces into the dead row and reports `queue.enqueued` with
   `result: "on_dead"`. Nothing claims it until someone calls `retryDead`, so
@@ -164,6 +220,52 @@ through. Fix forward with a release, not by reverting the migrations.
 - **Write cursors under the run lock.** `setCursor` has no compare-and-set:
   two writers race and the last one wins. Hold the run lock for the source
   whose cursor you advance.
+
+### Run record
+
+- **`finish` never throws for the database.** It returns `{ written: true }`
+  when its row settled, `why: "settled-elsewhere"` when a later run under the
+  same lock already settled it as interrupted, and `why: "error"` (with the
+  driver's `error`, and `runs.record_failed`) when the write failed. The work
+  itself may have succeeded; only the record is lost, and the next run under
+  the lock settles the row as interrupted. Alert on `runs.record_failed`.
+- **Retries on a lost connection.** When the settle fails with a
+  connection error (SQLSTATE class 08, 57P01–57P03, or a driver connection
+  error with no SQLSTATE), `finish` retries it up to twice, each after
+  `deps.sleep(1000)` (at once when no `sleep` is given). When a retry finds
+  no running row, it reads the run's own row back: if the first attempt had
+  committed before the connection dropped, the finish counts as written.
+  Any other failure, or a third one, is the result: later calls return it
+  and send nothing.
+- **Events and results carry the raw driver error.** `runs.record_failed`
+  and `finish`'s `error` are the driver's error, unchanged. Some drivers put
+  the statement's parameters in it (the scope, the reason), and a check
+  violation's detail can hold the whole row, so scrub it before shipping it
+  somewhere that should not see run data.
+- **Start the lock's keepalive for every run.** `startRun` does not start
+  it. A running row whose fencing row has not beaten for
+  `staleHeartbeatSeconds` reads `interrupted` in `verdictFor`, so a run
+  without `lock.startKeepalive()` turns red once it outlives that bound. The
+  config holds `staleHeartbeatSeconds` at no less than 6 × the lock's
+  `probeStallSeconds` + `endTimeoutSeconds` + 1 + 2 × `heartbeatSeconds` (426
+  for 30 s beats, a 60 s stall and a 5 s end timeout), so a run that survives
+  a stalled-probe recovery never reads red; the age is read on the database's
+  clock. `runs.lockTable` defaults to the lock slice's table.
+- **Gate at least once every `staleHeartbeatSeconds` in a long phase.** The
+  keepalive never recovers: after a stalled probe or a lost session it beats
+  nothing until the next `ensureExclusive()` recovers the lock, so a
+  phase that never calls it reads `interrupted` once it outlives the bound.
+  Calling it per batch is enough.
+- **Two kinds of `interrupted`.** `verdictFor` reads `interrupted` both for a
+  settled `interrupted` row and for a row still `running` whose heartbeat
+  went stale (its `at` is the last beat). Looking for the second with
+  `status = 'interrupted'` finds nothing: look at the job's `running` rows.
+  A running row whose fencing row was taken by something that never calls
+  `startRun` has no heartbeat to judge and is not counted; only the next
+  `startRun` under that lock settles it.
+- **A refused run records no buckets.** `finish("refused")` writes NULL
+  buckets and `reconciled` even after `account()`; counters, tokens and cost
+  are still recorded.
 
 ## Rules
 

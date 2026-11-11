@@ -22,7 +22,8 @@ export type QueueRefusalReason =
   | "payload_too_large"
   | "cursor_name_invalid"
   | "cursor_value_invalid"
-  | "error_class_invalid";
+  | "error_class_invalid"
+  | "claim_invalid";
 
 export class RootstockQueueError extends Error {
   readonly code: QueueErrorCode;

@@ -36,6 +36,8 @@ export interface QueueSliceInput {
   maxPayloadBytes: number;
   maxClaimLimit: number;
   enqueueLockTimeoutMs: number;
+  /** The lock wait of ack, fail and extendClaim, 1 to 60 000 ms. */
+  ackLockTimeoutMs: number;
   cursors?: CursorTableInput;
 }
 
@@ -66,6 +68,7 @@ export interface QueueSlice {
   readonly maxPayloadBytes: number;
   readonly maxClaimLimit: number;
   readonly enqueueLockTimeoutMs: number;
+  readonly ackLockTimeoutMs: number;
   readonly cursors: CursorTable | null;
 }
 
@@ -85,6 +88,7 @@ const QUEUE_KEYS: ReadonlySet<string> = new Set([
   "maxPayloadBytes",
   "maxClaimLimit",
   "enqueueLockTimeoutMs",
+  "ackLockTimeoutMs",
   "cursors",
 ]);
 const QUEUE_REQUIRED = [
@@ -101,6 +105,7 @@ const QUEUE_REQUIRED = [
   "maxPayloadBytes",
   "maxClaimLimit",
   "enqueueLockTimeoutMs",
+  "ackLockTimeoutMs",
 ] as const;
 const CURSOR_KEYS: ReadonlySet<string> = new Set([
   "table",
@@ -271,6 +276,13 @@ export function queueSlice(input: QueueSliceInput, defaults?: { schema?: string 
     1,
     60_000,
   );
+  const ackLockTimeoutMs = bounded(
+    r,
+    "ackLockTimeoutMs",
+    own(fields, "ackLockTimeoutMs"),
+    1,
+    60_000,
+  );
   const rawCursors = own(fields, "cursors");
   const cursors = rawCursors === undefined ? null : parseCursor(r, rawCursors, "cursors.", schema);
   return queueBrand.mark(
@@ -290,6 +302,7 @@ export function queueSlice(input: QueueSliceInput, defaults?: { schema?: string 
       maxPayloadBytes,
       maxClaimLimit,
       enqueueLockTimeoutMs,
+      ackLockTimeoutMs,
       cursors,
     }) as unknown as QueueSlice,
   );

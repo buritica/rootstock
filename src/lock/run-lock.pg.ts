@@ -346,7 +346,14 @@ describe("acquire against a real server", () => {
     const err = await refusal(take("alpha-sync", s));
     expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_UNFENCED");
     expect(err.cause).toBeDefined();
-    expect(await held("alpha-sync")).toBe(false);
+    // The close returns once the client has sent its Terminate; the backend
+    // frees the lock as it exits, a few ms later on a loaded runner.
+    let stillHeld = await held("alpha-sync");
+    for (let i = 0; stillHeld && i < 100; i += 1) {
+      await Bun.sleep(10);
+      stillHeld = await held("alpha-sync");
+    }
+    expect(stillHeld).toBe(false);
   });
 
   test("R9: two rootstock schemas share the advisory key but keep their own fencing rows", async () => {
@@ -403,6 +410,55 @@ describe("acquire against a real server", () => {
       await lock.release();
     }
   });
+});
+
+describe("w4d §8.2: the keepalive reads its fencing row", () => {
+  /**
+   * Ticks until `type` appears: a tick while the last one is still in flight
+   * is skipped by the probe guard, so one tick alone can be lost.
+   */
+  async function tickUntil(h: Harness, type: LockEvent["type"]): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!h.events.some((e) => e.type === type)) {
+      if (Date.now() > deadline) throw new Error(`no ${type} within 5 s`);
+      h.tick();
+      await Bun.sleep(20);
+    }
+  }
+
+  for (const how of ["deleted", "replaced"] as const) {
+    test(`LB6: fence row ${how} while held → the next tick emits fence_missing; the next gate throws LOST`, async () => {
+      const h = harness();
+      const lock = await take("beta-sync", slice(), h);
+      lock.startKeepalive();
+      h.tick();
+      await Bun.sleep(50);
+      expect(h.events.map((e) => e.type)).not.toContain("lock.fence_missing");
+      await adminSql.unsafe(
+        how === "deleted"
+          ? `DELETE FROM "${fenced}".run_locks WHERE name = $1`
+          : `UPDATE "${fenced}".run_locks SET holder = gen_random_uuid() WHERE name = $1`,
+        ["beta-sync"],
+      );
+      await tickUntil(h, "lock.fence_missing");
+      expect(h.events).toContainEqual({
+        type: "lock.fence_missing",
+        name: "beta-sync",
+        holder: lock.holder,
+      });
+      const err = await refusal(lock.ensureExclusive());
+      expect(err.code).toBe("ERR_ROOTSTOCK_LOCK_LOST");
+      expect(h.events).toContainEqual({
+        type: "lock.recovery_refused",
+        name: "beta-sync",
+        attempt: 1,
+        reason: "displaced",
+      });
+      expect(await refusal(lock.ensureExclusive())).toBe(err);
+      await lock.release();
+      expect(await held("beta-sync")).toBe(false);
+    });
+  }
 });
 
 describe("probes", () => {

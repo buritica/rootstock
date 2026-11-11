@@ -15,6 +15,48 @@ const CODES = [
 export type LockErrorCode = (typeof CODES)[number];
 const CODE_SET: ReadonlySet<LockErrorCode> = new Set(CODES);
 
+/**
+ * The fields a refusal carries, by `code` (w4d §8.2): the same values as the
+ * error's top-level fields, which stay.
+ */
+export type LockErrorDetails =
+  | { readonly code: "ERR_ROOTSTOCK_LOCK_HELD"; readonly waitedMs?: number }
+  | { readonly code: "ERR_ROOTSTOCK_LOCK_ABANDONED"; readonly waitedMs: number }
+  | { readonly code: "ERR_ROOTSTOCK_LOCK_MALFUNCTION"; readonly answer: unknown }
+  | {
+      readonly code: "ERR_ROOTSTOCK_LOCK_CONN";
+      readonly expectedPid: number;
+      readonly actualPid: number | null;
+    }
+  | {
+      readonly code: Exclude<
+        LockErrorCode,
+        | "ERR_ROOTSTOCK_LOCK_HELD"
+        | "ERR_ROOTSTOCK_LOCK_MALFUNCTION"
+        | "ERR_ROOTSTOCK_LOCK_CONN"
+        | "ERR_ROOTSTOCK_LOCK_ABANDONED"
+      >;
+    };
+
+function detailsOf(code: LockErrorCode, extras: Extras): LockErrorDetails {
+  switch (code) {
+    case "ERR_ROOTSTOCK_LOCK_HELD":
+      return Object.freeze("waitedMs" in extras ? { code, waitedMs: extras.waitedMs } : { code });
+    case "ERR_ROOTSTOCK_LOCK_ABANDONED":
+      return Object.freeze({ code, waitedMs: extras.waitedMs as number });
+    case "ERR_ROOTSTOCK_LOCK_MALFUNCTION":
+      return Object.freeze({ code, answer: extras.answer });
+    case "ERR_ROOTSTOCK_LOCK_CONN":
+      return Object.freeze({
+        code,
+        expectedPid: extras.expectedPid as number,
+        actualPid: extras.actualPid as number | null,
+      });
+    default:
+      return Object.freeze({ code });
+  }
+}
+
 interface Extras {
   readonly waitedMs?: number;
   readonly answer?: unknown;
@@ -38,6 +80,8 @@ export class RootstockLockError extends Error {
   readonly expectedPid?: number;
   /** CONN; null when the fence returned no row. */
   readonly actualPid?: number | null;
+  /** The fields above that this code carries, discriminated by `code`. */
+  readonly details: LockErrorDetails;
 
   constructor(code: LockErrorCode, lockName: string, message: string, extras: Extras = {}) {
     super(message, "cause" in extras ? { cause: extras.cause } : undefined);
@@ -49,6 +93,7 @@ export class RootstockLockError extends Error {
     if ("answer" in extras) this.answer = extras.answer;
     if ("expectedPid" in extras) this.expectedPid = extras.expectedPid;
     if ("actualPid" in extras) this.actualPid = extras.actualPid;
+    this.details = detailsOf(code, extras);
   }
 }
 
@@ -70,11 +115,12 @@ export const refusals = {
       typeof name === "string" ? name : (q(name) ?? "undefined"),
       `rootstock lock: ${q(name)} is not a lock this config declares — declared: ${slice.names.join(", ")}`,
     ),
-  wait: (slice: LockSlice, name: string, summary: unknown) =>
+  /** `needsBlock`: a block-mode wait on a slice without `wait.block`. */
+  wait: (slice: LockSlice, name: string, summary: unknown, needsBlock: boolean) =>
     new RootstockLockError(
       "ERR_ROOTSTOCK_LOCK_WAIT",
       name,
-      `rootstock lock: wait for ${q(name)} must be { mode: "poll", ms: an integer from 0 to ${slice.wait.maxMs} (wait.maxMs), turns: a createTurnQueue() queue, signal?: an ${ABORT_SIGNAL} } — got ${q(summary)}`,
+      `rootstock lock: wait for ${q(name)} must be { mode: "poll" | "block", ms: an integer from 0 (poll) or 1 (block) to ${slice.wait.maxMs} (wait.maxMs), turns: a createTurnQueue() queue, signal?: an ${ABORT_SIGNAL} }${needsBlock ? " (block mode needs wait.block in the lock slice)" : ""} — got ${q(summary)}`,
     ),
   held: (name: string) =>
     new RootstockLockError(

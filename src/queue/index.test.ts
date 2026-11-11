@@ -8,6 +8,7 @@ test("queue exports exactly the frozen surface", async () => {
     "cursorTable",
     "depth",
     "enqueue",
+    "extendClaim",
     "fail",
     "getCursor",
     "listDead",

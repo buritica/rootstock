@@ -1,5 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { L1, L3, L6, L7, L8, LOCK_HELD_PREDICATE, tableStatements } from "./statements.ts";
+import {
+  B0,
+  B1,
+  B1L,
+  B2,
+  L1,
+  L3,
+  L6,
+  L7,
+  L8,
+  LOCK_HELD_PREDICATE,
+  tableStatements,
+} from "./statements.ts";
 
 /** The contract's §2.4 texts, copied by hand, for `rootstock.run_locks`. */
 const T = `"rootstock"."run_locks"`;
@@ -56,7 +68,7 @@ RETURNING pg_backend_pid() AS pid`);
     ).toBe(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked, pg_backend_pid() AS pid,
        (SELECT holder::text FROM ${T} WHERE name = $1) AS holder`);
     expect(s.heartbeat).toBe(
-      `UPDATE ${T} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid`,
+      `UPDATE ${T} SET heartbeat_at = now() WHERE name = $1 AND holder = $2::uuid RETURNING 1 AS ok`,
     );
     expect(s.terminate).toBe(`SELECT pg_terminate_backend(l.pid) AS terminated
 FROM pg_locks l
@@ -71,9 +83,36 @@ WHERE l.pid = $2
     expect(Object.isFrozen(s)).toBe(true);
   });
 
+  test("B0, B1 (B3's text too), B2 are the frozen texts (w4d §8.1)", () => {
+    expect(B0).toBe(
+      "SELECT current_setting('lock_timeout') AS lt, current_setting('client_connection_check_interval') AS cc",
+    );
+    expect(B1).toBe(
+      "SELECT set_config('lock_timeout', $1::text, false) AS lt, set_config('client_connection_check_interval', $2::text, false) AS cc",
+    );
+    expect(B1L).toBe("SELECT set_config('lock_timeout', $1::text, false) AS lt");
+    expect(B2).toBe(
+      "SELECT true AS locked, pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(hashtext($1))) AS t",
+    );
+  });
+
   test("no statement carries a comment or a stray dollar", () => {
     const s = tableStatements({ schema: "a", name: "b" });
-    for (const text of [L1, L3, L6, L7, L8, s.fence, s.claim, s.heartbeat, s.terminate]) {
+    for (const text of [
+      B0,
+      B1,
+      B1L,
+      B2,
+      L1,
+      L3,
+      L6,
+      L7,
+      L8,
+      s.fence,
+      s.claim,
+      s.heartbeat,
+      s.terminate,
+    ]) {
       expect(text).not.toContain("--");
       expect(text.replace(/\$\d+/g, "")).not.toContain("$");
     }

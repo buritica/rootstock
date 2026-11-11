@@ -2,15 +2,31 @@ import type { Row, Sql } from "../db/index.ts";
 import type { LockEvent } from "./events.ts";
 import type { LockDeps } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
-import { L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
+import { B0, B1, B1L, B2, L1, L3, L6, L7, L8, tableStatements } from "./statements.ts";
 
 /**
  * A scripted lock session for the unit suites: `unsafe` answers per
- * statement id (L1-L8, matched by text) from a queue, and records the ids it
- * saw. An answer is rows, an Error to reject with, or a function of the
- * params. An id with an empty queue answers its default.
+ * statement id (L1-L9, B0-B3, B1L/B3L, matched by text; B1's text after a B2 is B3, B1L's is B3L)
+ * from a queue, and records the ids it saw. An answer is rows, an Error to
+ * reject with, or a function of the params. An id with an empty queue
+ * answers its default.
  */
-export type StatementId = "L1" | "L2" | "L3" | "L4" | "L5" | "L6" | "L7" | "L8" | "L9";
+export type StatementId =
+  | "L1"
+  | "L2"
+  | "L3"
+  | "L4"
+  | "L5"
+  | "L6"
+  | "L7"
+  | "L8"
+  | "L9"
+  | "B0"
+  | "B1"
+  | "B2"
+  | "B3"
+  | "B1L"
+  | "B3L";
 export type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[] | Promise<Row[]>);
 
 export interface FakeSession extends LockSession {
@@ -18,6 +34,8 @@ export interface FakeSession extends LockSession {
   /** Each statement's id with the params it was sent, in order. */
   readonly calls: { id: StatementId; params: readonly unknown[] }[];
   readonly closes: number;
+  /** destroy() calls (0 on a session made without destroy). */
+  readonly destroys: number;
   answer(id: StatementId, ...answers: Answer[]): void;
   failClose(err: Error): void;
 }
@@ -27,7 +45,10 @@ export const PID = 4242;
 export const HOLDER = "00000000-0000-4000-8000-000000000001";
 const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
 
-export function fakeSession(table = { schema: "rootstock", name: "run_locks" }): FakeSession {
+export function fakeSession(
+  table = { schema: "rootstock", name: "run_locks" },
+  opts: { destroy?: boolean } = {},
+): FakeSession {
   const t = tableStatements(table);
   const ids = new Map<string, StatementId>([
     [L1, "L1"],
@@ -39,26 +60,44 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
     [L7, "L7"],
     [L8, "L8"],
     [t.terminate, "L9"],
+    [B0, "B0"],
+    [B1, "B1"],
+    [B2, "B2"],
+    [B1L, "B1L"],
   ]);
   const defaults: Record<StatementId, Answer> = {
     L1: [{ locked: true, pid: PID }],
     L2: [{ pid: PID }],
     L3: [{ pid: PID, held: 1 }],
     L4: [{ locked: true, pid: PID + 1, holder: HOLDER }],
-    L5: [],
+    L5: [{ ok: 1 }],
     L6: [{ pg_advisory_unlock: true }],
     L7: [],
     L8: [],
     L9: [{ terminated: true }],
+    B0: [{ lt: "0", cc: "0" }],
+    B1: [{ lt: "", cc: "" }],
+    B2: [{ locked: true, pid: PID }],
+    B3: [{ lt: "", cc: "" }],
+    B1L: [{ lt: "" }],
+    B3L: [{ lt: "" }],
   };
   const queues = new Map<StatementId, Answer[]>();
   const seen: StatementId[] = [];
   const calls: { id: StatementId; params: readonly unknown[] }[] = [];
   let closes = 0;
+  let destroys = 0;
   let closeError: Error | undefined;
   const unsafe = async (query: string, params?: readonly unknown[]): Promise<Row[]> => {
-    const id = ids.get(query);
-    if (id === undefined) throw new Error(`fake session: unknown statement ${query}`);
+    const mapped = ids.get(query);
+    if (mapped === undefined) throw new Error(`fake session: unknown statement ${query}`);
+    const id = !seen.includes("B2")
+      ? mapped
+      : mapped === "B1"
+        ? "B3"
+        : mapped === "B1L"
+          ? "B3L"
+          : mapped;
     seen.push(id);
     calls.push({ id, params: [...(params ?? [])] });
     const answer = queues.get(id)?.shift() ?? defaults[id];
@@ -71,12 +110,15 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
     },
     { unsafe },
   ) as unknown as Sql;
-  return {
+  const session: FakeSession = {
     sql,
     seen,
     calls,
     get closes() {
       return closes;
+    },
+    get destroys() {
+      return destroys;
     },
     answer(id, ...answers) {
       queues.set(id, [...(queues.get(id) ?? []), ...answers]);
@@ -89,6 +131,13 @@ export function fakeSession(table = { schema: "rootstock", name: "run_locks" }):
       if (closeError !== undefined) throw closeError;
     },
   };
+  if (opts.destroy === false) return session;
+  return Object.assign(session, {
+    async destroy() {
+      destroys += 1;
+      if (closeError !== undefined) throw closeError;
+    },
+  });
 }
 
 export interface FakeDeps extends LockDeps {

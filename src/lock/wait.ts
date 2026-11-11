@@ -1,13 +1,16 @@
+import { pgCode, type Row } from "../db/index.ts";
 import { intIn, isRecord } from "../internal/slice.ts";
-import { pause, within } from "./bound.ts";
+import { pause, stalled, within } from "./bound.ts";
 import { ABORT_SIGNAL, type RootstockLockError, refusals } from "./errors.ts";
 import { failure } from "./events.ts";
 import { type Attempt, closeQuietly, fence, pidIn, type RunLock, refused } from "./run-lock.ts";
 import type { LockSession } from "./session.ts";
-import { L1, L6 } from "./statements.ts";
+import { B0, B1, B1L, B2, L1, L6 } from "./statements.ts";
 import { enqueueTurn, isTurnQueue, type TurnQueue } from "./turns.ts";
 
-export type LockWait = { mode: "poll"; ms: number; signal?: AbortSignal; turns: TurnQueue };
+export type LockWait =
+  | { mode: "poll"; ms: number; signal?: AbortSignal; turns: TurnQueue }
+  | { mode: "block"; ms: number; signal?: AbortSignal; turns: TurnQueue };
 
 // By tag, not instanceof: a signal from another realm or module copy is still
 // one. The tag can be forged, so the members the wait uses are checked too.
@@ -26,22 +29,25 @@ function isAbortSignal(v: unknown): boolean {
 }
 
 /**
- * §2.6's validation: anything else refuses WAIT (emitting `lock.refused`).
- * Each field is read once, and the wait that comes back is a fresh frozen
- * copy of the values checked, so a getter cannot change one afterwards.
+ * §2.6's validation, with block mode (w4d §8.1): anything else refuses WAIT
+ * (emitting `lock.refused`). Block mode needs `wait.block` in the slice and
+ * an `ms` of at least 1 (a lock_timeout of 0 means forever). Each field is
+ * read once, and the wait that comes back is a fresh frozen copy of the
+ * values checked, so a getter cannot change one afterwards.
  */
 export function checkWait(a: Attempt, wait: unknown): LockWait {
   const w = isRecord(wait) ? wait : undefined;
   const { mode, ms, turns, signal } = w ?? {};
+  const needsBlock = mode === "block" && a.slice.wait.block === undefined;
   const ok =
     w !== undefined &&
-    mode === "poll" &&
-    intIn(ms, 0, a.slice.wait.maxMs) &&
+    (mode === "poll" || (mode === "block" && !needsBlock)) &&
+    intIn(ms, mode === "block" ? 1 : 0, a.slice.wait.maxMs) &&
     isTurnQueue(turns) &&
     (signal === undefined || isAbortSignal(signal));
   if (!ok) {
     const summary = w === undefined ? wait : { mode, ms };
-    throw refused(a, refusals.wait(a.slice, a.name, summary));
+    throw refused(a, refusals.wait(a.slice, a.name, summary, needsBlock));
   }
   return Object.freeze(
     signal === undefined ? { mode, ms, turns } : { mode, ms, turns, signal: signal as AbortSignal },
@@ -196,6 +202,186 @@ export async function pollAcquire(a: Attempt, wait: LockWait): Promise<RunLock> 
       session = undefined;
       await closeQuietly(a, s, "acquire-error");
     }
+    a.releaseTurn();
+    throw err;
+  }
+}
+
+/** Ends a session at once (block mode's abort): destroy() when it has one, else close(). */
+async function destroyQuietly(a: Attempt, session: LockSession): Promise<void> {
+  try {
+    await (session.destroy === undefined ? session.close() : session.destroy());
+  } catch (error) {
+    a.emit({ type: "lock.end_failed", name: a.name, phase: "acquire-error", ...failure(error) });
+  }
+}
+
+/**
+ * w4d §8.1: take the turn, open, save and set lock_timeout and
+ * client_connection_check_interval (B0, B1), block in pg_advisory_lock (B2),
+ * restore the settings (B3) before the fence, then fence (§2.5 step 5 on).
+ * Only the session the acquire opens runs B0-B3; a recovery's fresh session
+ * never does.
+ */
+export async function blockAcquire(a: Attempt, wait: LockWait): Promise<RunLock> {
+  const { deps, name, slice, emit } = a;
+  const { signal } = wait;
+  // checkWait refused a block-mode wait on a slice without it.
+  const { checkIntervalMs } = slice.wait.block as { readonly checkIntervalMs: number };
+  const stall = slice.probeStallSeconds * 1000;
+  const start = deps.now();
+  const deadline = start + wait.ms;
+  const report = (outcome: "acquired" | "timeout" | "aborted" | "error"): number => {
+    const waitedMs = deps.now() - start;
+    emit({ type: "lock.wait", name, mode: "block", outcome, waitedMs });
+    return waitedMs;
+  };
+
+  const turn = enqueueTurn(wait.turns, name);
+  a.releaseTurn = turn.done;
+  /** Open and not yet closed or handed to the fence. */
+  let session: LockSession | undefined;
+  /** Takes the session out of `session`, so nothing below ends it twice. */
+  const take = (): LockSession => {
+    const s = session as LockSession;
+    session = undefined;
+    return s;
+  };
+  /** Closes the session, reports the wait, then refuses. */
+  const giveUp = async (
+    outcome: "timeout" | "aborted" | "error",
+    refusal: (waitedMs: number) => RootstockLockError,
+  ): Promise<never> => {
+    await closeQuietly(a, take(), "refusal");
+    throw refused(a, refusal(report(outcome)));
+  };
+  /** Closes the session and reports the wait; the catch below frees the turn and rethrows untouched. */
+  const fail = async (err: unknown): Promise<never> => {
+    await closeQuietly(a, take(), "acquire-error");
+    report("error");
+    throw err;
+  };
+  /** A statement bounded by the probe stall: its rows, or the stall as a thrown error. */
+  const bounded = async (
+    text: string,
+    params: readonly unknown[],
+    what: string,
+  ): Promise<Row[]> => {
+    const done = await within(deps, (session as LockSession).sql.unsafe(text, params), stall);
+    if (done === "timeout") throw stalled(what, stall);
+    return done.value;
+  };
+  /** L6 on the session, bounded by the stall; a failure or stall is reported, never thrown. */
+  const unlockBounded = async (): Promise<void> => {
+    try {
+      const unlocked = await within(deps, (session as LockSession).sql.unsafe(L6, [name]), stall);
+      if (unlocked === "timeout") {
+        emit({ type: "lock.unlock_failed", name, ...failure(stalled(`unlocking ${name}`, stall)) });
+      }
+    } catch (error) {
+      emit({ type: "lock.unlock_failed", name, ...failure(error) });
+    }
+  };
+  try {
+    const queued = await awaitTurn(a, turn.ahead, deadline, signal);
+    if (queued === "aborted") throw refused(a, refusals.abandoned(name, report("aborted")));
+    if (queued === "timeout") throw refused(a, refusals.heldAfterWait(name, report("timeout")));
+
+    const { open } = a;
+    session = open();
+    let settings: [string, string];
+    let remainingMs: number;
+    /** Whether B1 set the connection check, so B3 restores it too. */
+    let checked = true;
+    try {
+      const [row] = await bounded(B0, [], `the settings read for ${name}`);
+      const { lt, cc } = row ?? {};
+      if (typeof lt !== "string" || typeof cc !== "string") {
+        throw new Error(`rootstock lock: the settings read for ${name} did not answer two texts`);
+      }
+      settings = [lt, cc];
+      remainingMs = Math.max(1, deadline - deps.now());
+      try {
+        await bounded(B1, [`${remainingMs}ms`, `${checkIntervalMs}ms`], `the settings for ${name}`);
+      } catch (err) {
+        // Off Linux the server refuses the connection check (22023): block
+        // without it; an abort still ends the backend through destroy().
+        if (pgCode(err) !== "22023") throw err;
+        checked = false;
+        emit({ type: "lock.connection_check_unavailable", name });
+        await bounded(B1L, [`${remainingMs}ms`], `the settings for ${name}`);
+      }
+    } catch (err) {
+      return await fail(err);
+    }
+
+    if (signal?.aborted) {
+      // Aborted during the open or the settings: never start a wait.
+      return await giveUp("aborted", (ms) => refusals.abandoned(name, ms));
+    }
+    let blocked: { value: Row[] } | "timeout" | "aborted";
+    try {
+      blocked = await within(deps, session.sql.unsafe(B2, [name]), remainingMs + stall, signal);
+    } catch (err) {
+      if (pgCode(err) === "55P03") {
+        return await giveUp("timeout", (ms) => refusals.heldAfterWait(name, ms));
+      }
+      return await fail(err);
+    }
+    if (blocked === "aborted") {
+      // The backend may still be waiting: the socket goes now, not after it.
+      await destroyQuietly(a, take());
+      throw refused(a, refusals.abandoned(name, report("aborted")));
+    }
+    if (blocked === "timeout") {
+      // The server did not honour lock_timeout: B2 is still in flight, so the
+      // socket goes now rather than after it (§20 A33).
+      await destroyQuietly(a, take());
+      throw refused(a, refusals.heldAfterWait(name, report("timeout")));
+    }
+    const [row] = blocked.value;
+    if (row?.locked !== true) {
+      return await giveUp("error", () => refusals.malfunction(name, row?.locked));
+    }
+    const pid = pidIn(row);
+    if (pid === undefined) {
+      return await giveUp("error", () => refusals.malfunction(name, row?.pid));
+    }
+    if (signal?.aborted) {
+      // The last-grant race: never hand out a lock granted after the abort.
+      await unlockBounded();
+      return await giveUp("aborted", (ms) => refusals.abandoned(name, ms));
+    }
+
+    try {
+      await bounded(
+        checked ? B1 : B1L,
+        checked ? settings : [settings[0]],
+        `restoring the settings for ${name}`,
+      );
+    } catch (err) {
+      await unlockBounded();
+      // A stalled B3 may still be in flight: the socket goes now (§20 A33).
+      await destroyQuietly(a, take());
+      report("error");
+      throw err;
+    }
+
+    report("acquired");
+    const lock = await fence(a, take(), pid, {
+      ms: () => stall,
+      refusal: (_why, cause) => refusals.unfenced(slice, name, cause),
+    });
+    if (signal?.aborted) {
+      // The abort landed during B3 or the fence: the lock goes back (§20 A31).
+      await lock.release();
+      throw refused(a, refusals.abandoned(name, deps.now() - start));
+    }
+    return lock;
+  } catch (err) {
+    // Any throw the paths above did not plan for (a throwing clock, a broken
+    // hook into the driver) still closes the session and frees the turn.
+    if (session !== undefined) await closeQuietly(a, take(), "acquire-error");
     a.releaseTurn();
     throw err;
   }
