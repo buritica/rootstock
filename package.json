@@ -38,7 +38,8 @@
     "./queue": "./src/queue/index.ts",
     "./runs": "./src/runs/index.ts",
     "./concurrency": "./src/concurrency/index.ts",
-    "./config": "./src/config/index.ts"
+    "./config": "./src/config/index.ts",
+    "./retrieval": "./src/retrieval/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
