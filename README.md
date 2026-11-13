@@ -29,6 +29,7 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 |---|---|---|
 | `golden` | v0.0.1 | Golden snapshots that prove a refactor or extraction changed nothing: canonical JSON, capture/check, a recording `fetch`, seeded vectors and throwaway Postgres |
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
+| `retrieval` | next | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable |
 
 More arrive in phases. Phase 1 extractions must be byte-identical: each
 consumer adopts a module only where its goldens stay unchanged. Changes that
