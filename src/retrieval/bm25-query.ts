@@ -22,13 +22,17 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * caller, as you would for any search.
  *
  * CANDIDATE BUDGET. The index hands back at most `default_limit` candidates
- * (the index storage parameter, else the extension's default of 1000) BEFORE
- * PostgreSQL applies the SQL `limit`, so a `limit` above that cap comes back
- * silently short. Pass `budget` to raise it for one query: the result's
- * `setBudget` is a `set local lakebase_bm25.default_limit` statement the caller
- * runs first, in the SAME transaction as `text` (`set local` outside a
- * transaction does nothing past that statement). `setBudget` is null when no
- * budget is given, and `text` and `params` are the same either way.
+ * BEFORE PostgreSQL applies the SQL `limit`, so a `limit` above that cap comes
+ * back silently short. The cap is the `lakebase_bm25.default_limit` setting if
+ * the session or transaction set one, else the index's `default_limit`
+ * storage parameter, else the extension's default of 1000. Pass `budget` to
+ * raise it for one query: the result's `setBudget` is a `set local
+ * lakebase_bm25.default_limit` statement the caller runs first, in the SAME
+ * transaction as `text`. Outside a transaction block PostgreSQL only warns
+ * and ignores `set local`, so an autocommit caller that runs the two
+ * statements separately gets the old cap and short results, with no error.
+ * `setBudget` is null when no budget is given, and `text` and `params` are the
+ * same either way.
  *
  * NOT EXECUTED HERE. This repo's tests pin the statement text and the
  * parameter order only: the Postgres test image does not ship

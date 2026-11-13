@@ -80,7 +80,7 @@ limit $4`);
     for (const budget of [1.5, Number.NaN, -1, 0, 19, 65536, Number.POSITIVE_INFINITY]) {
       expect(() => bm25Query({ ...base, budget })).toThrow(`got ${budget}`);
     }
-    const injected = "1; drop table docs" as unknown as number;
-    expect(() => bm25Query({ ...base, budget: injected })).toThrow();
+    // @ts-expect-error a caller without types must still not reach `set` with text
+    expect(() => bm25Query({ ...base, budget: "1; drop table docs" })).toThrow();
   });
 });
