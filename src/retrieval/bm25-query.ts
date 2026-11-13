@@ -11,6 +11,12 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * shares no term with the query scores 0 and is left out, so a result shorter
  * than `limit` means that few rows matched.
  *
+ * BEFORE FIRST USE the database needs two things, or the statement fails at
+ * run time naming an index that does not exist: `create extension
+ * lakebase_text`, and a `lakebase_bm25` index on the tsvector column built
+ * AFTER the table is populated (the index takes its corpus statistics at
+ * build time). Ship the index before the code that queries it.
+ *
  * An empty or all-stopword `query` parses to an empty tsvector; what the
  * extension does with that is its own business, so guard an empty query in the
  * caller, as you would for any search.
@@ -24,6 +30,12 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * `where` is TRUSTED SQL over the table alias `d` (a scope the caller built
  * from its own constants and bind-free predicates). It is spliced in as
  * written and must never carry request text.
+ * It also costs: a scope inside the scored subquery can stop the index from
+ * serving the top-K directly. On a large table, prefer no `where`, a larger
+ * `limit`, and the scope applied on the caller's own join.
+ *
+ * Ties order by `key`, so the cut at `limit` is deterministic only when
+ * `keyColumn` is unique.
  */
 export interface Bm25QueryInput {
   /** Table holding the documents; `schema.table` is accepted. */
