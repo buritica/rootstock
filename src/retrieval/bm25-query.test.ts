@@ -50,4 +50,37 @@ describe("bm25Query", () => {
     expect(() => bm25Query({ ...base, limit: 0 })).toThrow();
     expect(() => bm25Query({ ...base, limit: 1.5 })).toThrow();
   });
+
+  test("without a budget, the statement is unchanged and nothing is set", () => {
+    const q = bm25Query(base);
+    expect(q.setBudget).toBeNull();
+    expect(q.params).toEqual(["english", "upload size limit", "docs_bm25", 20]);
+    expect(q.text).toBe(`select key, score from (
+  select d."slug" as key,
+         d."tsv" <@> to_bm25query(to_tsvector($1::regconfig, $2), $3) as score
+  from "docs" d
+  
+) s
+where score < 0
+order by score, key
+limit $4`);
+  });
+
+  test("a budget adds a set local statement and leaves the query alone", () => {
+    const plain = bm25Query(base);
+    const q = bm25Query({ ...base, limit: 300, budget: 600 });
+    expect(q.setBudget).toEqual({ text: "set local lakebase_bm25.default_limit = 600" });
+    expect(q.text).toBe(plain.text);
+    expect(q.params).toEqual(["english", "upload size limit", "docs_bm25", 300]);
+    expect(bm25Query({ ...base, budget: 20 }).setBudget?.text).toEndWith("= 20");
+    expect(bm25Query({ ...base, budget: 65535 }).setBudget?.text).toEndWith("= 65535");
+  });
+
+  test("rejects a budget that is not an integer from limit to 65535", () => {
+    for (const budget of [1.5, Number.NaN, -1, 0, 19, 65536, Number.POSITIVE_INFINITY]) {
+      expect(() => bm25Query({ ...base, budget })).toThrow(`got ${budget}`);
+    }
+    // @ts-expect-error a caller without types must still not reach `set` with text
+    expect(() => bm25Query({ ...base, budget: "1; drop table docs" })).toThrow();
+  });
 });
