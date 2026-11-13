@@ -40,6 +40,10 @@ export function reciprocalRankFusion<T>(
 ): Fused<T>[] {
   const k = options.k ?? 60;
   if (!(k >= 0)) throw new Error(`reciprocalRankFusion: k must be >= 0, got ${k}`);
+  const { limit } = options;
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+    throw new Error(`reciprocalRankFusion: limit must be a non-negative integer, got ${limit}`);
+  }
   const byKey = new Map<string, Fused<T> & { order: number; best: number }>();
   lists.forEach((list, listIndex) => {
     const weight = list.weight ?? 1;
@@ -63,6 +67,6 @@ export function reciprocalRankFusion<T>(
   const fused = [...byKey.values()].sort(
     (a, b) => b.score - a.score || a.best - b.best || a.order - b.order,
   );
-  const cut = options.limit === undefined ? fused : fused.slice(0, options.limit);
+  const cut = limit === undefined ? fused : fused.slice(0, limit);
   return cut.map(({ item, score, ranks }) => ({ item, score, ranks }));
 }

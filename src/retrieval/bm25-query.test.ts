@@ -30,6 +30,7 @@ describe("bm25Query", () => {
   test("refuses an identifier that is not a plain name", () => {
     expect(() => bm25Query({ ...base, keyColumn: 'we"ird' })).toThrow();
     expect(() => bm25Query({ ...base, table: "docs; drop table x" })).toThrow();
+    expect(() => bm25Query({ ...base, table: "a.b.c" })).toThrow();
   });
 
   test("keeps only matching rows, best first, with a stable tie order", () => {

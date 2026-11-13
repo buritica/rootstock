@@ -11,6 +11,16 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * shares no term with the query scores 0 and is left out, so a result shorter
  * than `limit` means that few rows matched.
  *
+ * An empty or all-stopword `query` parses to an empty tsvector; what the
+ * extension does with that is its own business, so guard an empty query in the
+ * caller, as you would for any search.
+ *
+ * NOT EXECUTED HERE. This repo's tests pin the statement text and the
+ * parameter order only: the Postgres test image does not ship
+ * `lakebase_text`, so nothing in this repo runs the statement. A consumer that
+ * adopts it owns the integration test against a database that has the
+ * extension.
+ *
  * `where` is TRUSTED SQL over the table alias `d` (a scope the caller built
  * from its own constants and bind-free predicates). It is spliced in as
  * written and must never carry request text.
@@ -41,7 +51,11 @@ export function bm25Query(input: Bm25QueryInput): Bm25Query {
   if (!Number.isInteger(input.limit) || input.limit < 1) {
     throw new Error(`bm25Query: limit must be a positive integer, got ${input.limit}`);
   }
-  const table = input.table.split(".").map(quoteIdentifier).join(".");
+  const tableParts = input.table.split(".");
+  if (tableParts.length > 2) {
+    throw new Error(`bm25Query: table must be "name" or "schema.name", got ${input.table}`);
+  }
+  const table = tableParts.map(quoteIdentifier).join(".");
   const key = quoteIdentifier(input.keyColumn);
   const tsv = quoteIdentifier(input.tsvColumn);
   const scope = input.where ? `where ${input.where}` : "";

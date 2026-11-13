@@ -57,6 +57,13 @@ describe("reciprocalRankFusion", () => {
     expect(out[0]?.item.from).toBe("lex");
   });
 
+  test("rejects a limit that is not a non-negative integer", () => {
+    for (const limit of [-1, 1.5, Number.NaN]) {
+      expect(() => reciprocalRankFusion([{ items: ["a", "b"] }], { key, limit })).toThrow();
+    }
+    expect(reciprocalRankFusion([{ items: ["a"] }], { key, limit: 0 })).toEqual([]);
+  });
+
   test("rejects a negative k or weight", () => {
     expect(() => reciprocalRankFusion([{ items: ["a"] }], { key, k: -1 })).toThrow();
     expect(() => reciprocalRankFusion([{ items: ["a"], weight: -1 }], { key })).toThrow();
