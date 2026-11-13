@@ -21,6 +21,15 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * extension does with that is its own business, so guard an empty query in the
  * caller, as you would for any search.
  *
+ * CANDIDATE BUDGET. The index hands back at most `default_limit` candidates
+ * (the index storage parameter, else the extension's default of 1000) BEFORE
+ * PostgreSQL applies the SQL `limit`, so a `limit` above that cap comes back
+ * silently short. Pass `budget` to raise it for one query: the result's
+ * `setBudget` is a `set local lakebase_bm25.default_limit` statement the caller
+ * runs first, in the SAME transaction as `text` (`set local` outside a
+ * transaction does nothing past that statement). `setBudget` is null when no
+ * budget is given, and `text` and `params` are the same either way.
+ *
  * NOT EXECUTED HERE. This repo's tests pin the statement text and the
  * parameter order only: the Postgres test image does not ship
  * `lakebase_text`, so nothing in this repo runs the statement. A consumer that
@@ -30,9 +39,11 @@ import { quoteIdentifier } from "../db/quote-identifier.ts";
  * `where` is TRUSTED SQL over the table alias `d` (a scope the caller built
  * from its own constants and bind-free predicates). It is spliced in as
  * written and must never carry request text.
- * It also costs: a scope inside the scored subquery can stop the index from
- * serving the top-K directly. On a large table, prefer no `where`, a larger
- * `limit`, and the scope applied on the caller's own join.
+ * It also costs: the index returns its candidates first and the scope runs
+ * after (the extension's prefilter is off by default and slow when on), so a
+ * scope spends the candidate budget. Measured on a large table, a 1-in-16
+ * scope kept 14 of 60 requested rows. Prefer no `where`, a larger `limit` and
+ * `budget`, and the scope applied on the caller's own join.
  *
  * Ties order by `key`, so the cut at `limit` is deterministic only when
  * `keyColumn` is unique.
@@ -51,17 +62,33 @@ export interface Bm25QueryInput {
   /** The user's query text. Bound, never spliced. */
   query: string;
   limit: number;
+  /**
+   * Candidates the index may return for this query, an integer in 1..65535
+   * and at least `limit`. Omit it to keep the index's own `default_limit`.
+   */
+  budget?: number;
   where?: string;
 }
 
 export interface Bm25Query {
   text: string;
   params: [config: string, query: string, index: string, limit: number];
+  /** Run first, in the same transaction as `text`; null without a budget. */
+  setBudget: { text: string } | null;
 }
 
 export function bm25Query(input: Bm25QueryInput): Bm25Query {
   if (!Number.isInteger(input.limit) || input.limit < 1) {
     throw new Error(`bm25Query: limit must be a positive integer, got ${input.limit}`);
+  }
+  const { budget } = input;
+  if (
+    budget !== undefined &&
+    (!Number.isInteger(budget) || budget < input.limit || budget > 65535)
+  ) {
+    throw new Error(
+      `bm25Query: budget must be an integer from limit (${input.limit}) to 65535, got ${budget}`,
+    );
   }
   const tableParts = input.table.split(".");
   if (tableParts.length > 2) {
@@ -80,5 +107,9 @@ export function bm25Query(input: Bm25QueryInput): Bm25Query {
 where score < 0
 order by score, key
 limit $4`;
-  return { text, params: [input.config, input.query, input.index, input.limit] };
+  // `set` takes no bind parameters, so the budget is inlined. The integer
+  // check above is what keeps anything but digits out of this statement.
+  const setBudget =
+    budget === undefined ? null : { text: `set local lakebase_bm25.default_limit = ${budget}` };
+  return { text, params: [input.config, input.query, input.index, input.limit], setBudget };
 }
