@@ -4,6 +4,7 @@ import { lockSlice } from "../lock/index.ts";
 import { migrateSlice } from "../migrate/index.ts";
 import { queueSlice } from "../queue/index.ts";
 import { runsSlice } from "../runs/index.ts";
+import { usageSlice } from "../usage/index.ts";
 import {
   composeRootstockConfig,
   type RootstockConfig,
@@ -18,9 +19,10 @@ const PARSERS: SliceParsers = {
   lockSlice,
   queueSlice,
   runsSlice,
+  usageSlice,
 };
 
-/** Composes the client, migrate, concurrency, lock, queue and runs slices and checks the invariants. */
+/** Composes the client, migrate, concurrency, lock, queue, runs and usage slices and checks the invariants. */
 export function defineRootstockConfig(input: RootstockConfigInput): RootstockConfig {
   return composeRootstockConfig(PARSERS, input);
 }

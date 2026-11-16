@@ -10,4 +10,6 @@ export const MANIFEST: readonly string[] = Object.freeze([
   "20261107145200_runs.sql",
   "20261107145201_quarantine.sql",
   "20261107145202_work_queue_claim_fence.sql",
+  "20261116220000_mcp_calls.sql",
+  "20261116220001_spend.sql",
 ]);

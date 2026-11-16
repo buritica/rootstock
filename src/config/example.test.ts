@@ -7,6 +7,7 @@ import { QUEUE_INPUT } from "../queue/fixtures.test-support.ts";
 import { queueSlice } from "../queue/index.ts";
 import { runsInputWithStaleHeartbeat } from "../runs/fixtures.test-support.ts";
 import { runsSlice } from "../runs/index.ts";
+import { usageSlice } from "../usage/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type Invariant, type RootstockConfigInput } from "./define.ts";
 import { widthBelowPool } from "./invariants.ts";
@@ -42,6 +43,7 @@ const unfrozen = {
   lockSlice,
   queueSlice,
   runsSlice,
+  usageSlice,
 } satisfies SliceParsers;
 
 const define = defineRootstockConfig;
@@ -438,6 +440,7 @@ describe("print", () => {
       lockSlice,
       queueSlice,
       runsSlice,
+      usageSlice,
     } satisfies SliceParsers;
     expect(printRootstockConfig(composeRootstockConfig(leaky, exampleInput))).toBe(EXAMPLE_PRINT);
   });
@@ -493,6 +496,10 @@ describe("define", () => {
       runsSlice: (i, d) => {
         calls.push("runs");
         return runsSlice(i, d);
+      },
+      usageSlice: (i, d) => {
+        calls.push("usage");
+        return usageSlice(i, d);
       },
     };
     let caught: unknown;
@@ -662,6 +669,7 @@ describe("brand and failure paths", () => {
       lockSlice,
       queueSlice,
       runsSlice,
+      usageSlice,
     } satisfies SliceParsers;
     const config = composeRootstockConfig(recording, exampleInput);
     expect(config.client).toBe(made.client as typeof config.client);
@@ -838,6 +846,7 @@ describe("brand and failure paths", () => {
       lockSlice,
       queueSlice,
       runsSlice,
+      usageSlice,
     } satisfies SliceParsers;
     let caught: unknown;
     try {
