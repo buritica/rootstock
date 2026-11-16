@@ -1,4 +1,4 @@
-import { codeIn } from "../internal/slice.ts";
+import { codeIn, q } from "../internal/slice.ts";
 
 const CODES = [
   "ERR_ROOTSTOCK_RUNNER_INPUT",
@@ -29,4 +29,26 @@ export class RootstockRunnerError extends Error {
 /** The code of a runner refusal, by `code` (survives two module copies), or undefined. */
 export function runnerErrorCode(err: unknown): RunnerErrorCode | undefined {
   return codeIn(CODE_SET, err);
+}
+
+/** An INPUT refusal: `rootstock runner: <fn>(): <field> <what> — got <q(value)>` (F25). */
+export const input = (
+  fn: string,
+  field: string,
+  what: string,
+  value: unknown,
+): RootstockRunnerError =>
+  new RootstockRunnerError(
+    "ERR_ROOTSTOCK_RUNNER_INPUT",
+    `${fn}(): ${field} ${what} — got ${q(value)}`,
+  );
+
+export const isFn = (v: unknown): boolean => typeof v === "function";
+
+/** Refuses anything without the Transactor's `begin` and `sql`. */
+export function checkTransactor(fn: string, tx: unknown): void {
+  const t = tx as { begin?: unknown; sql?: unknown } | null;
+  if (typeof t !== "object" || t === null || !isFn(t.begin) || !isFn(t.sql)) {
+    throw input(fn, "tx", "must be a Transactor", tx);
+  }
 }

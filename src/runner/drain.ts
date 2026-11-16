@@ -1,7 +1,7 @@
 import { pgCode } from "../db/index.ts";
-import { intIn, q, safeHook } from "../internal/slice.ts";
+import { intIn, safeHook } from "../internal/slice.ts";
 import { ack, claim, extendClaim, fail, type QueueRow } from "../queue/index.ts";
-import { RootstockRunnerError } from "./errors.ts";
+import { checkTransactor, isFn, input as refusal } from "./errors.ts";
 import type {
   DrainDeps,
   DrainFailure,
@@ -15,21 +15,13 @@ import type {
   SourceDrain,
 } from "./types.ts";
 
-const input = (field: string, what: string, value: unknown): RootstockRunnerError =>
-  new RootstockRunnerError(
-    "ERR_ROOTSTOCK_RUNNER_INPUT",
-    `drainQueue(): ${field} ${what} — got ${q(value)}`,
-  );
-
-const isFn = (v: unknown): boolean => typeof v === "function";
+const FN = "drainQueue";
+const input = (field: string, what: string, value: unknown) => refusal(FN, field, what, value);
 const BOUND = 1_000_000;
 
 function check<T, L extends DrainLock>(i: DrainInput<T, L>): void {
   if (typeof i !== "object" || i === null) throw input("input", "must be an object", i);
-  const tx = i.tx as Partial<DrainInput<T, L>["tx"]> | null;
-  if (typeof tx !== "object" || tx === null || !isFn(tx.begin) || typeof tx.sql !== "function") {
-    throw input("tx", "must be a Transactor", i.tx);
-  }
+  checkTransactor(FN, i.tx);
   if (!Array.isArray(i.sources)) throw input("sources", "must be an array", i.sources);
   for (const s of i.sources) {
     const src = s as Partial<DrainSource<T>> | null;
@@ -161,11 +153,11 @@ async function drainSource<T, L extends DrainLock>(
       { source, limit: i.limit, worker: i.worker },
       deps.queueHooks,
     );
-    if (rows.length > 0) shared.contendedRun = 0;
     if (rows.length === 0) {
       emit({ type: "drain.empty", source });
       return false;
     }
+    shared.contendedRun = 0;
     record = await i.record.start(lock, source);
     const state = await rowLoop(i, deps, emit, shared, src, drain, rows, handle, lock, record);
 
@@ -255,6 +247,15 @@ async function rowLoop<T, L extends DrainLock>(
       return undefined;
     }
   };
+  /** Fails a row with `errorClass`, counting it when the fail landed. */
+  const failRow = async (row: QueueRow, errorClass: string) => {
+    const result = await settleRow(row, "fail", () =>
+      fail(tx, queue, { key: row.key, worker, errorClass, claim: row.claim }, deps.queueHooks),
+    );
+    if (result !== undefined) drain.failed += 1;
+    if (result?.result === "dead") drain.dead += 1;
+    return result;
+  };
   const charge = (n: number): void => {
     shared.archived += n;
     drain.archived += n;
@@ -287,17 +288,7 @@ async function rowLoop<T, L extends DrainLock>(
     }
     if (shared.capped || state.stopped || state.fatal.set) {
       const why: HeldWhy = shared.capped ? "capped" : state.stopped ? "interrupted" : "aborted";
-      const held = await settleRow(row, "fail", () =>
-        fail(
-          tx,
-          queue,
-          { key: row.key, worker, errorClass: i.heldClass[why], claim: row.claim },
-          deps.queueHooks,
-        ),
-      );
-      if (held === undefined) continue;
-      drain.failed += 1;
-      if (held.result === "dead") drain.dead += 1;
+      await failRow(row, i.heldClass[why]);
       continue;
     }
     drain.handled += 1;
@@ -313,21 +304,12 @@ async function rowLoop<T, L extends DrainLock>(
       outcome = await handle(row, ctx);
     } catch (err) {
       state.threw += 1;
-      const result = await settleRow(row, "fail", () =>
-        fail(
-          tx,
-          queue,
-          { key: row.key, worker, errorClass: i.errorClassOf(err), claim: row.claim },
-          deps.queueHooks,
-        ),
-      );
-      if (result !== undefined) drain.failed += 1;
-      if (result?.result === "dead") drain.dead += 1;
+      const result = await failRow(row, i.errorClassOf(err));
       let before = 0;
       try {
         before = parts(i.archivedBefore?.(err));
       } catch {
-        before = 0;
+        // A throwing archivedBefore counts nothing.
       }
       charge(before);
       emit({

@@ -1,5 +1,5 @@
 import { forEachBounded } from "../concurrency/index.ts";
-import type { Transactor, TxSql } from "../db/index.ts";
+import type { TxSql } from "../db/index.ts";
 import { intIn, q, safeHook } from "../internal/slice.ts";
 import type { RunLock } from "../lock/index.ts";
 import { getCursor, setCursor } from "../queue/index.ts";
@@ -11,7 +11,7 @@ import {
   resolveQuarantine,
   startRun,
 } from "../runs/index.ts";
-import { RootstockRunnerError } from "./errors.ts";
+import { checkTransactor, input, isFn, RootstockRunnerError } from "./errors.ts";
 import type {
   Exclusion,
   LoadContext,
@@ -89,7 +89,7 @@ export function defaultReason(
   switch (f.kind) {
     case "options": {
       const b = f.field === "batchSize" ? BATCH : WIDTH;
-      return `rootstock runner: ${f.field} must be an integer in ${b.lo}–${b.hi}, got ${json(f.value)}`;
+      return `rootstock runner: ${f.field} must be an integer in ${b.lo}–${b.hi}, got ${q(f.value)}`;
     }
     case "list":
       return `rootstock runner: list failed: ${d(f.error)}`;
@@ -108,25 +108,19 @@ export function defaultReason(
   }
 }
 
-function json(v: unknown): string {
-  try {
-    const s = JSON.stringify(v);
-    return s === undefined ? safeString(v) : s;
-  } catch {
-    return safeString(v);
-  }
-}
-
-const input = (fn: string, field: string, what: string, value: unknown): RootstockRunnerError =>
-  new RootstockRunnerError(
-    "ERR_ROOTSTOCK_RUNNER_INPUT",
-    `${fn}(): ${field} ${what} — got ${q(value)}`,
-  );
-
-const isFn = (v: unknown): boolean => typeof v === "function";
-
 /** "Set" means a non-empty string (F17). */
 const hasHash = (h: unknown): h is string => typeof h === "string" && h !== "";
+
+/** P7.3: the listing's hash matches the stored one, so the ref is skipped before any fetch. */
+const skipBeforeFetch = (ref: PullRef, known: ReadonlyMap<string, string | null>): boolean =>
+  hasHash(ref.contentHash) && known.get(ref.externalId) === ref.contentHash;
+
+/** P7.5 g: only the fetch knew the hash, and it matches the stored one. */
+const unchangedAfterFetch = (
+  ref: PullRef,
+  doc: PullDoc,
+  known: ReadonlyMap<string, string | null>,
+): boolean => !hasHash(ref.contentHash) && known.get(doc.externalId) === doc.contentHash;
 
 /** Shape checks shared by runPull and planPull; every refusal is before any I/O. */
 function checkSource(fn: string, source: unknown, since: unknown): void {
@@ -160,10 +154,7 @@ function checkCommon(
   fn: string,
   a: { tx?: unknown; describe?: unknown; mismatchReason?: unknown },
 ): void {
-  const t = a.tx as Partial<Transactor> | null;
-  if (typeof t !== "object" || t === null || !isFn(t.begin) || typeof t.sql !== "function") {
-    throw input(fn, "tx", "must be a Transactor", a.tx);
-  }
+  checkTransactor(fn, a.tx);
   for (const k of ["describe", "mismatchReason"] as const) {
     if (a[k] !== undefined && !isFn(a[k])) {
       throw input(fn, k, "must be a function when given", a[k]);
@@ -221,16 +212,6 @@ function checkListing<R extends PullRef>(listing: unknown): PullListing<R> {
     }
   }
   return l as PullListing<R>;
-}
-
-/** Internal sentinel: a gate inside the batch transaction refused; carries its error. */
-class GateLost extends Error {
-  override readonly name = "GateLost";
-  readonly error: unknown;
-  constructor(error: unknown) {
-    super("lost the run lock inside the batch");
-    this.error = error;
-  }
 }
 
 /** Internal sentinel: a plan's transaction always rolls back. */
@@ -447,12 +428,25 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
     return settle({ kind: "options", field: "fetchConcurrency", value: args.fetchConcurrency });
   }
   const gate = (): Promise<void> => lock.ensureExclusive();
+  /** Set when a gate inside a batch transaction refused (F7). */
+  let lost: { error: unknown } | undefined;
   const gateIn = async (): Promise<void> => {
     try {
       await gate();
     } catch (error) {
-      throw new GateLost(error);
+      lost = { error };
+      throw error;
     }
+  };
+  // F1: one context per run; the quota flag is reset before each doc.
+  const quotaFlag = { hit: false };
+  const ctx: LoadContext = {
+    quotaHit: () => {
+      quotaFlag.hit = true;
+    },
+    meter: (model, inTok, outTok, opts) =>
+      guarded("meter", () => run.meter(model, inTok, outTok, opts)),
+    count: (name, n) => guarded("count", () => run.count(name, n)),
   };
 
   // P4
@@ -478,11 +472,8 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
   counts.excludedReasons = folded.reasons;
   counts.listed = refs.length + folded.total;
 
-  // P6
-  const idCounts = new Map<string, number>();
-  for (const r of refs) idCounts.set(r.externalId, (idCounts.get(r.externalId) ?? 0) + 1);
+  // P6: ids already processed this run (a repeat of one is a duplicate).
   const processed = new Set<string>();
-  const repeated = (id: string): boolean => (idCounts.get(id) ?? 0) > 1;
 
   // P7
   let batchNo = 0;
@@ -505,9 +496,8 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
     }
     // P7.3
     const klass: Klass[] = batch.map((r) => {
-      if (repeated(r.externalId) && processed.has(r.externalId)) return "dup-done";
-      if (hasHash(r.contentHash) && known.get(r.externalId) === r.contentHash) return "skip";
-      return "fetch";
+      if (processed.has(r.externalId)) return "dup-done";
+      return skipBeforeFetch(r, known) ? "skip" : "fetch";
     });
     // P7.4
     let fetched: Map<number, Fetched<D>>;
@@ -532,12 +522,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
     let trippedAt = -1;
     try {
       await tx.begin(async (t: TxSql<N>) => {
-        const pending = new Set(
-          (await pendingQuarantine(t, args.quarantine, { job: source.job, externalIds: ids })).map(
-            (p) => p.externalId,
-          ),
-        );
-        const toResolve: string[] = [];
+        const written: string[] = [];
         const quarantinedHere = new Set<string>();
         const put = async (externalId: string, payload: unknown, reason: string): Promise<void> => {
           await quarantineSafe(
@@ -549,54 +534,39 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
           b.quarantined += 1;
           quarantinedHere.add(externalId);
         };
-        const mark = (id: string): void => {
-          if (repeated(id)) batchProcessed.add(id);
-        };
-        /** One breaker hit; true once it has tripped. */
-        const hit = (): boolean => {
-          if (breaker === undefined) return false;
-          breaker.hit();
-          return breaker.tripped;
-        };
 
-        for (const [i, ref] of batch.entries()) {
+        /** One ref (P7.5 a–h); what it tells the breaker. */
+        const step = async (i: number, ref: R): Promise<"hit" | "clear" | "none"> => {
           const id = ref.externalId;
           // a
-          if (klass[i] === "dup-done" || (repeated(id) && batchProcessed.has(id))) {
+          if (klass[i] === "dup-done" || batchProcessed.has(id)) {
             b.quarantined += 1;
-            continue;
+            return "none";
           }
           // b
           if (klass[i] === "skip") {
             b.unchanged += 1;
-            mark(id);
-            continue;
+            batchProcessed.add(id);
+            return "none";
           }
           const got = fetched.get(i) as Fetched<D>;
           // c
           if ("error" in got) {
             await put(id, ref, describe(got.error));
-            continue;
+            return "none";
           }
           const doc = got.doc;
           // d
           if (doc?.externalId !== id) {
             await put(id, ref, mismatch(id, doc?.externalId));
-            continue;
+            return "none";
           }
           // e
           b.fetched += 1;
           // F7: gate before the doc's writes.
           await gateIn();
-          const flag = { hit: false };
-          const ctx: LoadContext = {
-            quotaHit: () => {
-              flag.hit = true;
-            },
-            meter: (model, inTok, outTok, opts) =>
-              guarded("meter", () => run.meter(model, inTok, outTok, opts)),
-            count: (name, n) => guarded("count", () => run.count(name, n)),
-          };
+          quotaFlag.hit = false;
+          const hitOr = (other: "clear" | "none") => (quotaFlag.hit ? "hit" : other);
           // f
           const tryRepoint = source.tryRepoint;
           if (tryRepoint !== undefined && !known.has(doc.externalId)) {
@@ -609,62 +579,67 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
             if (claimed === true) {
               b.repointed += 1;
               b.unchanged += 1;
-              mark(id);
-              if (flag.hit && hit()) {
-                trippedAt = i;
-                break;
-              }
-              continue;
+              batchProcessed.add(id);
+              return hitOr("none");
             }
           }
           // g
-          if (!hasHash(ref.contentHash) && known.get(doc.externalId) === doc.contentHash) {
+          if (unchangedAfterFetch(ref, doc, known)) {
             b.unchanged += 1;
-            mark(id);
-            if (flag.hit && hit()) {
-              trippedAt = i;
-              break;
-            }
-            continue;
+            batchProcessed.add(id);
+            return hitOr("none");
           }
           // h
           try {
             await t.savepoint((_sp, n) => source.load(n, doc, ctx));
           } catch (err) {
             await put(id, doc, describe(err));
-            if ((flag.hit || args.quota?.isQuota(err) === true) && hit()) {
-              trippedAt = i;
-              break;
-            }
-            continue;
+            return args.quota?.isQuota(err) === true ? "hit" : hitOr("none");
           }
           b.written += 1;
-          mark(id);
-          if (pending.has(id)) toResolve.push(id);
-          if (flag.hit) {
-            if (hit()) {
-              trippedAt = i;
-              break;
-            }
-          } else {
-            breaker?.clear();
+          batchProcessed.add(id);
+          written.push(id);
+          return hitOr("clear");
+        };
+
+        for (const [i, ref] of batch.entries()) {
+          const signal = await step(i, ref);
+          if (breaker === undefined || signal === "none") continue;
+          if (signal === "clear") {
+            breaker.clear();
+            continue;
+          }
+          breaker.hit();
+          if (breaker.tripped) {
+            trippedAt = i;
+            break;
           }
         }
 
-        // 3
-        const resolve = toResolve.filter((id) => !quarantinedHere.has(id));
-        if (resolve.length > 0) {
+        // 3: resolve the pending rows of ids written here and not quarantined here.
+        const candidates = written.filter((id) => !quarantinedHere.has(id));
+        if (candidates.length > 0) {
+          let count = 0;
           try {
-            await t.savepoint((sp) =>
-              resolveQuarantine(
-                sp,
-                args.quarantine,
-                { job: source.job, externalIds: resolve },
-                deps.runs,
-              ),
-            );
+            await t.savepoint(async (sp) => {
+              const resolve = (
+                await pendingQuarantine(sp, args.quarantine, {
+                  job: source.job,
+                  externalIds: candidates,
+                })
+              ).map((p) => p.externalId);
+              count = resolve.length;
+              if (count > 0) {
+                await resolveQuarantine(
+                  sp,
+                  args.quarantine,
+                  { job: source.job, externalIds: resolve },
+                  deps.runs,
+                );
+              }
+            });
           } catch (error) {
-            emit({ type: "runner.resolve_failed", job: source.job, count: resolve.length, error });
+            emit({ type: "runner.resolve_failed", job: source.job, count, error });
           }
         }
         // 4: the cursor of the last ref this batch covered.
@@ -677,24 +652,15 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       });
     } catch (error) {
       // P7.6: the batch rolled back; the totals are those before it.
-      if (error instanceof GateLost) {
-        emit({
-          type: "runner.batch_rolled_back",
-          job: source.job,
-          runId: run.id,
-          batch: batchNo,
-          kind: "lost-lock",
-        });
-        return settle({ kind: "lost-lock", error: error.error });
-      }
+      const kind = lost === undefined ? "batch" : "lost-lock";
       emit({
         type: "runner.batch_rolled_back",
         job: source.job,
         runId: run.id,
         batch: batchNo,
-        kind: "batch",
+        kind,
       });
-      return settle({ kind: "batch", error });
+      return settle({ kind, error: lost === undefined ? error : lost.error });
     }
     for (const id of batchProcessed) processed.add(id);
     counts.fetched += b.fetched;
@@ -811,9 +777,7 @@ export async function planPull<R extends PullRef, D extends PullDoc, N>(
     const known = await source.existing(batch.map((r) => r.externalId));
     // A duplicate is decided after the fetch (an earlier failed fetch does not count), so
     // classify skip/fetch first and resolve duplicates in order below.
-    const klass: Klass[] = batch.map((r) =>
-      hasHash(r.contentHash) && known.get(r.externalId) === r.contentHash ? "skip" : "fetch",
-    );
+    const klass: Klass[] = batch.map((r) => (skipBeforeFetch(r, known) ? "skip" : "fetch"));
     const fetched = await fetchAll(
       source as PullSource<R, D, unknown>,
       batch,
@@ -855,7 +819,7 @@ export async function planPull<R extends PullRef, D extends PullDoc, N>(
         toPlan.push({ item, doc });
         return;
       }
-      if (!hasHash(ref.contentHash) && known.get(id) === doc.contentHash) {
+      if (unchangedAfterFetch(ref, doc, known)) {
         items.push({ externalId: id, action: "unchanged" });
         return;
       }
