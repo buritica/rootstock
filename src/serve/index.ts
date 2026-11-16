@@ -1,4 +1,14 @@
 export {
+  type CallHandle,
+  currentCall,
+  type InstallSeamsOptions,
+  installSeams,
+  LOCAL_CALLER,
+  localRequestContext,
+  type RequestContext,
+  type ServeHooks,
+} from "./call.ts";
+export {
   type Bind,
   CHAIN_SHAPED_HEADERS,
   resolveBind,
