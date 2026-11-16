@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { drainQueue } from "./drain.ts";
 import { runnerErrorCode } from "./errors.ts";
-import { defaultReason, messageOf, mismatchReason, planPull, runPull } from "./pull.ts";
+import { defaultMismatchReason, defaultReason, messageOf, planPull, runPull } from "./pull.ts";
 import type { PullFailure } from "./types.ts";
 
 // The runner's pure parts (contract §2.5, §14): texts, and every refusal
@@ -71,10 +71,10 @@ describe("texts", () => {
   });
 
   test("T1 mismatch text", () => {
-    expect(mismatchReason("a", "b")).toBe(
+    expect(defaultMismatchReason("a", "b")).toBe(
       "fetched a doc for a different externalId: asked for a, got b",
     );
-    expect(mismatchReason("a", undefined)).toEndWith("got undefined");
+    expect(defaultMismatchReason("a", undefined)).toEndWith("got undefined");
   });
 
   test("every failure kind's default text, describe threaded through", () => {

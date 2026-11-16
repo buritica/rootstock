@@ -12,6 +12,7 @@ import { runnerErrorCode } from "./errors.ts";
 import {
   cursorOf,
   docs,
+  killLock,
   type MemSource,
   memSource,
   QuotaError,
@@ -76,6 +77,19 @@ async function pull(
     if (own) await lock.release();
   }
 }
+
+/** `real` with `before` awaited ahead of each of its gates. */
+const gatedLock = (real: RunLock, before: () => Promise<void> | void): RunLock => ({
+  name: real.name,
+  holder: real.holder,
+  ensureExclusive: async () => {
+    await before();
+    await real.ensureExclusive();
+  },
+  startKeepalive: () => real.startKeepalive(),
+  stopKeepalive: () => real.stopKeepalive(),
+  release: () => real.release(),
+});
 
 const recs = (n: number, extra: Partial<Rec> = {}): Rec[] =>
   Array.from({ length: n }, (_, i) => ({ id: `r${i + 1}`, hash: `h${i + 1}`, ...extra }));
@@ -156,7 +170,7 @@ describe("RP2 each branch counts", () => {
 });
 
 describe("RP3 run-scoped duplicates", () => {
-  test("a repeat in a later batch counts quarantined with no row; a failed first occurrence lets the next try", async () => {
+  test("a repeat in a later batch counts quarantined with no row and is never fetched", async () => {
     const env = await fresh();
     const src = memSource(env, main.transactor, [
       { id: "d", hash: "1" },
@@ -402,7 +416,7 @@ describe("RD4 no transaction is open during a fetch", () => {
 });
 
 describe("RD7 a lost lock", () => {
-  test("a fence stolen between batches settles lost-lock and writes nothing more", async () => {
+  test("lost during the fetch pass: settles lost-lock and writes nothing", async () => {
     const env = await fresh();
     const lock = await env.acquire("alpha-sync");
     const src = memSource(env, main.transactor, recs(4));
@@ -411,12 +425,7 @@ describe("RD7 a lost lock", () => {
       n += 1;
       if (n === 2) {
         // The lock's backend dies and a competitor takes the lock: the gate reads LOST.
-        await sql.unsafe(
-          `SELECT pg_terminate_backend(pid) FROM pg_locks
-           WHERE locktype = 'advisory' AND granted
-             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
-        );
-        await Bun.sleep(100);
+        await killLock(sql, "alpha-sync");
         await env.acquire("alpha-sync");
       }
     };
@@ -425,6 +434,37 @@ describe("RD7 a lost lock", () => {
     expect(report.failure?.kind).toBe("lost-lock");
     expect(report.written).toBe(0);
     expect(await docs(sql, env)).toEqual([]);
+  });
+
+  test("P7.1: lost between batches, batch 1 stands and batch 2 is never read", async () => {
+    const env = await fresh();
+    const real = await env.acquire("alpha-sync");
+    let killed = false;
+    // The first gate after batch 1 committed is batch 2's P7.1.
+    const lock = gatedLock(real, async () => {
+      if (killed || !env.events.some((e) => e.type === "runner.batch_committed")) return;
+      killed = true;
+      await killLock(sql, "alpha-sync");
+      await env.acquire("alpha-sync");
+    });
+    const src = memSource(env, main.transactor, recs(4));
+    const existing = src.existing.bind(src);
+    let existingCalls = 0;
+    src.existing = (ids) => {
+      existingCalls += 1;
+      return existing(ids);
+    };
+    const report = await pull(env, src, { lock });
+    expect(report.failure?.kind).toBe("lost-lock");
+    expect(report).toMatchObject({ status: "failed", written: 2 });
+    // The gate refused before batch 2's existing, so nothing of batch 2 was touched.
+    expect(existingCalls).toBe(1);
+    expect(src.fetches).toEqual(["r1", "r2"]);
+    expect(await docs(sql, env)).toEqual(["r1", "r2"]);
+    expect(await cursorOf(sql, env)).toBe(2);
+    const [row] = await runRows(sql, env);
+    expect(row?.status).toBe("failed");
+    expect(String(row?.reason)).toContain("rootstock runner: lost the run lock: ");
   });
 });
 
@@ -672,12 +712,7 @@ describe("the guard and the run record", () => {
     const killer = openSecond();
     src.beforeLoad = async (id) => {
       if (id !== "r1") return;
-      await killer.transactor.sql.unsafe(
-        `SELECT pg_terminate_backend(pid) FROM pg_locks
-         WHERE locktype = 'advisory' AND granted
-           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
-      );
-      await Bun.sleep(100);
+      await killLock(killer.transactor.sql, "alpha-sync");
       await env.acquire("alpha-sync");
     };
     const report = await pull(env, src, { lock }).finally(() => killer.close());
@@ -692,5 +727,241 @@ describe("the guard and the run record", () => {
       batch: 1,
       kind: "lost-lock",
     } satisfies RunnerEvent);
+  });
+});
+
+describe("RP3 a failed first occurrence", () => {
+  test("in the same batch: the later occurrence fetches fresh and writes", async () => {
+    const env = await fresh();
+    const d: Rec = { id: "d", hash: "1", failFetchOnce: true };
+    const src = memSource(env, main.transactor, [d, d]);
+    const report = await pull(env, src, { batchSize: 5 });
+    expect(report).toMatchObject({ status: "ok", listed: 2, written: 1, quarantined: 1 });
+    expect(src.fetches).toEqual(["d", "d"]);
+    expect(await docs(sql, env)).toEqual(["d"]);
+  });
+
+  test("across batches: the later occurrence writes and resolves the earlier batch's row", async () => {
+    const env = await fresh();
+    const d: Rec = { id: "d", hash: "1", failFetchOnce: true };
+    const src = memSource(env, main.transactor, [d, { id: "x", hash: "2" }, d]);
+    const report = await pull(env, src);
+    expect(report).toMatchObject({ status: "ok", listed: 3, written: 2, quarantined: 1 });
+    expect(src.fetches).toEqual(["d", "x", "d"]);
+    expect(await docs(sql, env)).toEqual(["d", "x"]);
+    expect((await quarantineRows(sql, env)).map((r) => [r.external_id, r.status])).toEqual([
+      ["d", "resolved"],
+    ]);
+  });
+});
+
+describe("RD3 a pending row the batch also failed", () => {
+  test("a repeat failure keeps it pending with the new reason; a later success resolves it", async () => {
+    const env = await fresh();
+    await pull(env, memSource(env, main.transactor, [{ id: "x", hash: "1", failFetch: true }]));
+    await pull(env, memSource(env, main.transactor, [{ id: "x", hash: "1", failLoad: true }]));
+    expect(await quarantineRows(sql, env)).toEqual([
+      { external_id: "x", status: "pending", reason: "load failed for x" },
+    ]);
+    await pull(env, memSource(env, main.transactor, [{ id: "x", hash: "1" }]));
+    expect((await quarantineRows(sql, env))[0]?.status).toBe("resolved");
+  });
+
+  test("quarantined and then written in one batch: the row stays pending", async () => {
+    const env = await fresh();
+    await pull(env, memSource(env, main.transactor, [{ id: "x", hash: "1", failLoad: true }]));
+    const x: Rec = { id: "x", hash: "1", failFetchOnce: true };
+    const report = await pull(env, memSource(env, main.transactor, [x, x]), { batchSize: 5 });
+    expect(report).toMatchObject({ status: "ok", written: 1, quarantined: 1 });
+    expect(await docs(sql, env)).toEqual(["x"]);
+    expect(await quarantineRows(sql, env)).toEqual([
+      { external_id: "x", status: "pending", reason: "fetch failed once for x" },
+    ]);
+  });
+});
+
+describe("RP6 other throws leave the count", () => {
+  test("3 quota throws, a plain load failure, 2 quota throws: trips on the fifth hit", async () => {
+    const env = await fresh();
+    const q = (id: string): Rec => ({ id, hash: id, quota: true });
+    const rs: Rec[] = [
+      q("q0"),
+      q("q1"),
+      q("q2"),
+      { id: "lf", hash: "l", failLoad: true },
+      q("q3"),
+      q("q4"),
+      { id: "z", hash: "z" },
+    ];
+    const report = await pull(env, memSource(env, main.transactor, rs), {
+      batchSize: 10,
+      quota: {
+        make: (d: Parameters<typeof consecutiveBreaker>[2]) =>
+          consecutiveBreaker("alpha-quota", env.runs, d),
+        isQuota: (e: unknown) => e instanceof QuotaError,
+      },
+    });
+    // A clearing failLoad would leave 2 hits (no trip); a counting one would trip at q3.
+    expect(report.failure).toEqual({ kind: "quota", count: 5, externalId: "q4" });
+    expect(report).toMatchObject({ written: 0, quarantined: 6 });
+    expect(await cursorOf(sql, env)).toBe(6);
+  });
+});
+
+describe("RP11 an empty listing on a backfill", () => {
+  test("leaves the stored cursor alone", async () => {
+    const env = await fresh();
+    await sql.unsafe(`INSERT INTO ${env.C} (name, value) VALUES ('alpha-sync', '7'::jsonb)`);
+    const src = memSource(env, main.transactor, [], {
+      boundedBackfill: true,
+      nextCursor: { at: 9 },
+    });
+    const report = await pull(env, src, { since: new Date(1000) });
+    expect(report.status).toBe("ok");
+    expect(await cursorOf(sql, env)).toBe(7);
+  });
+});
+
+describe("RD repoint, an id already stored", () => {
+  test("is never offered to tryRepoint: a changed doc loads", async () => {
+    const env = await fresh();
+    await pull(env, memSource(env, main.transactor, [{ id: "a", hash: "1" }]));
+    const offered: string[] = [];
+    const src = memSource(env, main.transactor, [{ id: "a", hash: "2" }], {
+      repoint: (id) => {
+        offered.push(id);
+        return true;
+      },
+    });
+    const report = await pull(env, src);
+    expect(report).toMatchObject({ status: "ok", written: 1, repointed: 0, unchanged: 0 });
+    expect(offered).toEqual([]);
+    const [row] = await sql.unsafe<{ h: string }>(`SELECT content_hash AS h FROM ${env.D}`);
+    expect(row?.h).toBe("2");
+  });
+});
+
+describe("F17 an empty hash is no hash", () => {
+  test('a fetched doc with contentHash "" loads even when the stored hash is ""', async () => {
+    const env = await fresh();
+    await sql.unsafe(`INSERT INTO ${env.D} (external_id, content_hash) VALUES ('e', '')`);
+    const report = await pull(
+      env,
+      memSource(env, main.transactor, [{ id: "e", hash: "", hashAfterFetch: true }]),
+    );
+    expect(report).toMatchObject({ status: "ok", fetched: 1, written: 1, unchanged: 0 });
+  });
+});
+
+describe("list: a NUL externalId", () => {
+  test("settles failed list (INPUT) and writes nothing", async () => {
+    const env = await fresh();
+    const src = memSource(env, main.transactor, recs(2));
+    src.list = async () => ({
+      refs: [
+        { externalId: "r1", contentHash: "h1", cursor: 1 },
+        { externalId: "r\u00002", contentHash: "h2", cursor: 2 },
+      ],
+    });
+    const report = await pull(env, src);
+    expect(report.failure?.kind).toBe("list");
+    expect(runnerErrorCode((report.failure as { error: unknown }).error)).toBe(
+      "ERR_ROOTSTOCK_RUNNER_INPUT",
+    );
+    expect(src.fetches).toEqual([]);
+    expect(await docs(sql, env)).toEqual([]);
+    expect(await cursorOf(sql, env)).toBeUndefined();
+    expect((await runRows(sql, env))[0]?.status).toBe("failed");
+  });
+});
+
+describe("RP9/RP10 the fetch pass", () => {
+  test("RP9 fetchConcurrency bounds in-flight fetches, each fetch gated first", async () => {
+    const env = await fresh();
+    const log: string[] = [];
+    const lock = gatedLock(await env.acquire("alpha-sync"), () => {
+      log.push("gate");
+    });
+    const src = memSource(env, main.transactor, recs(10));
+    const list = src.list.bind(src);
+    src.list = (c, s) => {
+      log.push("list");
+      return list(c, s);
+    };
+    let inFlight = 0;
+    let most = 0;
+    src.duringFetch = async () => {
+      log.push("fetch");
+      inFlight += 1;
+      most = Math.max(most, inFlight);
+    };
+    src.fetchGate = async () => {
+      await Bun.sleep(15);
+      inFlight -= 1;
+    };
+    src.beforeLoad = async () => {
+      log.push("load");
+    };
+    const report = await pull(env, src, { lock, batchSize: 10, fetchConcurrency: 3 });
+    expect(report).toMatchObject({ status: "ok", written: 10 });
+    expect(most).toBe(3);
+    const pass = log.slice(log.indexOf("list") + 1, log.indexOf("load"));
+    // P7.1, one per fetch, the gate after the pass, and r1's gate before its load.
+    expect(pass.filter((x) => x === "gate")).toHaveLength(13);
+    expect(pass.filter((x) => x === "fetch")).toHaveLength(10);
+    // The k-th fetch starts after at least k + 1 gates (P7.1 and its own).
+    let gates = 0;
+    let fetches = 0;
+    for (const x of pass) {
+      if (x === "gate") gates += 1;
+      else {
+        fetches += 1;
+        expect(gates).toBeGreaterThanOrEqual(fetches + 1);
+      }
+    }
+  });
+
+  test("RP10 a gate throw while two fetches are parked settles lost-lock only after both resolve", async () => {
+    const env = await fresh();
+    let listed = false;
+    let gatesAfterList = 0;
+    const refusal = new Error("lock gone");
+    const lock = gatedLock(await env.acquire("alpha-sync"), () => {
+      if (!listed) return;
+      gatesAfterList += 1;
+      // P7.1, r1's gate, r2's gate, then r3's: refused.
+      if (gatesAfterList === 4) throw refusal;
+    });
+    const src = memSource(env, main.transactor, recs(3));
+    const list = src.list.bind(src);
+    src.list = async (c, s) => {
+      const out = await list(c, s);
+      listed = true;
+      return out;
+    };
+    const parked = new Map<string, () => void>();
+    src.fetchGate = (id) =>
+      new Promise<void>((resolve) => {
+        parked.set(id, resolve);
+      });
+    let done = false;
+    const running = pull(env, src, { lock, batchSize: 3, fetchConcurrency: 3 }).finally(() => {
+      done = true;
+    });
+    const deadline = Date.now() + 5_000;
+    while ((parked.size < 2 || gatesAfterList < 4) && Date.now() < deadline) await Bun.sleep(5);
+    expect([...parked.keys()]).toEqual(["r1", "r2"]);
+    await Bun.sleep(50);
+    expect(done).toBe(false);
+    expect((await runRows(sql, env))[0]?.status).toBe("running");
+    parked.get("r1")?.();
+    await Bun.sleep(50);
+    expect(done).toBe(false);
+    parked.get("r2")?.();
+    const report = await running;
+    expect(report.failure).toEqual({ kind: "lost-lock", error: refusal });
+    expect(src.fetches).toEqual(["r1", "r2"]);
+    expect(await docs(sql, env)).toEqual([]);
+    expect((await runRows(sql, env))[0]?.status).toBe("failed");
   });
 });

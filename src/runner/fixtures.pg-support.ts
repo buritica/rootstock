@@ -7,6 +7,7 @@ import {
   type LockDeps,
   type LockSlice,
   lockSlice,
+  locksHeld,
   postgresJsLockSession,
   type RunLock,
 } from "../lock/index.ts";
@@ -73,6 +74,26 @@ export function takeLock(lock: LockSlice, name: string): Promise<RunLock> {
   );
 }
 
+/**
+ * Kills the backends holding `name`'s one-key advisory lock in this database
+ * (and no other lock's), then waits until no session holds it.
+ */
+export async function killLock(sql: Sql, name: string): Promise<void> {
+  await sql.unsafe(
+    `SELECT pg_terminate_backend(pid) FROM pg_locks
+     WHERE locktype = 'advisory' AND granted AND objsubid = 1 AND pid <> pg_backend_pid()
+       AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       AND classid = ((hashtext($1)::bigint >> 32) & 4294967295)::oid
+       AND objid = (hashtext($1)::bigint & 4294967295)::oid`,
+    [name],
+  );
+  const deadline = Date.now() + 5_000;
+  while ((await locksHeld(sql, [name])).get(name) === true) {
+    if (Date.now() > deadline) throw new Error(`${name} was never released`);
+    await Bun.sleep(10);
+  }
+}
+
 /** Rootstock's tables in a fresh schema, plus the test's own doc table. */
 export async function runnerEnv(tx: Transactor, sc: string, held: RunLock[]): Promise<RunnerEnv> {
   await applyRootstockMigrations(tx, migrateSlice({ schema: sc }));
@@ -130,6 +151,8 @@ export interface Rec {
   /** Withhold the hash from the listing (only fetch knows it). */
   hashAfterFetch?: boolean;
   failFetch?: boolean;
+  /** Only the first fetch of this id throws; a later occurrence fetches. */
+  failFetchOnce?: boolean;
   wrongId?: boolean;
   failLoad?: boolean;
   /** The load throws a quota error. */
@@ -203,6 +226,7 @@ export function memSource(
 ): MemSource {
   const byId = new Map<string, Rec>();
   for (const r of recs) byId.set(r.id, r);
+  const failedOnce = new Set<string>();
   const src: MemSource = {
     job: opts.job ?? "alpha-sync",
     ...(opts.boundedBackfill ? { boundedBackfill: true } : {}),
@@ -234,6 +258,10 @@ export function memSource(
       await src.fetchGate?.(ref.externalId);
       const r = byId.get(ref.externalId) as Rec;
       if (r.failFetch) throw new Error(`fetch failed for ${r.id}`);
+      if (r.failFetchOnce && !failedOnce.has(r.id)) {
+        failedOnce.add(r.id);
+        throw new Error(`fetch failed once for ${r.id}`);
+      }
       return {
         externalId: r.wrongId ? `${r.id}-other` : r.id,
         contentHash: r.hash,

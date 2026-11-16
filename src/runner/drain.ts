@@ -145,53 +145,67 @@ async function drainSource<T, L extends DrainLock>(
     return false;
   }
 
-  try {
-    lock.startKeepalive();
-    const rows = await claim(
-      i.tx.sql,
-      i.queue,
-      { source, limit: i.limit, worker: i.worker },
-      deps.queueHooks,
-    );
-    if (rows.length === 0) {
-      emit({ type: "drain.empty", source });
-      return false;
-    }
-    shared.contendedRun = 0;
-    record = await i.record.start(lock, source);
-    const state = await rowLoop(i, deps, emit, shared, src, drain, rows, handle, lock, record);
-
-    const allFailed = drain.handled >= i.minRowsForAllFailed && state.threw === drain.handled;
-    if (allFailed) emit({ type: "drain.all_failed", source, handled: drain.handled });
-    if (drain.dead > 0) emit({ type: "drain.dead_lettered", source, dead: drain.dead });
-    const failure: DrainFailure | undefined = state.fatal.set
-      ? { kind: "fatal", error: state.fatal.error }
-      : firstFailure(drain, {
-          stopped: state.stopped,
-          jammed: state.jammed,
-          capped: shared.capped,
-          allFailed,
-          archived: shared.archived,
-          cap: i.maxArchivals,
-        });
-    recorded = true;
-    await i.record.settle(record, failure === undefined ? { drain } : { drain, failure });
-    if (failure === undefined) return false;
-    if (failure.kind === "fatal") emit({ type: "drain.aborted", source, error: failure.error });
-    return true;
-  } catch (err) {
-    emit({ type: "drain.failed", source, error: err });
-    if (recorded) return true;
+  const page = await (async (): Promise<boolean> => {
     try {
-      await i.record.settle(record, { drain, failure: { kind: "queue", error: err } });
-    } catch (error) {
-      emit({ type: "drain.settle_failed", source, error });
+      lock.startKeepalive();
+      const rows = await claim(
+        i.tx.sql,
+        i.queue,
+        { source, limit: i.limit, worker: i.worker },
+        deps.queueHooks,
+      );
+      if (rows.length === 0) {
+        emit({ type: "drain.empty", source });
+        return false;
+      }
+      shared.contendedRun = 0;
+      record = await i.record.start(lock, source);
+      const state = await rowLoop(i, deps, emit, shared, src, drain, rows, handle, lock, record);
+
+      const allFailed = drain.handled >= i.minRowsForAllFailed && state.threw === drain.handled;
+      if (allFailed) emit({ type: "drain.all_failed", source, handled: drain.handled });
+      if (drain.dead > 0) emit({ type: "drain.dead_lettered", source, dead: drain.dead });
+      const failure: DrainFailure | undefined = state.fatal.set
+        ? { kind: "fatal", error: state.fatal.error }
+        : firstFailure(drain, {
+            stopped: state.stopped,
+            jammed: state.jammed,
+            capped: shared.capped,
+            allFailed,
+            archived: shared.archived,
+            cap: i.maxArchivals,
+          });
+      recorded = true;
+      await i.record.settle(record, failure === undefined ? { drain } : { drain, failure });
+      if (failure === undefined) return false;
+      if (failure.kind === "fatal") emit({ type: "drain.aborted", source, error: failure.error });
+      return true;
+    } catch (err) {
+      emit({ type: "drain.failed", source, error: err });
+      if (recorded) return true;
+      try {
+        await i.record.settle(record, { drain, failure: { kind: "queue", error: err } });
+      } catch (error) {
+        emit({ type: "drain.settle_failed", source, error });
+      }
+      return true;
     }
-    return true;
-  } finally {
+  })();
+  // Teardown never throws past the drain: a lost report would hide acked rows.
+  let clean = true;
+  try {
     lock.stopKeepalive();
-    await lock.release();
+  } catch (error) {
+    clean = false;
+    emit({ type: "drain.release_failed", source, error });
   }
+  try {
+    await lock.release();
+  } catch (error) {
+    clean = false;
+    emit({ type: "drain.release_failed", source, error });
+  }
+  return page || !clean;
 }
 
 /** Why a row loop ended early. */
@@ -245,6 +259,24 @@ async function rowLoop<T, L extends DrainLock>(
       if (shared.contendedRun >= i.contendedBrake) shared.jammed = true;
       emit({ type: "drain.row_contended", source, key: row.key, operation });
       return undefined;
+    }
+  };
+  /** The consumer's class for a throw; a throwing or empty answer reads as "Error". */
+  const classOf = (err: unknown): string => {
+    try {
+      const c = i.errorClassOf(err);
+      if (typeof c === "string" && c !== "") return c;
+    } catch {
+      // Falls back below.
+    }
+    return "Error";
+  };
+  /** A throwing isFatal reads as fatal: stopping is the safe side. */
+  const fatalOf = (err: unknown): boolean => {
+    try {
+      return i.isFatal(err) === true;
+    } catch {
+      return true;
     }
   };
   /** Fails a row with `errorClass`, counting it when the fail landed. */
@@ -304,7 +336,7 @@ async function rowLoop<T, L extends DrainLock>(
       outcome = await handle(row, ctx);
     } catch (err) {
       state.threw += 1;
-      const result = await failRow(row, i.errorClassOf(err));
+      const result = await failRow(row, classOf(err));
       let before = 0;
       try {
         before = parts(i.archivedBefore?.(err));
@@ -321,7 +353,7 @@ async function rowLoop<T, L extends DrainLock>(
         archivedBefore: before,
         error: err,
       });
-      if (i.isFatal(err)) state.fatal = { set: true, error: err };
+      if (fatalOf(err)) state.fatal = { set: true, error: err };
       trip(rows.length - at - 1);
       continue;
     }

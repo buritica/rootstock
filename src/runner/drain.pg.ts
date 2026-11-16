@@ -166,6 +166,38 @@ async function drain(
 }
 
 const ok: Handler = async () => ({});
+
+/** A second session holding the row locks of `keys` until `done()` (idempotent). */
+async function holdRows(env: Env, keys: string[]) {
+  const holder = openSecond();
+  let locked!: () => void;
+  const isLocked = new Promise<void>((r) => {
+    locked = r;
+  });
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const holding = holder.transactor.begin(async (tx) => {
+    await tx.unsafe(
+      `SELECT key FROM ${env.T} WHERE key IN (SELECT jsonb_array_elements_text($1::text::jsonb)) FOR UPDATE`,
+      [JSON.stringify(keys)],
+    );
+    locked();
+    await hold;
+  });
+  await isLocked;
+  let closed = false;
+  return {
+    async done() {
+      if (closed) return;
+      closed = true;
+      release();
+      await holding;
+      await holder.close();
+    },
+  };
+}
 const types = (env: Env) =>
   env.events.filter((e) => e.type.startsWith("drain.")).map((e) => e.type);
 
@@ -551,5 +583,246 @@ describe("composition with the run record (F27)", () => {
     await env.put("alpha:1");
     expect((await only({})).drains[0]).toMatchObject({ handled: 1, acked: 1 });
     expect(await statusOf(killed.id)).toBe("interrupted");
+  });
+});
+
+describe("DR11 failure precedence", () => {
+  test("fatal beats capped", async () => {
+    const env = await fresh();
+    await env.put("alpha:1");
+    await env.put("alpha:2");
+    const fatal = new FatalError("lost it");
+    const report = await drain(
+      env,
+      {
+        alpha: async () => {
+          throw fatal;
+        },
+      },
+      { maxArchivals: 5, archivedBefore: () => 10 },
+    );
+    expect(report.status).toBe(1);
+    expect(types(env)).toContain("drain.archival_cap");
+    expect(env.settles[0]?.failure).toEqual({ kind: "fatal", error: fatal });
+  });
+
+  // Row 1 is handled while a second session locks rows 2 and 3: row 2's held
+  // fail is contended (the brake at 1 jams), row 3 is left claimed.
+  const jamAfterFirst = async (
+    env: Env,
+    outcome: DrainOutcome,
+    over: Partial<DrainInput<string, RunLock>>,
+  ) => {
+    for (const k of ["alpha:1", "alpha:2", "alpha:3"]) await env.put(k);
+    let hold: Awaited<ReturnType<typeof holdRows>> | undefined;
+    try {
+      return await drain(
+        env,
+        {
+          alpha: async () => {
+            hold = await holdRows(env, ["alpha:2", "alpha:3"]);
+            return outcome;
+          },
+        },
+        { contendedBrake: 1, ...over },
+      );
+    } finally {
+      await hold?.done();
+    }
+  };
+
+  test("interrupted beats jammed, and says it jammed", async () => {
+    const env = await fresh({ ackLockTimeoutMs: 200 });
+    // Asked before the source, before row 1, then before row 2: true there.
+    let calls = 0;
+    const report = await jamAfterFirst(env, {}, { interrupted: () => calls++ >= 2 });
+    expect(report.status).toBe(1);
+    expect(report.drains[0]).toMatchObject({ handled: 1, acked: 1, contended: 1, jammed: 1 });
+    expect(env.settles[0]?.failure).toEqual({ kind: "interrupted", jammed: true, leftClaimed: 2 });
+  });
+
+  test("capped beats jammed and carries jammed: true", async () => {
+    const env = await fresh({ ackLockTimeoutMs: 200 });
+    const report = await jamAfterFirst(env, { archived: 10 }, { maxArchivals: 5 });
+    expect(report.status).toBe(1);
+    expect(report.drains[0]).toMatchObject({ handled: 1, acked: 1, contended: 1, jammed: 1 });
+    expect(env.settles[0]?.failure).toEqual({
+      kind: "capped",
+      archived: 10,
+      cap: 5,
+      jammed: true,
+      leftClaimed: 2,
+    });
+  });
+
+  test("all-failed beats dead", async () => {
+    const env = await fresh({ maxAttempts: 1 });
+    await env.put("alpha:1");
+    await env.put("alpha:2");
+    const report = await drain(env, {
+      alpha: async () => {
+        throw new Error("bad file");
+      },
+    });
+    expect(report.drains[0]).toMatchObject({ handled: 2, dead: 2 });
+    expect(types(env)).toContain("drain.dead_lettered");
+    expect(env.settles[0]?.failure).toEqual({ kind: "all-failed", handled: 2 });
+  });
+});
+
+describe("DR7 the contention streak", () => {
+  test("a landed ack resets it: two contended acks apart never reach a brake of 2", async () => {
+    const env = await fresh({ ackLockTimeoutMs: 200 });
+    for (const k of ["alpha:1", "alpha:2", "alpha:3"]) await env.put(k);
+    const holds: Awaited<ReturnType<typeof holdRows>>[] = [];
+    try {
+      const report = await drain(
+        env,
+        {
+          alpha: async (row) => {
+            if (row.key === "alpha:2") await holds[0]?.done();
+            else holds.push(await holdRows(env, [row.key]));
+            return {};
+          },
+        },
+        { contendedBrake: 2 },
+      );
+      expect(report.status).toBe(0);
+      expect(report.drains[0]).toMatchObject({ handled: 3, acked: 1, contended: 2, jammed: 0 });
+      expect(env.settles[0]?.failure).toBeUndefined();
+    } finally {
+      for (const h of holds) await h.done();
+    }
+  });
+
+  test("a jam in one source stops the next: queue-jammed", async () => {
+    const env = await fresh({ ackLockTimeoutMs: 200 });
+    await env.put("alpha:1");
+    await env.put("beta:1");
+    let hold: Awaited<ReturnType<typeof holdRows>> | undefined;
+    try {
+      const report = await drain(
+        env,
+        {
+          alpha: async () => {
+            hold = await holdRows(env, ["alpha:1"]);
+            return {};
+          },
+          beta: ok,
+        },
+        { contendedBrake: 1 },
+      );
+      expect(report.status).toBe(1);
+      expect(report.drains.map((d) => d.source)).toEqual(["alpha"]);
+      expect(env.settles[0]?.failure).toEqual({ kind: "jammed", leftClaimed: 1 });
+    } finally {
+      await hold?.done();
+    }
+    expect(env.events).toContainEqual({
+      type: "drain.sources_stopped",
+      source: "beta",
+      reason: "queue-jammed",
+    });
+    expect(await env.row("beta:1")).toMatchObject({ claimed: false });
+  });
+});
+
+describe("the consumer's hooks misbehave", () => {
+  test("F25: archivedBefore answering NaN, -1 or 1.5 charges nothing", async () => {
+    const env = await fresh();
+    const answers = [Number.NaN, -1, 1.5];
+    for (const [i] of answers.entries()) await env.put(`alpha:${i}`);
+    let at = 0;
+    const report = await drain(
+      env,
+      {
+        alpha: async () => {
+          throw new Error("boom");
+        },
+      },
+      { maxArchivals: 1, archivedBefore: () => answers[at++] as number },
+    );
+    expect(at).toBe(3);
+    expect(report.archived).toBe(0);
+    expect(report.drains[0]?.archived).toBe(0);
+    expect(types(env)).not.toContain("drain.archival_cap");
+    expect(env.settles[0]?.failure?.kind).toBe("all-failed");
+  });
+
+  test("a throwing errorClassOf fails the row with class Error", async () => {
+    const env = await fresh();
+    await env.put("alpha:1");
+    await drain(
+      env,
+      {
+        alpha: async () => {
+          throw new Archived(0);
+        },
+      },
+      {
+        errorClassOf: () => {
+          throw new Error("no class");
+        },
+      },
+    );
+    expect(await env.row("alpha:1")).toMatchObject({ last_error: "Error", attempts: 1 });
+  });
+
+  test("a throwing isFatal aborts the drain", async () => {
+    const env = await fresh();
+    await env.put("alpha:1");
+    await env.put("alpha:2");
+    const boom = new Error("boom");
+    const report = await drain(
+      env,
+      {
+        alpha: async () => {
+          throw boom;
+        },
+      },
+      {
+        isFatal: () => {
+          throw new Error("cannot tell");
+        },
+      },
+    );
+    expect(report.status).toBe(1);
+    expect(report.drains[0]).toMatchObject({ handled: 1, failed: 2 });
+    expect(env.settles[0]?.failure).toEqual({ kind: "fatal", error: boom });
+    expect(await env.row("alpha:2")).toMatchObject({ last_error: "HeldAborted" });
+  });
+
+  test("a lock whose release rejects: the report still comes back, status 1, drain.release_failed", async () => {
+    const env = await fresh();
+    await env.put("alpha:1");
+    const refused = new Error("release failed");
+    const report = await drain(
+      env,
+      { alpha: ok },
+      {
+        acquire: async (src) => {
+          const real = await takeLock(runnerLockSlice(env.sc), src.lockName);
+          return {
+            name: real.name,
+            holder: real.holder,
+            ensureExclusive: () => real.ensureExclusive(),
+            startKeepalive: () => real.startKeepalive(),
+            stopKeepalive: () => real.stopKeepalive(),
+            release: async () => {
+              await real.release();
+              throw refused;
+            },
+          };
+        },
+      },
+    );
+    expect(report.status).toBe(1);
+    expect(report.drains[0]).toMatchObject({ handled: 1, acked: 1 });
+    expect(env.settles[0]?.failure).toBeUndefined();
+    expect(env.events).toContainEqual({
+      type: "drain.release_failed",
+      source: "alpha",
+      error: refused,
+    });
   });
 });

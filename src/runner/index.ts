@@ -1,6 +1,6 @@
 export { drainQueue } from "./drain.ts";
 export { RootstockRunnerError, type RunnerErrorCode, runnerErrorCode } from "./errors.ts";
-export { defaultReason, messageOf, mismatchReason, planPull, runPull } from "./pull.ts";
+export { defaultMismatchReason, defaultReason, messageOf, planPull, runPull } from "./pull.ts";
 export type {
   DrainContext,
   DrainDeps,

@@ -1178,6 +1178,31 @@ describe("QF6: extendClaim", () => {
     expect(await q.row("alpha:m")).toMatchObject({ claimed: true, claimed_by: W });
   });
 
+  test("QX4 a dead-lettered row reads missing, even with its claim intact", async () => {
+    const q = await fresh({ maxAttempts: 1 });
+    await q.put("alpha:d");
+    await q.put("alpha:k");
+    const taken = await claim(sql, q.s, { source: "alpha", limit: 2, worker: W });
+    const arg = (key: string) => ({
+      key,
+      worker: W,
+      claim: taken.find((t) => t.key === key)?.claim as Claim,
+    });
+    // Dead through fail at maxAttempts.
+    expect((await fail(main.transactor, q.s, { ...arg("alpha:d"), errorClass: "E" })).result).toBe(
+      "dead",
+    );
+    expect(await extendClaim(main.transactor, q.s, arg("alpha:d"))).toBe("missing");
+    // Dead with its claimer and token still on the row: only dead_at refuses it.
+    await sql.unsafe(`UPDATE ${q.T} SET dead_at = clock_timestamp() WHERE key = 'alpha:k'`);
+    q.events.length = 0;
+    expect(await extendClaim(main.transactor, q.s, arg("alpha:k"), q.hooks)).toBe("missing");
+    expect(q.events).toEqual([
+      { type: "queue.lost", key: "alpha:k", worker: W, operation: "extend" },
+    ]);
+    expect(await q.row("alpha:k")).toMatchObject({ dead: true, claimed: true, claimed_by: W });
+  });
+
   test("behind a row lock: 55P03 after ackLockTimeoutMs, queue.ack_contended { extend }", async () => {
     const q = await fresh({ ackLockTimeoutMs: 500 });
     await q.put("alpha:busy");

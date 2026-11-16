@@ -302,9 +302,9 @@ export interface DrainInput<T, L extends DrainLock = RunLock> {
   /** Takes the source's lock without waiting; a refusal `isHeld` recognises skips the source. */
   acquire(source: DrainSource<T>): Promise<L>;
   isHeld(err: unknown): boolean;
-  /** A handler error that dooms the rest of the drain (a lost lock). */
+  /** A handler error that dooms the rest of the drain (a lost lock). A throw here reads as fatal. */
   isFatal(err: unknown): boolean;
-  /** The error class `fail` stores for a handler's throw. */
+  /** The error class `fail` stores for a handler's throw; a throw or an empty answer reads as "Error". */
   errorClassOf(err: unknown): string;
   /** The error class `fail` stores for a row claimed but never handled. */
   heldClass: Readonly<Record<HeldWhy, string>>;
@@ -390,6 +390,7 @@ export type RunnerEvent =
   | { type: "drain.aborted"; source: string; error: unknown }
   | { type: "drain.failed"; source: string; error: unknown }
   | { type: "drain.settle_failed"; source: string; error: unknown }
+  | { type: "drain.release_failed"; source: string; error: unknown }
   | {
       type: "drain.done";
       worker: string;

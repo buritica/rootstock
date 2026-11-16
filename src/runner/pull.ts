@@ -52,7 +52,7 @@ export function messageOf(err: unknown): string {
 }
 
 /** The id-mismatch text (T1). */
-export const mismatchReason = (asked: string, got: unknown): string =>
+export const defaultMismatchReason = (asked: string, got: unknown): string =>
   `fetched a doc for a different externalId: asked for ${asked}, got ${safeString(got)}`;
 
 function safeString(v: unknown): string {
@@ -120,7 +120,10 @@ const unchangedAfterFetch = (
   ref: PullRef,
   doc: PullDoc,
   known: ReadonlyMap<string, string | null>,
-): boolean => !hasHash(ref.contentHash) && known.get(doc.externalId) === doc.contentHash;
+): boolean =>
+  !hasHash(ref.contentHash) &&
+  hasHash(doc.contentHash) &&
+  known.get(doc.externalId) === doc.contentHash;
 
 /** Shape checks shared by runPull and planPull; every refusal is before any I/O. */
 function checkSource(fn: string, source: unknown, since: unknown): void {
@@ -207,8 +210,10 @@ function checkListing<R extends PullRef>(listing: unknown): PullListing<R> {
     throw input("list", "result", "must be { refs: array }", listing);
   }
   for (const r of l.refs) {
-    if (typeof (r as PullRef | null)?.externalId !== "string") {
-      throw input("list", "refs[]", "must each carry a string externalId", r);
+    const id = (r as PullRef | null)?.externalId;
+    // A NUL id could never be quarantined, so it would stall every later run on its batch.
+    if (typeof id !== "string" || id === "" || id.includes("\u0000")) {
+      throw input("list", "refs[]", "must each carry a non-empty externalId without NUL", r);
     }
   }
   return l as PullListing<R>;
@@ -417,7 +422,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
 ): Promise<PullReport> {
   const { tx, source, lock, since } = args;
   const backfill = since !== undefined;
-  const mismatch = guardedText(args.mismatchReason, mismatchReason);
+  const mismatch = guardedText(args.mismatchReason, defaultMismatchReason);
   // P2
   const breaker: Breaker | undefined = args.quota?.make(deps.runs);
   // P3
@@ -438,15 +443,16 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       throw error;
     }
   };
-  // F1: one context per run; the quota flag is reset before each doc.
-  const quotaFlag = { hit: false };
-  const ctx: LoadContext = {
-    quotaHit: () => {
-      quotaFlag.hit = true;
-    },
-    meter: (model, inTok, outTok, opts) =>
-      guarded("meter", () => run.meter(model, inTok, outTok, opts)),
-    count: (name, n) => guarded("count", () => run.count(name, n)),
+  const meter: LoadContext["meter"] = (model, inTok, outTok, opts) =>
+    guarded("meter", () => run.meter(model, inTok, outTok, opts));
+  const count: LoadContext["count"] = (name, n) => guarded("count", () => run.count(name, n));
+  /** A throwing isQuota reads as "not quota": the load was already quarantined. */
+  const isQuota = (err: unknown): boolean => {
+    try {
+      return args.quota?.isQuota(err) === true;
+    } catch {
+      return false;
+    }
   };
 
   // P4
@@ -565,7 +571,15 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
           b.fetched += 1;
           // F7: gate before the doc's writes.
           await gateIn();
-          quotaFlag.hit = false;
+          // F1: a context per doc, so a late quotaHit never lands on the next doc.
+          const quotaFlag = { hit: false };
+          const ctx: LoadContext = {
+            quotaHit: () => {
+              quotaFlag.hit = true;
+            },
+            meter,
+            count,
+          };
           const hitOr = (other: "clear" | "none") => (quotaFlag.hit ? "hit" : other);
           // f
           const tryRepoint = source.tryRepoint;
@@ -594,7 +608,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
             await t.savepoint((_sp, n) => source.load(n, doc, ctx));
           } catch (err) {
             await put(id, doc, describe(err));
-            return args.quota?.isQuota(err) === true ? "hit" : hitOr("none");
+            return isQuota(err) ? "hit" : hitOr("none");
           }
           b.written += 1;
           batchProcessed.add(id);
@@ -619,7 +633,6 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
         // 3: resolve the pending rows of ids written here and not quarantined here.
         const candidates = written.filter((id) => !quarantinedHere.has(id));
         if (candidates.length > 0) {
-          let count = 0;
           try {
             await t.savepoint(async (sp) => {
               const resolve = (
@@ -628,8 +641,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
                   externalIds: candidates,
                 })
               ).map((p) => p.externalId);
-              count = resolve.length;
-              if (count > 0) {
+              if (resolve.length > 0) {
                 await resolveQuarantine(
                   sp,
                   args.quarantine,
@@ -639,7 +651,12 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
               }
             });
           } catch (error) {
-            emit({ type: "runner.resolve_failed", job: source.job, count, error });
+            emit({
+              type: "runner.resolve_failed",
+              job: source.job,
+              count: candidates.length,
+              error,
+            });
           }
         }
         // 4: the cursor of the last ref this batch covered.
@@ -754,7 +771,7 @@ export async function planPull<R extends PullRef, D extends PullDoc, N>(
   const backfill = since !== undefined;
   const gate = lock === undefined ? undefined : (): Promise<void> => lock.ensureExclusive();
   const describe = guardedText(args.describe, messageOf);
-  const mismatch = guardedText(args.mismatchReason, mismatchReason);
+  const mismatch = guardedText(args.mismatchReason, defaultMismatchReason);
 
   await gate?.();
   const stored = backfill
@@ -834,9 +851,10 @@ export async function planPull<R extends PullRef, D extends PullDoc, N>(
           await t`SET TRANSACTION READ ONLY`;
           for (const p of toPlan) {
             try {
-              p.item.detail = await t.savepoint((_sp, n) =>
+              const detail = await t.savepoint((_sp, n) =>
                 planLoad.call(source, n, p.doc, PLAN_CTX),
               );
+              if (detail !== undefined) p.item.detail = detail;
             } catch (err) {
               p.item.detail = { error: describe(err) };
             }
