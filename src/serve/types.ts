@@ -81,12 +81,20 @@ export interface UsageWiring {
   sinks: readonly CallSink[];
   keepArgs: boolean;
   keepOutput: boolean;
-  /** Built by `usage` from the runs prices (serve cannot import `runs`). Called only when the call metered tokens; no prices → costUsd null, costNote "unpriced:<models>". */
+  /**
+   * Built by `usage` from the runs prices (serve cannot import `runs`). Called once per call, only when it
+   * metered tokens; no prices → costUsd null, costNote "unpriced:<models>" (models sorted). costUsd is a
+   * decimal string. The seam guards it: a throw records costUsd null, costNote "price_failed" and logs
+   * `usage.price_failed`, never failing the call.
+   */
   price: (
     tokens: Readonly<Record<string, { input: number; output: number }>>,
     estimated: boolean,
   ) => { costUsd: string | null; costNote: string | null };
-  /** `usage`'s errorClassOf: `classify` first (the service's classifyError hook), then the generic walk; never a message. */
+  /**
+   * `usage`'s errorClassOf: `classify` first (the seam passes the service's classifyError hook), then the
+   * generic walk; never a message. The seam guards it: a throw records "unreadable error".
+   */
   errorClassOf: (err: unknown, classify?: (err: unknown) => string | undefined) => string;
   spend: SpendCharger | null;
   serverSha: string | null;
