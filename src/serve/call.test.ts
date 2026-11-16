@@ -345,6 +345,63 @@ describe("the handle", () => {
     expect(log.names()).toEqual(["usage.price_failed", "usage.sink_failed"]);
   });
 
+  test("price runs once, only for a call that metered; estimated when any meter was", async () => {
+    const priced: [string[], boolean][] = [];
+    const records: CallRecord[] = [];
+    const usage = wiring(records, {
+      price: (tokens, estimated) => {
+        priced.push([Object.keys(tokens), estimated]);
+        return { costUsd: "1", costNote: null };
+      },
+    });
+    const { peer } = await stdio({
+      usage,
+      register: (server) =>
+        server.registerTool("spend", { inputSchema: { est: z.boolean() } }, async ({ est }) => {
+          currentCall().meter({ model: "m", input: 1, output: 1 });
+          currentCall().meter({ model: "m", input: 1, output: 1, estimated: est });
+          return { content: [] };
+        }),
+    });
+    await peer.callTool("echo", { text: "no meter" });
+    await peer.callTool("spend", { est: false });
+    await peer.callTool("spend", { est: true });
+    expect(priced).toEqual([
+      [["m"], false],
+      [["m"], true],
+    ]);
+    expect(records.map((r) => r.costUsd)).toEqual([null, "1", "1"]);
+  });
+
+  test("a rejected spend write never becomes an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const usage = wiring([], {
+        spend: {
+          forCaller: () => ({
+            assertWithin: async () => {},
+            record: () => Promise.reject(new Error("write failed")),
+          }),
+        },
+      });
+      const { peer } = await stdio({
+        usage,
+        register: (server) =>
+          server.registerTool("spend", {}, async () => {
+            currentCall().meter({ model: "m", input: 1, output: 0 });
+            return { content: [] };
+          }),
+      });
+      await peer.callTool("spend");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("meter queues the spend write; assertWithinSpend reaches the charger", async () => {
     const calls: string[] = [];
     const records: CallRecord[] = [];
