@@ -40,6 +40,12 @@ export {
   readiness,
 } from "./probes.ts";
 export {
+  type AuthLayer,
+  createMcpService,
+  type McpService,
+  type McpServiceOptions,
+} from "./service.ts";
+export {
   type Caller,
   type CallRecord,
   type CallSink,
