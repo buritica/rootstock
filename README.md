@@ -29,6 +29,7 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 |---|---|---|
 | `golden` | v0.0.1 | Golden snapshots that prove a refactor or extraction changed nothing: canonical JSON, capture/check, a recording `fetch`, seeded vectors and throwaway Postgres |
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
+| `runner` | v0.11.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record), plan mode (`planPull`) and the queue drain (`drainQueue`) |
 | `retrieval` | v0.9.0 | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), with an optional candidate `budget` (a `set local` run first, since the index caps candidates before SQL `limit`), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable. The database needs the extension and a `lakebase_bm25` index built after the table is populated |
 
 More arrive in phases. Phase 1 extractions must be byte-identical: each
@@ -267,6 +268,57 @@ forward on 0.8.x only: an older line can never ship a migration there.
 - **A refused run records no buckets.** `finish("refused")` writes NULL
   buckets and `reconciled` even after `account()`; counters, tokens and cost
   are still recorded.
+
+### Pull runner and drain
+
+`@buritica/rootstock/runner` (0.11.0) runs a pull source and drains a queue.
+
+- **`runPull` fetches outside any transaction.** Per batch it reads what is
+  stored (`existing`), fetches what changed at most `fetchConcurrency` at a
+  time, then opens one transaction for the batch's loads, quarantine rows,
+  resolves and cursor. A fetch can take minutes without holding a backend
+  idle in a transaction.
+- **A killed run converges.** The cursor moves with the batch that covers
+  it, so a run killed mid-batch leaves that batch uncommitted and the next
+  run lists it again. That needs `list(cursorOf(r))` to return every ref
+  after `r`: when refs can share a cursor across a batch boundary, `list`
+  must be inclusive (equal cursors come back, already-stored ones are
+  skipped as unchanged).
+- **The lock is the caller's.** Acquire it, start its keepalive, and release
+  it after `runPull` returns. The runner gates it before each batch, before
+  each fetch, after the fetch pass, before each doc's writes and as the
+  batch transaction's last step; a gate refusal rolls the batch back and
+  settles `failed` (`lost-lock`).
+- **A quota trip stops after the ref that tripped it.** With `quota`, a load
+  that throws what `isQuota` recognises, or calls `ctx.quotaHit()`, counts
+  one hit; a load that resolves without calling it clears the count. At the
+  breaker's limit the batch commits through that ref, the cursor lands on
+  it, and the run settles `failed` (`quota`). Nothing already paid for is
+  rolled back.
+- **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run.
+  A refusal from `runs` emits `runner.settle_refused` and never fails the
+  load.
+- **Fold long exclusion lists.** Each `excluded` reason becomes a key of the
+  run's `excludedReasons`, so a source with many reasons folds them before
+  returning the listing. An empty reason, or one with a NUL, fails the run
+  as a `list` failure.
+- **Events inside a batch can describe a rollback.** `runs.quarantined`,
+  `runs.resolved` and `queue.cursor_written` fire inside the batch
+  transaction; when the batch rolls back, `runner.batch_rolled_back` follows.
+- **`planPull` writes nothing.** It lists, fetches and classifies each ref
+  as the run would, batch by batch, and stops before load. A source with
+  `planLoad` gets the docs that would load inside a READ ONLY transaction,
+  opened after the batch's fetches, that always rolls back. `maxRefs` plans
+  only the first refs (`truncated: true`).
+- **`drainQueue` holds one lock per source.** It takes each source's lock
+  without waiting (a refusal `isHeld` recognises skips the source; any other
+  propagates), claims a batch, and acks or fails each row, with one archival
+  cap across the whole drain, a contention brake, an interrupt and a fatal
+  stop. Rows it never handled are failed with your `heldClass` text and an
+  attempt charged.
+- **A killed drain's record is settled by the next drain that claims rows.**
+  `record.start` runs only after a claim returned rows, so an empty drain
+  leaves an earlier `running` row as it was.
 
 ## Rules
 

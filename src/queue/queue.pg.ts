@@ -872,6 +872,19 @@ async function rejection(run: () => Promise<unknown>): Promise<{ err: unknown; t
   throw new Error("expected a rejection");
 }
 
+/** Resolves once some backend of this database is waiting on a row lock; `on` is a free session. */
+async function waitForLockWaiter(on: Sql): Promise<void> {
+  for (let i = 0; i < 200; i += 1) {
+    const [r] = await on.unsafe(
+      `SELECT count(*)::text AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+    );
+    if (Number(r?.n) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("no backend started waiting on the row lock");
+}
+
 describe("QF1: the claim fence", () => {
   test("a stale holder's ack and fail after a reclaim are missing, under the same worker name", async () => {
     const q = await fresh();
@@ -1071,7 +1084,9 @@ describe("QF6: extendClaim", () => {
     q.events.length = 0;
     const a = { key: "alpha:x", worker: W, claim: taken?.claim as Claim };
     expect(await extendClaim(main.transactor, q.s, a, q.hooks)).toBe("extended");
-    expect(q.events).toEqual([{ type: "queue.claim_extended", key: "alpha:x", worker: W }]);
+    expect(q.events).toEqual([
+      { type: "queue.claim_extended", key: "alpha:x", worker: W, changed: false },
+    ]);
     const [r] = await sql.unsafe(
       `SELECT extract(epoch FROM (clock_timestamp() - claimed_at))::float8::text AS age FROM ${q.T} WHERE key = 'alpha:x'`,
     );
@@ -1080,20 +1095,71 @@ describe("QF6: extendClaim", () => {
     expect(await ack(main.transactor, q.s, a)).toBe("deleted");
   });
 
-  test("changed: an enqueue since the claim leaves claimed_at as it was, and ack releases", async () => {
+  test("QX2 changed: an enqueue since the claim still extends, and ack releases", async () => {
     const q = await fresh();
     await q.put("alpha:c");
     const [taken] = await claim(sql, q.s, { source: "alpha", limit: 1, worker: W });
+    await sql.unsafe(`UPDATE ${q.T} SET claimed_at = claimed_at - interval '20 minutes',
+                        updated_at = updated_at - interval '20 minutes' WHERE key = 'alpha:c'`);
     await q.put("alpha:c", { payload: { n: 2 } });
-    const claimedAt = `SELECT claimed_at::text AS c FROM ${q.T} WHERE key = 'alpha:c'`;
-    const [before] = await sql.unsafe(claimedAt);
     q.events.length = 0;
     const a = { key: "alpha:c", worker: W, claim: taken?.claim as Claim };
     expect(await extendClaim(main.transactor, q.s, a, q.hooks)).toBe("changed");
-    expect(q.events).toEqual([]);
-    const [after] = await sql.unsafe(claimedAt);
-    expect(after?.c).toBe(before?.c);
+    expect(q.events).toEqual([
+      { type: "queue.claim_extended", key: "alpha:c", worker: W, changed: true },
+    ]);
+    const [r] = await sql.unsafe(
+      `SELECT extract(epoch FROM (clock_timestamp() - claimed_at))::float8::text AS age FROM ${q.T} WHERE key = 'alpha:c'`,
+    );
+    // Extended past the enqueue's updated_at: only the version keeps the ack from deleting.
+    expect(Number(r?.age)).toBeLessThan(5);
     expect(await ack(main.transactor, q.s, a)).toBe("released");
+    expect(await q.row("alpha:c")).toMatchObject({ claimed: false, attempts: 0 });
+  });
+
+  test("QX3 a reclaim that commits while extend waits on the row reads missing", async () => {
+    const q = await fresh({ ackLockTimeoutMs: 10_000 });
+    await q.put("alpha:r");
+    const [taken] = await claim(sql, q.s, { source: "alpha", limit: 1, worker: W });
+    // B holds the row, A's extend queues behind it, B re-tokens the claim and commits.
+    const holder = openSecond();
+    const watcher = openSecond();
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => {
+      locked = r;
+    });
+    let go!: () => void;
+    const retoken = new Promise<void>((r) => {
+      go = r;
+    });
+    const holding = holder.transactor.begin(async (tx) => {
+      await tx.unsafe(`SELECT key FROM ${q.T} WHERE key = 'alpha:r' FOR UPDATE`);
+      locked();
+      await retoken;
+      await tx.unsafe(`UPDATE ${q.T} SET claim_token = gen_random_uuid() WHERE key = 'alpha:r'`);
+    });
+    try {
+      await isLocked;
+      q.events.length = 0;
+      const extending = extendClaim(
+        main.transactor,
+        q.s,
+        { key: "alpha:r", worker: W, claim: taken?.claim as Claim },
+        q.hooks,
+      );
+      await waitForLockWaiter(watcher.transactor.sql);
+      go();
+      await holding;
+      expect(await extending).toBe("missing");
+    } finally {
+      go();
+      await holding.catch(() => undefined);
+      await holder.close();
+      await watcher.close();
+    }
+    expect(q.events).toEqual([
+      { type: "queue.lost", key: "alpha:r", worker: W, operation: "extend" },
+    ]);
   });
 
   test("missing: another token, or another worker, emits queue.lost { extend }", async () => {

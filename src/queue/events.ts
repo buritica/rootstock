@@ -85,7 +85,7 @@ export type QueueEvent =
       worker: string;
       operation: "ack" | "fail" | "extend";
     }
-  | { type: "queue.claim_extended"; key: string; worker: string }
+  | { type: "queue.claim_extended"; key: string; worker: string; changed: boolean }
   | { type: "queue.retried"; key: string; source: string; kind: string }
   | { type: "queue.retry_noop"; key: string }
   | { type: "queue.cursor_read"; name: string; value: unknown }
