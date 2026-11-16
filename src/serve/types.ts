@@ -96,13 +96,20 @@ export interface StoppableServer {
   pending(): number;
 }
 
+/**
+ * How `mcpPath` answers a method other than POST.
+ * "405-first": the 405 before anything else. "auth-then-405": authenticate, then the 405.
+ * "auth-then-entry": authenticate, then the SDK entry with no body; its answer passes through untouched.
+ */
+export type MethodAnswer = "405-first" | "auth-then-405" | "auth-then-entry";
+
 /** Every field is required: a profile states each consumer's behaviour, never a default. */
 export interface ServeProfile {
   id: string;
   /** "/mcp" */
   mcpPath: string;
-  /** "auth": hand to requireMcpAuth as today. */
-  methods: { get: "405"; head: "405" | "auth"; other: "post-path" | "auth" };
+  /** "other" = every method but GET and POST. */
+  methods: { get: MethodAnswer; other: MethodAnswer };
   /** true: return null for paths the service does not own. */
   passUnknown: boolean;
   /** Matched with startsWith. */
@@ -147,7 +154,7 @@ export interface ServeProfile {
   /** Response bytes that differ per consumer. */
   bodies: {
     unauthorizedNoSub: "jsonrpc-401" | "empty-401";
-    jwksFailure: "503-retry" | "500-empty" | "500-json";
+    jwksFailure: "503-retry" | "500-empty" | "jsonrpc-500";
     notFound: "empty-no-store" | "text-not-found" | "json-not-found";
     internal: "empty-500" | "json-500" | "text-500";
     /** The SDK's text with the profile's limit. */

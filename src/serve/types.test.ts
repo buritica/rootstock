@@ -213,7 +213,7 @@ test("the shared types admit a complete value", () => {
   const profile: ServeProfile = {
     id: "example",
     mcpPath: "/mcp",
-    methods: { get: "405", head: "405", other: "post-path" },
+    methods: { get: "405-first", other: "auth-then-entry" },
     passUnknown: false,
     authPrefixes: { api: ["/api/auth/"], wellKnown: ["/.well-known/"] },
     entry: { kind: "transport", json: true },
