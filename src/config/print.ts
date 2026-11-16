@@ -137,6 +137,48 @@ function usageView(usage: NonNullable<RootstockConfig["usage"]>): unknown {
   };
 }
 
+const bucketView = (b: { capacity: number; refillPerSecond: number; maxKeys: number }) => ({
+  capacity: b.capacity,
+  maxKeys: b.maxKeys,
+  refillPerSecond: b.refillPerSecond,
+});
+
+function serveView(serve: NonNullable<RootstockConfig["serve"]>): unknown {
+  const { bodyLimit, limits, probes, shutdown } = serve;
+  const turn = limits.turnBudget;
+  return {
+    bodyLimit: {
+      bearer: bodyLimit.bearer,
+      local: bodyLimit.local,
+      none: bodyLimit.none,
+      oauth: bodyLimit.oauth,
+    },
+    deadlineMs: serve.deadlineMs,
+    id: serve.id,
+    idleTimeout: serve.idleTimeout,
+    limits: {
+      concurrency: mapView(limits.concurrency, (g) => ({ max: g.max, tools: [...g.tools] })),
+      logIntervalMs: limits.logIntervalMs,
+      perTool: mapView(limits.perTool, bucketView),
+      refusal: limits.refusal === null ? null : bucketView(limits.refusal),
+      serving: limits.serving === null ? null : bucketView(limits.serving),
+      turnBudget:
+        turn === null ? null : { cap: turn.cap, maxTurns: turn.maxTurns, warnAt: turn.warnAt },
+    },
+    probes: {
+      cacheTtlMs: probes.cacheTtlMs,
+      pendingMaxMs: probes.pendingMaxMs,
+      timeoutMs: probes.timeoutMs,
+    },
+    shutdown: {
+      drainMs: shutdown.drainMs,
+      flushMs: shutdown.flushMs,
+      forceMs: shutdown.forceMs,
+      poolEndTimeoutS: shutdown.poolEndTimeoutS,
+    },
+  };
+}
+
 /**
  * The config as canonical JSON, every field spelled out, for a repo to pin
  * as its config golden. No version field: a patch release must not move it.
@@ -181,6 +223,8 @@ export function printRootstockConfig(config: RootstockConfig): string {
   if (config.runs !== null) view.runs = runsView(config.runs);
   // Likewise: a config without a usage slice prints as before.
   if (config.usage !== null) view.usage = usageView(config.usage);
+  // And a config without a serve slice prints as before too.
+  if (config.serve !== null) view.serve = serveView(config.serve);
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;
 }

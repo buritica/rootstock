@@ -349,6 +349,8 @@ const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
     "../queue/index.ts",
     "../runs/index.ts",
     "../usage/index.ts",
+    // The slice file only: serve's index loads the MCP SDK, an optional peer.
+    "../serve/slice.ts",
     "../internal/slice.ts",
     "../golden/canonical.ts",
   ],

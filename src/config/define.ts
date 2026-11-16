@@ -3,6 +3,8 @@ import {
   runsJobLocks,
   runsLockTable,
   runsStaleHeartbeat,
+  serveDeadlineIdle,
+  serveProbeTimeout,
   usageSpendPrices,
 } from "./builtin.ts";
 import type {
@@ -18,6 +20,8 @@ import type {
   QueueSlice,
   RunsInput,
   RunsSlice,
+  ServeInput,
+  ServeSlice,
   SliceParsers,
   UsageInput,
   UsageSlice,
@@ -38,6 +42,7 @@ export interface RootstockConfigInput {
   queue?: QueueInput;
   runs?: RunsInput;
   usage?: UsageInput;
+  serve?: ServeInput;
   invariants?: readonly Invariant[];
 }
 
@@ -51,11 +56,14 @@ export interface RootstockConfig {
   readonly queue: QueueSlice | null;
   readonly runs: RunsSlice | null;
   readonly usage: UsageSlice | null;
+  readonly serve: ServeSlice | null;
   /**
    * Every invariant id, in input order, after the built-in ones that apply
    * (`lock-profile-single` when there is a lock; `runs-lock-table`,
    * `runs-job-locks` and `runs-stale-heartbeat` when there is a runs slice;
-   * `usage-spend-prices` when the usage slice's spend is in dollars);
+   * `usage-spend-prices` when the usage slice's spend is in dollars;
+   * `serve-deadline-idle` when the serve slice sets both deadlineMs and
+   * idleTimeout, and `serve-probe-timeout` when there is a serve slice);
    * all held, or define threw.
    */
   readonly invariants: readonly string[];
@@ -71,6 +79,7 @@ const INPUT_KEYS: readonly string[] = [
   "queue",
   "runs",
   "usage",
+  "serve",
   "invariants",
 ];
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
@@ -113,6 +122,7 @@ export function composeRootstockConfig(
       : input.runs;
   const runs = runsInput === undefined ? null : parsers.runsSlice(runsInput, defaults);
   const usage = input.usage === undefined ? null : parsers.usageSlice(input.usage, defaults);
+  const serve = input.serve === undefined ? null : parsers.serveSlice(input.serve);
 
   // A misspelled key would otherwise drop its slice or its invariants and
   // still build green. The value is never echoed, as in every slice parser.
@@ -133,6 +143,10 @@ export function composeRootstockConfig(
     ...(lock === null ? [] : [lockProfileSingle]),
     ...(runs === null ? [] : [runsLockTable, runsJobLocks, runsStaleHeartbeat]),
     ...(usage?.spend?.unit === "usd" ? [usageSpendPrices] : []),
+    ...(serve !== null && serve.deadlineMs !== null && serve.idleTimeout !== null
+      ? [serveDeadlineIdle]
+      : []),
+    ...(serve === null ? [] : [serveProbeTimeout]),
     ...(input.invariants ?? []),
   ];
   const ids: string[] = [];
@@ -156,6 +170,7 @@ export function composeRootstockConfig(
     queue,
     runs,
     usage,
+    serve,
     invariants: ids,
   } satisfies Omit<RootstockConfig, typeof rootstockConfigBrand>);
   built.add(config);
