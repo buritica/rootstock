@@ -46,8 +46,7 @@ export function testTransactorKind(): TestTransactorKind {
   return known;
 }
 
-function open(max = 1): TestClient {
-  const url = required("ROOTSTOCK_TEST_DATABASE_URL");
+function open(max = 1, url = required("ROOTSTOCK_TEST_DATABASE_URL")): TestClient {
   const kind = testTransactorKind();
   switch (kind) {
     case "bun-sql": {
@@ -63,6 +62,22 @@ function open(max = 1): TestClient {
       return { kind, client, close: () => client.$client.end() };
     }
   }
+}
+
+/**
+ * A `max: 1` client of the kind under test on another database of the same
+ * server, for a suite that makes its own throwaway database (its URL from
+ * `testDatabaseUrlFor`).
+ */
+export function openTestClientAt(url: string): TestClient {
+  return open(1, url);
+}
+
+/** `ROOTSTOCK_TEST_DATABASE_URL` with its database name replaced by `database`. */
+export function testDatabaseUrlFor(database: string): string {
+  const url = new URL(required("ROOTSTOCK_TEST_DATABASE_URL"));
+  url.pathname = `/${encodeURIComponent(database)}`;
+  return url.href;
 }
 
 /** The client a suite's cases run on. */
