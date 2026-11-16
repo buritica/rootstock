@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { dirname, join } from "node:path/posix";
 import pkg from "../package.json";
 
 const ROOT = `${import.meta.dir}/..`;
@@ -135,23 +136,28 @@ const TYPE_POSITION = "(?:[:<]|(?<![|&])[|&]|\\b(?:as|satisfies)\\s)\\s*";
 const TYPE_END = "(?=\\s*(?:[;,)|&>=\\]}]|\\[\\s*\\]|$))";
 const MEMBER = "\\s*(?:\\??\\.|\\[(?!\\s*\\]))";
 const NO_MEMBER_OR_CALL = "(?!\\s*(?:\\??\\.|\\[|\\())";
+const nameReads = (names: string): string[] => [
+  `${NOT_MEMBER}\\b(${names})\\b(?!\\s*\\??:)`,
+  `(?<!${KEY_POSITION})${NOT_MEMBER}\\b(${names})\\b(?=\\s*\\??:)`,
+];
 // `Date` is a clock when read as a value: `Date.now()`, `Date['now']`,
 // `Date()`, `new Date()`, `new Date` and `const D = Date`. `new Date(ms)`,
 // `Date.UTC(...)`, `instanceof Date` and the type are not.
+const DATE_READS = [
+  `${NOT_MEMBER}\\bDate\\s*\\??\\.\\s*now\\b`,
+  `${NOT_MEMBER}\\bDate\\s*\\[(?!\\s*\\])`,
+  `${NOT_MEMBER}(?<!\\bnew\\s+)\\bDate\\s*\\(`,
+  "\\bnew\\s+Date\\s*(\\(\\s*\\)|(?!\\s*\\())",
+  `${NOT_MEMBER}(?<!\\bnew\\s+|\\binstanceof\\s+|${TYPE_POSITION})\\bDate\\b${NO_MEMBER_OR_CALL}`,
+  `(?<=${TYPE_POSITION})\\bDate\\b(?!${TYPE_END}|\\s*\\??\\.|\\s*\\[)`,
+];
+const ABORT_SIGNAL_READS = [
+  `${NOT_MEMBER}\\bAbortSignal${MEMBER}`,
+  `${NOT_MEMBER}(?<!${TYPE_POSITION})\\bAbortSignal\\b(?!\\s*(?:\\??\\.|\\[))`,
+  `(?<=${TYPE_POSITION})\\bAbortSignal\\b(?!${TYPE_END}|${MEMBER})`,
+];
 const FORBIDDEN_GLOBALS = new RegExp(
-  [
-    `${NOT_MEMBER}\\b(${GLOBAL_NAMES})\\b(?!\\s*\\??:)`,
-    `(?<!${KEY_POSITION})${NOT_MEMBER}\\b(${GLOBAL_NAMES})\\b(?=\\s*\\??:)`,
-    `${NOT_MEMBER}\\bAbortSignal${MEMBER}`,
-    `${NOT_MEMBER}(?<!${TYPE_POSITION})\\bAbortSignal\\b(?!\\s*(?:\\??\\.|\\[))`,
-    `(?<=${TYPE_POSITION})\\bAbortSignal\\b(?!${TYPE_END}|${MEMBER})`,
-    `${NOT_MEMBER}\\bDate\\s*\\??\\.\\s*now\\b`,
-    `${NOT_MEMBER}\\bDate\\s*\\[(?!\\s*\\])`,
-    `${NOT_MEMBER}(?<!\\bnew\\s+)\\bDate\\s*\\(`,
-    "\\bnew\\s+Date\\s*(\\(\\s*\\)|(?!\\s*\\())",
-    `${NOT_MEMBER}(?<!\\bnew\\s+|\\binstanceof\\s+|${TYPE_POSITION})\\bDate\\b${NO_MEMBER_OR_CALL}`,
-    `(?<=${TYPE_POSITION})\\bDate\\b(?!${TYPE_END}|\\s*\\??\\.|\\s*\\[)`,
-  ].join("|"),
+  [...nameReads(GLOBAL_NAMES), ...ABORT_SIGNAL_READS, ...DATE_READS].join("|"),
 );
 
 test("the purity scan tells a read from a key", () => {
@@ -243,8 +249,9 @@ function literalEnd(source: string, start: number): number {
 
 // The code a scan reads: `//` and `/* */` comments outside literals are
 // dropped (a block comment keeps its newlines, so line numbers stay true) and
-// a quoted string's text is blanked, since `"Date"` names nothing.
-function stripComments(source: string): string {
+// a quoted string's text is blanked, since `"Date"` names nothing, unless
+// `keepStrings` asks for comments alone to go (to read import specifiers).
+function stripComments(source: string, keepStrings = false): string {
   let out = "";
   let prev = "";
   let i = 0;
@@ -262,7 +269,8 @@ function stripComments(source: string): string {
       const end = literalEnd(source, i);
       const text = source.slice(i, end);
       // A quoted string's text is no code; a template's `${…}` is, so it stays.
-      out += c === '"' || c === "'" ? `${c}${" ".repeat(Math.max(0, text.length - 2))}${c}` : text;
+      const blank = !keepStrings && (c === '"' || c === "'");
+      out += blank ? `${c}${" ".repeat(Math.max(0, text.length - 2))}${c}` : text;
       prev = c;
       i = end;
     } else {
@@ -406,4 +414,211 @@ test("no non-test file reads the environment", async () => {
     });
   }
   expect(offenders).toEqual([]);
+});
+
+// The W5 subpaths (`serve`, `serve/auth`, `usage`). Relative specifiers are
+// resolved to repo paths first, so a nested file cannot dodge a rule by its
+// depth. The first rule whose prefix matches a file applies. `own` is the
+// tree a file may import freely; `targets` are repo paths (a "/" suffix
+// admits the folder); `packages` admit the package and its subpaths.
+interface ImportRule {
+  readonly prefix: string;
+  readonly own: string | null;
+  readonly notOwn?: string;
+  readonly targets: readonly string[];
+  readonly packages: readonly string[];
+}
+const W5_RULES: readonly ImportRule[] = [
+  // Pure: nothing outside itself.
+  { prefix: "src/serve/types.ts", own: null, targets: [], packages: [] },
+  {
+    prefix: "src/serve/auth/",
+    own: "src/serve/auth/",
+    targets: ["src/serve/types.ts", "src/internal/"],
+    packages: ["better-auth", "@better-auth/mcp", "@better-auth/cimd"],
+  },
+  // Never Better Auth, never serve/auth: `serve` loads without the auth peers.
+  {
+    prefix: "src/serve/",
+    own: "src/serve/",
+    notOwn: "src/serve/auth/",
+    targets: [
+      "src/serve/types.ts",
+      "src/db/index.ts",
+      "src/migrate/index.ts",
+      "src/internal/",
+      "src/retry/token-bucket-math.ts",
+    ],
+    packages: ["@modelcontextprotocol/server", "node:async_hooks"],
+  },
+  {
+    prefix: "src/usage/",
+    own: "src/usage/",
+    targets: ["src/serve/types.ts", "src/db/index.ts", "src/runs/index.ts", "src/internal/"],
+    packages: [],
+  },
+];
+// Time, timers, ids, I/O and output are injected (contract: no `console`,
+// `Bun.*`, `Date`, `performance`, `setTimeout`, `crypto`): the same names the
+// pure subpaths forbid. serve/auth alone may read `fetch`, which Better Auth's
+// cimd plugin takes as a parameter.
+const w5Globals = (names: string): RegExp =>
+  new RegExp([...nameReads(names), ...ABORT_SIGNAL_READS, ...DATE_READS].join("|"));
+const W5_GLOBALS = w5Globals(GLOBAL_NAMES);
+const W5_AUTH_GLOBALS = w5Globals(
+  GLOBAL_NAMES.split("|")
+    .filter((n) => n !== "fetch")
+    .join("|"),
+);
+// A dynamic `import(` whose argument is not one plain string literal names a
+// module no scan can check, so it fails closed. Run on stripped code, where a
+// string's quotes stay and its text is blank.
+const NON_LITERAL_IMPORT = /(?<![.\w$])\bimport\s*\((?!\s*(["'])[^"'\n]*\1\s*\))/g;
+
+function w5Offenders(path: string, source: string): string[] {
+  const rule = W5_RULES.find((r) => allowed(path, [r.prefix]));
+  if (rule === undefined || TEST_FILE.test(path)) return [];
+  const offenders: string[] = [];
+  for (const spec of specifiers(stripComments(source, true))) {
+    if (spec.startsWith(".")) {
+      const target = join(dirname(path), spec);
+      const inOwn =
+        rule.own !== null &&
+        target.startsWith(rule.own) &&
+        !(rule.notOwn !== undefined && target.startsWith(rule.notOwn));
+      if (!inOwn && !allowed(target, rule.targets)) {
+        offenders.push(`${path} imports ${spec}`);
+      }
+    } else if (!rule.packages.some((p) => spec === p || spec.startsWith(`${p}/`))) {
+      offenders.push(`${path} imports ${spec}`);
+    }
+  }
+  const code = stripComments(source);
+  const globals = rule.prefix === "src/serve/auth/" ? W5_AUTH_GLOBALS : W5_GLOBALS;
+  code.split("\n").forEach((line, i) => {
+    const m = line.match(globals);
+    if (m) offenders.push(`${path}:${i + 1} uses ${m[0]}`);
+  });
+  for (const m of code.matchAll(NON_LITERAL_IMPORT)) {
+    const line = code.slice(0, m.index).split("\n").length;
+    offenders.push(`${path}:${line} imports a non-literal specifier`);
+  }
+  return offenders;
+}
+
+describe("serve, serve/auth and usage", () => {
+  test("non-test files import only their allowlist and reach no ambient clock, timer or id", async () => {
+    const offenders: string[] = [];
+    let scanned = 0;
+    for (const path of await sourceFiles()) {
+      if (!W5_RULES.some((r) => allowed(path, [r.prefix])) || TEST_FILE.test(path)) continue;
+      scanned++;
+      offenders.push(...w5Offenders(path, await Bun.file(`${ROOT}/${path}`).text()));
+    }
+    expect(scanned).toBeGreaterThanOrEqual(4);
+    expect(offenders).toEqual([]);
+  });
+
+  test("the scan admits each allowlisted import", () => {
+    const admitted: [string, string][] = [
+      ["src/serve/index.ts", "./types.ts"],
+      ["src/serve/index.ts", "./pipeline.ts"],
+      ["src/serve/index.ts", "@modelcontextprotocol/server"],
+      ["src/serve/index.ts", "node:async_hooks"],
+      ["src/serve/index.ts", "../db/index.ts"],
+      ["src/serve/index.ts", "../migrate/index.ts"],
+      ["src/serve/index.ts", "../internal/slice.ts"],
+      ["src/serve/index.ts", "../retry/token-bucket-math.ts"],
+      ["src/serve/limits/bucket.ts", "../../retry/token-bucket-math.ts"],
+      ["src/serve/auth/index.ts", "../types.ts"],
+      ["src/serve/auth/index.ts", "./pages.ts"],
+      ["src/serve/auth/index.ts", "better-auth"],
+      ["src/serve/auth/index.ts", "better-auth/plugins"],
+      ["src/serve/auth/index.ts", "@better-auth/mcp"],
+      ["src/serve/auth/index.ts", "@better-auth/cimd"],
+      ["src/serve/auth/index.ts", "../../internal/slice.ts"],
+      ["src/usage/index.ts", "./sinks.ts"],
+      ["src/usage/index.ts", "../serve/types.ts"],
+      ["src/usage/index.ts", "../db/index.ts"],
+      ["src/usage/index.ts", "../runs/index.ts"],
+      ["src/usage/index.ts", "../internal/slice.ts"],
+    ];
+    const wrong = admitted.filter(([path, spec]) => w5Offenders(path, `import "${spec}";`).length);
+    expect(wrong).toEqual([]);
+  });
+
+  test("the scan fails on a planted violation", () => {
+    const planted: [string, string][] = [
+      // types.ts is pure: not even a sibling.
+      ["src/serve/types.ts", 'import { x } from "./limits.ts";'],
+      ["src/serve/types.ts", 'import type { SqlSubset } from "../db/index.ts";'],
+      // serve never loads Better Auth, directly or through serve/auth.
+      ["src/serve/index.ts", 'import { betterAuth } from "better-auth";'],
+      ["src/serve/index.ts", 'import { mcp } from "@better-auth/mcp";'],
+      ["src/serve/index.ts", 'export * from "./auth/index.ts";'],
+      ["src/serve/limits/bucket.ts", 'import "../auth/index.ts";'],
+      ["src/serve/index.ts", 'import { x } from "../retry/index.ts";'],
+      ["src/serve/index.ts", 'import { sql } from "postgres";'],
+      ["src/serve/index.ts", 'import { McpServer } from "@modelcontextprotocol/node";'],
+      ["src/serve/index.ts", 'import { x } from "../usage/index.ts";'],
+      // serve/auth sees the shared types only.
+      ["src/serve/auth/index.ts", 'import { createMcpService } from "../index.ts";'],
+      ["src/serve/auth/index.ts", 'import { McpServer } from "@modelcontextprotocol/server";'],
+      ["src/serve/auth/index.ts", 'import { x } from "../../db/index.ts";'],
+      ["src/serve/auth/index.ts", 'import { SignJWT } from "jose";'],
+      // usage reaches serve through types.ts only.
+      ["src/usage/index.ts", 'import { currentCall } from "../serve/index.ts";'],
+      ["src/usage/index.ts", 'import { x } from "../lock/index.ts";'],
+      ["src/usage/index.ts", 'const m = await import("node:fs");'],
+      // Ambient clocks, timers, ids and output.
+      ["src/serve/index.ts", "const t = Date.now();"],
+      ["src/serve/index.ts", "const d = new Date();"],
+      ["src/serve/index.ts", "const t = performance.now();"],
+      ["src/serve/index.ts", "setTimeout(fn, 5);"],
+      ["src/serve/auth/index.ts", "const id = crypto.randomUUID();"],
+      ["src/usage/index.ts", "console.log(x);"],
+      ["src/usage/index.ts", "await Bun.sleep(1);"],
+      ["src/serve/types.ts", "const r = Math.random();"],
+      // Every global the pure subpaths forbid, however it is reached.
+      ["src/serve/index.ts", "globalThis.setTimeout(f, 5);"],
+      ["src/serve/index.ts", 'const t = globalThis["Date"].now();'],
+      ["src/serve/index.ts", "const g = globalThis;"],
+      ["src/serve/index.ts", "const s = AbortSignal.timeout(5);"],
+      ["src/serve/index.ts", "const s = AbortSignal.any([a, b]);"],
+      ["src/serve/index.ts", "queueMicrotask(f);"],
+      ["src/serve/index.ts", "const t = process.hrtime();"],
+      ["src/usage/index.ts", "const { env } = process;"],
+      ["src/serve/index.ts", "const r = await fetch(u);"],
+      ["src/usage/index.ts", "const f = fetch;"],
+      ["src/serve/auth/index.ts", "const s = AbortSignal.timeout(5);"],
+      ["src/serve/auth/index.ts", "const g = globalThis.fetch;"],
+      // Every way to load a module the specifier scan cannot read.
+      ["src/serve/index.ts", 'const fs = require("node:fs");'],
+      ["src/serve/index.ts", 'import fs = require("node:fs");'],
+      ["src/serve/auth/index.ts", 'const m = require("./pages.ts");'],
+      ["src/usage/index.ts", "const m = await import(`node:fs`);"],
+      ["src/usage/index.ts", "const m = await import(name);"],
+      ["src/usage/index.ts", 'const m = await import("./sinks" + ".ts");'],
+      ["src/usage/index.ts", 'const m = await import(/* c */ "node:fs");'],
+      ["src/usage/index.ts", 'const m = await import(\n  "node:fs"\n);'],
+    ];
+    const missed = planted.filter(([path, src]) => w5Offenders(path, src).length !== 1);
+    expect(missed).toEqual([]);
+  });
+
+  test("injected names and test files are not violations", () => {
+    const clean = [
+      "const t = deps.clock.now();",
+      "const cancel = o.timers.set(5, fn);",
+      'log("serve.request", { ms });',
+      "const at = new Date(ms).toISOString();",
+      "type T = { at: Date; timers: Timers };",
+      "const r = await deps.fetch(u);",
+      'import x from "./sinks.ts"; // import "node:fs"',
+      '/* import("node:fs") */ const s = "import(name)";',
+    ];
+    expect(clean.flatMap((src) => w5Offenders("src/serve/index.ts", src))).toEqual([]);
+    expect(w5Offenders("src/serve/auth/index.ts", "const r = await fetch(u);")).toEqual([]);
+    expect(w5Offenders("src/serve/index.test.ts", 'import "better-auth"; Date.now();')).toEqual([]);
+  });
 });

@@ -40,7 +40,10 @@
     "./runner": "./src/runner/index.ts",
     "./concurrency": "./src/concurrency/index.ts",
     "./config": "./src/config/index.ts",
-    "./retrieval": "./src/retrieval/index.ts"
+    "./retrieval": "./src/retrieval/index.ts",
+    "./serve": "./src/serve/index.ts",
+    "./serve/auth": "./src/serve/auth/index.ts",
+    "./usage": "./src/usage/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
@@ -51,25 +54,50 @@
     "test:db": "bun scripts/test-db.ts"
   },
   "devDependencies": {
+    "@better-auth/cimd": "1.7.17",
+    "@better-auth/core": "1.7.17",
+    "@better-auth/mcp": "1.7.17",
+    "@better-auth/oauth-provider": "1.7.17",
     "@biomejs/biome": "2.5.14",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
     "@types/bun": "1.4.2",
+    "better-auth": "1.7.17",
     "drizzle-orm": "0.45.3",
     "jszip": "3.10.2",
     "mammoth": "1.13.0",
     "postgres": "3.4.9",
     "typescript": "7.0.2",
-    "unpdf": "1.8.1"
+    "unpdf": "1.8.1",
+    "zod": "4.6.7"
   },
   "publishConfig": {
     "access": "public",
     "provenance": true
   },
   "peerDependencies": {
+    "@better-auth/cimd": ">=1.7.17 <1.8",
+    "@better-auth/mcp": ">=1.7.17 <1.8",
+    "@modelcontextprotocol/server": ">=2.4.0 <3",
+    "better-auth": ">=1.7.17 <1.8",
     "jszip": "~3.10.2",
     "mammoth": "^1.13.0",
-    "unpdf": "^1.8.1"
+    "unpdf": "^1.8.1",
+    "zod": "^4.5.4"
   },
   "peerDependenciesMeta": {
+    "@better-auth/cimd": {
+      "optional": true
+    },
+    "@better-auth/mcp": {
+      "optional": true
+    },
+    "@modelcontextprotocol/server": {
+      "optional": true
+    },
+    "better-auth": {
+      "optional": true
+    },
     "jszip": {
       "optional": true
     },
@@ -78,6 +106,13 @@
     },
     "unpdf": {
       "optional": true
+    },
+    "zod": {
+      "optional": true
     }
+  },
+  "overrides": {
+    "@better-auth/core": "1.7.17",
+    "@better-auth/oauth-provider": "1.7.17"
   }
 }

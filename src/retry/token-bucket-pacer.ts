@@ -1,3 +1,5 @@
+import { msUntilToken, refillTokens } from "./token-bucket-math.ts";
+
 /** Just enough of a pacer to spend a token: what lets a test hand in a counting stub. */
 export interface Pacer {
   take(): Promise<void>;
@@ -46,14 +48,13 @@ export function createTokenBucketPacer(options: TokenBucketPacerOptions): TokenB
   async function acquire(): Promise<void> {
     for (;;) {
       const t = now();
-      const refill = ((t - lastRefillMs) / 1000) * ratePerSecond;
-      tokens = Math.min(burst, tokens + Math.max(0, refill));
+      tokens = refillTokens(tokens, t - lastRefillMs, ratePerSecond, burst);
       lastRefillMs = t;
       if (tokens >= 1) {
         tokens -= 1;
         return;
       }
-      await sleep(Math.ceil(((1 - tokens) / ratePerSecond) * 1000));
+      await sleep(msUntilToken(tokens, ratePerSecond));
     }
   }
 
