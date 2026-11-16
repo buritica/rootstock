@@ -176,13 +176,16 @@ function makeHandle(state: CallState, usage: UsageWiring | null, caller: Caller)
       state.tokens[u.model] = t;
       state.metered = true;
       if (u.estimated) state.estimated = true;
-      // The charger logs its own write failures; this keeps the rejection handled.
-      spend()
-        ?.record(u)
-        .catch(() => {});
+      // The charger logs its own write failures; this keeps the rejection
+      // handled, and a charger that throws synchronously never fails the call.
+      try {
+        Promise.resolve(spend()?.record(u)).catch(() => {});
+      } catch {
+        // As above.
+      }
     },
-    assertWithinSpend() {
-      return spend()?.assertWithin() ?? Promise.resolve();
+    async assertWithinSpend() {
+      await spend()?.assertWithin();
     },
   });
 }

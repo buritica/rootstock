@@ -337,8 +337,8 @@ export function createMcpService(o: McpServiceOptions): McpService {
   async function mcp(
     req: Request,
     url: URL,
-    info: { remoteAddress?: string },
     sourceKey: string,
+    faces: { bearer: boolean; oauth: boolean },
     publicFace: boolean,
   ): Promise<Response> {
     const method = req.method;
@@ -383,7 +383,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         return bodies.tooManyRequests();
       }
       // 5.3
-      const accepts = o.acceptCredentials?.(req, info) ?? { bearer: true, oauth: true };
+      const accepts = faces;
       if (o.credentials !== undefined && accepts.bearer) {
         const c = o.credentials(req);
         if (c instanceof Response) return c;
@@ -609,8 +609,9 @@ export function createMcpService(o: McpServiceOptions): McpService {
         sourceKey = sourceKeyFor(req, info, profile.clientIpHeader);
         const url = new URL(req.url);
         const hc = profile.hostCheck;
-        const publicFace =
-          o.acceptCredentials !== undefined && o.acceptCredentials(req, info).bearer === false;
+        // acceptCredentials decides the face: no static bearer is the public one.
+        const accepts = o.acceptCredentials?.(req, info);
+        const publicFace = accepts !== undefined && !accepts.bearer;
         const early405 =
           url.pathname === profile.mcpPath &&
           req.method !== "POST" &&
@@ -628,7 +629,13 @@ export function createMcpService(o: McpServiceOptions): McpService {
         }
         // 1 and 5
         if (url.pathname === profile.mcpPath)
-          return await mcp(req, url, info, sourceKey, publicFace);
+          return await mcp(
+            req,
+            url,
+            sourceKey,
+            accepts ?? { bearer: true, oauth: true },
+            publicFace,
+          );
         // 3
         const auth = await authRoute(req, url, sourceKey);
         if (auth !== undefined) return auth;
