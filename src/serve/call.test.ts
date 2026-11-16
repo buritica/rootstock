@@ -8,6 +8,7 @@ import {
   LOCAL_CALLER,
   localRequestContext,
   type RequestContext,
+  seamRuntime,
 } from "./call.ts";
 import { captureLog, fakeTime, flush } from "./fakes.test-support.ts";
 import type { Limits } from "./limits.ts";
@@ -81,7 +82,8 @@ async function stdio(s: Setup = {}) {
     profile: { unknownTool: s.unknownTool ?? "protocolError" },
     caller,
     toolScopes: s.toolScopes ?? SCOPES,
-    limits: s.limits === undefined ? NO_LIMITS : s.limits,
+    // A fresh object per server: one Limits shared by servers with other logs is rebuilt (and says so).
+    limits: s.limits === undefined ? { ...NO_LIMITS } : s.limits,
     usage: s.usage === undefined ? wiring(records) : s.usage,
     ctx: s.ctx ?? localRequestContext(caller),
     hooks: s.hooks ?? {},
@@ -590,7 +592,12 @@ describe("limits in the seams", () => {
       errorClass: "TurnBudgetExhausted",
       turnId: "turn-1",
     });
-    expect(log.lines).toContainEqual(["serve.turn_budget_exhausted", { tool: "spend", used: 3 }]);
+    expect(log.lines.filter(([e]) => e === "serve.turn_budget_exhausted")).toEqual([
+      [
+        "serve.turn_budget_exhausted",
+        { tool: "spend", used: 3, caller: "agent", turnId: "turn-1" },
+      ],
+    ]);
   });
 
   test("a limits tool toolScopes does not declare is refused", async () => {
@@ -764,4 +771,76 @@ test("installSeams on a server that already has tools throws ERR_ROOTSTOCK_SERVE
   }
   expect((caught as { code?: string })?.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
   expect(String(caught)).toMatch(/before the first registerTool/);
+});
+
+describe("imagine-gate seam details", () => {
+  test("one Limits object keeps at most 8 runtimes, least recently used out, and says when it rebuilds", () => {
+    const limits: Limits = { ...NO_LIMITS };
+    const time = fakeTime();
+    const lines: [string, Record<string, unknown>][] = [];
+    const logs = Array.from({ length: 9 }, () =>
+      Object.assign(
+        (e: string, f: Readonly<Record<string, unknown>>) => lines.push([e, { ...f }]),
+        {},
+      ),
+    );
+    const first = seamRuntime(limits, SCOPES, time, logs[0] as never);
+    expect(seamRuntime(limits, SCOPES, time, logs[0] as never)).toBe(first); // a hit
+    for (const l of logs.slice(1)) seamRuntime(limits, SCOPES, time, l as never);
+    expect(seamRuntime(limits, SCOPES, time, logs[0] as never)).not.toBe(first); // evicted, rebuilt
+    expect(lines.map(([, f]) => f.reason)).toEqual([
+      ...Array(7).fill("new-deps"),
+      "evicted",
+      "evicted",
+    ]);
+    expect(lines.every(([e]) => e === "serve.seam_runtime_rebuilt")).toBe(true);
+  });
+
+  test("turn_budget_exhausted is logged once per caller and turn", async () => {
+    const caller: Caller = { name: "agent", kind: "oauth", scopes: new Set(["mcp:tools"]) };
+    const ctx = { ...localRequestContext(caller), delegated: { onBehalfOf: null, turnId: "t-9" } };
+    const { peer, log } = await stdio({
+      caller,
+      ctx,
+      limits: {
+        ...NO_LIMITS,
+        turnBudget: { cap: 1, warnAt: 0, maxTurns: 10, exhausted: (n) => `spent ${n}` },
+      },
+    });
+    for (let i = 0; i < 4; i++) await peer.callTool("echo", { text: "x" });
+    expect(log.lines.filter(([e]) => e === "serve.turn_budget_exhausted")).toEqual([
+      ["serve.turn_budget_exhausted", { tool: "echo", used: 2, caller: "agent", turnId: "t-9" }],
+    ]);
+  });
+
+  test("an async sink whose record rejects is logged, never unhandled; the other sinks record", async () => {
+    let handled = false;
+    const kept: CallRecord[] = [];
+    const usage = wiring([], {
+      sinks: [
+        {
+          record: () => {
+            const p = Promise.reject(new SyntaxError("write failed"));
+            const then = p.then.bind(p);
+            // biome-ignore lint/suspicious/noThenProperty: spying on the handler the seam attaches is the point
+            p.then = ((ok, bad) => {
+              if (bad !== undefined) handled = true;
+              return then(ok, bad);
+            }) as typeof p.then;
+            return p as never;
+          },
+        },
+        { record: (r) => kept.push(r) },
+      ],
+    });
+    const { peer, log } = await stdio({ usage });
+    await peer.callTool("echo", { text: "x" });
+    await flush();
+    expect(handled).toBe(true);
+    expect(kept).toHaveLength(1);
+    expect(log.lines).toContainEqual([
+      "usage.sink_failed",
+      { tool: "echo", stage: "record", errorClass: "SyntaxError" },
+    ]);
+  });
 });

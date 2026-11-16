@@ -200,6 +200,8 @@ interface Runtime {
   groups: ReadonlyMap<string, ToolGroup>;
   turn: { budget: TurnBudget; limits: TurnBudgetLimits } | null;
   rateLimited: (bucket: string, fields: Readonly<Record<string, unknown>>) => void;
+  /** True the first time a caller+turn is past its budget (the line is logged once). */
+  firstExhaustion: (key: string) => boolean;
 }
 
 /** Per Limits object, one runtime per (toolScopes, clock, log) it was installed with. */
@@ -212,7 +214,11 @@ const NO_LIMITS: Runtime = {
   groups: new Map(),
   turn: null,
   rateLimited: () => {},
+  firstExhaustion: () => true,
 };
+
+/** Runtimes kept per Limits object; past this, the least recently used is rebuilt on next use. */
+const RUNTIMES_PER_LIMITS = 8;
 
 /**
  * The bucket, group and budget state for `limits`, built once per Limits
@@ -229,10 +235,17 @@ export function seamRuntime(
   if (limits === null) return NO_LIMITS;
   const installs = runtimes.get(limits) ?? [];
   runtimes.set(limits, installs);
-  const cached = installs.find(
+  const at = installs.findIndex(
     (i) => i.toolScopes === toolScopes && i.clock === clock && i.log === log,
   );
-  if (cached) return cached.rt;
+  if (at >= 0) {
+    // LRU: the hit moves to the most recently used end.
+    const [hit] = installs.splice(at, 1);
+    if (hit !== undefined) {
+      installs.push(hit);
+      return hit.rt;
+    }
+  }
   const declared = (where: string, tool: string) => {
     if (!Object.hasOwn(toolScopes.tools, tool)) {
       throw configError(
@@ -284,9 +297,33 @@ export function seamRuntime(
     groups,
     turn,
     rateLimited: rateLimitedLog(safeLog(log), clock, limits.logIntervalMs),
+    firstExhaustion: onceEach(limits.turnBudget?.maxTurns ?? 1),
   };
+  // A second runtime for one Limits object means its buckets start over for
+  // these deps (a new toolScopes, clock or log); say so, it resets limits.
+  if (installs.length > 0) {
+    safeLog(log)("serve.seam_runtime_rebuilt", {
+      reason: installs.length >= RUNTIMES_PER_LIMITS ? "evicted" : "new-deps",
+      runtimes: Math.min(installs.length + 1, RUNTIMES_PER_LIMITS),
+    });
+  }
   installs.push({ toolScopes, clock, log, rt });
+  if (installs.length > RUNTIMES_PER_LIMITS) installs.shift();
   return rt;
+}
+
+/** A key's first sighting is true, later ones false; remembers at most `max` keys (oldest dropped). */
+function onceEach(max: number): (key: string) => boolean {
+  const seen = new Set<string>();
+  return (key) => {
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (seen.size > max) {
+      const oldest = seen.values().next().value;
+      if (oldest !== undefined) seen.delete(oldest);
+    }
+    return true;
+  };
 }
 
 // ------------------------------------------------------------------ seams
@@ -340,7 +377,11 @@ const seamFault = () => new ProtocolError(ProtocolErrorCode.InternalError, "Inte
 export function installSeamsWith(
   server: McpServer,
   o: InstallSeamsOptions,
-  extra: { timedOut: () => boolean },
+  extra: {
+    timedOut: () => boolean;
+    /** Sees each tool call's promise as it starts (the service tracks calls past a deadline). */
+    onCall?: (call: Promise<unknown>) => void;
+  },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
   try {
@@ -472,7 +513,7 @@ export function installSeamsWith(
         throw err;
       }
     };
-    return calls.run({ state, handle }, async () => {
+    const running = calls.run({ state, handle }, async () => {
       try {
         return await dispatch();
       } catch (err) {
@@ -482,6 +523,8 @@ export function installSeamsWith(
         throw seamFault();
       }
     });
+    safeHook(extra.onCall, running);
+    return running;
 
     async function dispatch(): Promise<unknown> {
       const turnId = ctx.delegated.turnId;
@@ -489,7 +532,15 @@ export function installSeamsWith(
         const charge = rt.turn.budget.forTurn(turnId)();
         state.turnCharge = charge;
         if (charge.exhausted) {
-          log("serve.turn_budget_exhausted", { tool, used: charge.used });
+          // Once per caller and turn: a looping client would otherwise log every call.
+          if (rt.firstExhaustion(`${caller.name}\u0000${turnId}`)) {
+            log("serve.turn_budget_exhausted", {
+              tool,
+              used: charge.used,
+              caller: caller.name,
+              turnId,
+            });
+          }
           const text = JSON.stringify(exhaustedResult(charge, rt.turn.limits.exhausted));
           const result = { content: [{ type: "text", text }] };
           record("refused", result, "TurnBudgetExhausted");
@@ -544,15 +595,20 @@ export function installSeamsWith(
         log("usage.sink_failed", { tool: state.tool, stage: "build", errorClass: className(err) });
         return;
       }
+      const failed = (err: unknown) =>
+        log("usage.sink_failed", { tool: state.tool, stage: "record", errorClass: className(err) });
       for (const sink of sinks) {
         try {
-          sink.record(r);
+          const out: unknown = sink.record(r);
+          // An async sink's rejection is logged like a throw, never left
+          // unhandled (safeHook attaches the handler and swallows its faults).
+          safeHook((p: unknown) => {
+            if (typeof (p as PromiseLike<unknown> | undefined)?.then === "function") {
+              (p as PromiseLike<unknown>).then(undefined, failed);
+            }
+          }, out);
         } catch (err) {
-          log("usage.sink_failed", {
-            tool: state.tool,
-            stage: "record",
-            errorClass: className(err),
-          });
+          failed(err);
         }
       }
     }

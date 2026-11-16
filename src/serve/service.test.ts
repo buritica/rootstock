@@ -975,6 +975,8 @@ async function settle<T>(p: Promise<T>, time: FakeTime, stepMs = 50, rounds = 40
   );
   for (let i = 0; i < rounds && !done; i++) {
     await until(() => done || time.pending() > 0);
+    // One macrotask first, so work already resolving settles before time moves.
+    await new Promise<void>((r) => setImmediate(r));
     if (!done) time.advance(stepMs);
   }
   if (!done) throw new Error("settle: still pending");
@@ -1025,6 +1027,9 @@ describe("shutdown", () => {
         poolClosed: true,
         poolReason: "clean",
         poolMs: 0,
+        forced: "ok",
+        entryClosed: "none",
+        flushFailed: [],
       },
     ]);
     expect(time.pending()).toBe(0);

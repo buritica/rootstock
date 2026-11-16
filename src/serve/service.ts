@@ -1,6 +1,21 @@
 // createMcpService: the request pipeline of contract §3.2, in order, and the
 // shutdown of §3.7. Every answer a profile can vary is a profile value; the
 // bytes that mimic the SDK are built in bodies.ts and checked against it.
+//
+// Known behaviors, kept on purpose:
+// - A batch over the serving capacity is refused 429 and drains the bucket,
+//   as the loop it reproduces did.
+// - Limits live in memory, per process: N instances allow N times the rate.
+// - The turn budget is keyed by the client-sent turn id; source keys fall
+//   back to "unknown", so clients behind a proxy that sends no address share
+//   one refusal bucket.
+// - A JWKS outage charges each client's refusal token, like any auth throw.
+// - serve.request carries no requestId (it would move existing log goldens).
+// - Readiness omits a probe that cannot answer, so it fails open on it.
+// - On an SSE answer, serve.request's `ms` is time to headers; the sink's
+//   `durationMs` is the call's.
+// - Nothing flushes sinks for a stdio server: its owner calls each sink's
+//   `idle()` on exit.
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -132,6 +147,20 @@ function isJwksFailure(err: unknown): boolean {
   }
 }
 
+/**
+ * The auth server could not be reached: Better Auth's network-error text or
+ * jose's JWKS timeout. A log field only; the answer stays bodies.internal.
+ */
+function isAuthUnreachable(err: unknown): boolean {
+  try {
+    return (
+      err instanceof Error && (err.message === "JWKS fetch failed" || err.name === "JWKSTimeout")
+    );
+  } catch {
+    return false;
+  }
+}
+
 function clientOf(headers: Headers): RequestContext["client"] {
   // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
   const ua = (headers.get("user-agent") ?? "").replace(/[\x00-\x1f\x7f]/g, " ").trim();
@@ -182,6 +211,15 @@ function validate(o: McpServiceOptions): void {
         limit,
       );
     }
+  }
+  if (p.deadlineMs !== null && p.entry?.kind === "handler") {
+    // The handler entry answers SSE: a deadline would bound only the time to
+    // headers, never the tool, so it is refused rather than half applied.
+    throw configError(
+      "createMcpService",
+      'profile.deadlineMs must be null with entry.kind "handler"',
+      p.deadlineMs,
+    );
   }
   if (p.deadlineMs !== null && !isPositiveInteger(p.deadlineMs)) {
     throw configError(
@@ -235,7 +273,9 @@ interface Exchange {
   timedOut: () => boolean;
   /** The per-request server, once built; closed when the deadline expires. */
   server: McpServer | undefined;
-  /** The first error the handler entry reported for this request (factory throws included). */
+  /** Tool calls of this request still running. */
+  calls: Set<Promise<unknown>>;
+  /** The latest error the handler entry reported for this request (factory throws included). */
   failure: { err: unknown } | undefined;
 }
 
@@ -298,16 +338,50 @@ export function createMcpService(o: McpServiceOptions): McpService {
    * "all-but-public-auth" the private face is checked at step 2, before any
    * route; every other MCP request is checked at 5.1.
    */
-  const hostRefusal = (req: Request, faces: Faces, step: 2 | 5): Response | undefined => {
+  const hostRefusal = (
+    req: Request,
+    faces: Faces,
+    step: 2 | 5,
+    sourceKey: string,
+  ): Response | undefined => {
     if (host === null) return undefined;
     const atStep2 = host.privateFirst && faces.bearer;
-    return atStep2 === (step === 2) ? host.guard(req) : undefined;
+    const res = atStep2 === (step === 2) ? host.guard(req) : undefined;
+    if (res !== undefined) hostRefusedLog(req, sourceKey);
+    return res;
+  };
+
+  // serve.host_refused, at most once per source key per minute: a wrong host
+  // list refuses everything, and the 404 alone looks like a route 404.
+  const HOST_LOG_MS = 60_000;
+  const HOST_LOG_KEYS = 1_024;
+  const hostLogged = new Map<string, number>();
+  const hostRefusedLog = (req: Request, sourceKey: string) => {
+    const t = clock.monotonic();
+    const at = hostLogged.get(sourceKey);
+    if (at !== undefined && t - at < HOST_LOG_MS) return;
+    hostLogged.delete(sourceKey);
+    hostLogged.set(sourceKey, t);
+    if (hostLogged.size > HOST_LOG_KEYS) {
+      const oldest = hostLogged.keys().next().value;
+      if (oldest !== undefined) hostLogged.delete(oldest);
+    }
+    log("serve.host_refused", {
+      sourceKey,
+      host: (req.headers.get("host") ?? "").slice(0, 200),
+      origin: (req.headers.get("origin") ?? "").slice(0, 200),
+    });
   };
 
   const methodAnswer = (method: string): MethodAnswer | null =>
     method === "POST" ? null : method === "GET" ? profile.methods.get : profile.methods.other;
 
   const exchange = new AsyncLocalStorage<Exchange>();
+  /**
+   * Tool calls still running after their deadline answered. The dispatch
+   * itself cannot be tracked: a closed transport never settles it.
+   */
+  const orphans = new Set<Promise<unknown>>();
 
   const buildServer = async (x: Exchange): Promise<McpServer> => {
     const server = new McpServer(o.serverInfo);
@@ -325,7 +399,14 @@ export function createMcpService(o: McpServiceOptions): McpService {
         clock,
         log,
       },
-      { timedOut: x.timedOut },
+      {
+        timedOut: x.timedOut,
+        onCall: (c) => {
+          x.calls.add(c);
+          const done = () => x.calls.delete(c);
+          c.then(done, done);
+        },
+      },
     );
     await o.registerTools(server, x.ctx);
     return server;
@@ -355,11 +436,12 @@ export function createMcpService(o: McpServiceOptions): McpService {
     if (kind === "handler") {
       const limits = Object.values(profile.bodyLimit).filter((v): v is number => v !== null);
       // A factory throw, or any other fault the entry reports, is kept on the
-      // exchange: the entry's own 500 then becomes serve's (bodies.internal
+      // exchange (the latest wins: an early report can be a benign
+      // rejection): the entry's own 500 then becomes serve's (bodies.internal
       // and serve.request_failed), on the legacy leg as on the modern one.
       const report = (err: unknown) => {
         const x = exchange.getStore();
-        if (x !== undefined) x.failure ??= { err };
+        if (x !== undefined) x.failure = { err };
       };
       const handler = createMcpHandler(
         async () => {
@@ -399,13 +481,17 @@ export function createMcpService(o: McpServiceOptions): McpService {
     return {
       async run(req, x, parsedBody, authInfo) {
         let server: McpServer | undefined;
+        // Past the deadline the answer is already sent: no tool may start.
+        const expired = () => bodies.internal(profile.bodies.internal);
         try {
           server = await buildServer(x);
+          if (x.timedOut()) return expired();
           const transport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
             enableJsonResponse: true,
           });
           await server.connect(transport);
+          if (x.timedOut()) return expired();
           return await transport.handleRequest(req, optsOf(parsedBody, authInfo));
         } finally {
           try {
@@ -522,6 +608,23 @@ export function createMcpService(o: McpServiceOptions): McpService {
       });
       return res;
     };
+    // Set when afterAuth reaches its serve.request: the line is written only
+    // once aroundRequest has returned, so a throw after next() logs the 500.
+    let deferred:
+      | {
+          res: Response;
+          extra: Readonly<Record<string, unknown>>;
+          known?: { rejection: string | undefined };
+        }
+      | undefined;
+    const settle = (
+      res: Response,
+      extra: Readonly<Record<string, unknown>>,
+      known?: { rejection: string | undefined },
+    ): Response => {
+      deferred = { res, extra, ...(known === undefined ? {} : { known }) };
+      return res;
+    };
     /** Logs serve.request_failed once and answers bodies.internal. */
     const fail = (
       reason: "threw" | "deadline",
@@ -553,7 +656,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
 
     async function authenticated(): Promise<Response> {
       // 5.1, 5.2
-      const early = hostRefusal(req, faces, 5) ?? peekRefusal();
+      const early = hostRefusal(req, faces, 5, sourceKey) ?? peekRefusal();
       if (early) return early;
       // 5.3
       if (o.credentials !== undefined && faces.bearer) {
@@ -606,6 +709,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         chargeRefusal("serve.auth_threw", {
           errorClass: className(err),
           ...(jwks ? { jwks: true } : {}),
+          ...(!jwks && isAuthUnreachable(err) ? { authUnreachable: true } : {}),
           error: err,
         });
         return jwks
@@ -649,7 +753,11 @@ export function createMcpService(o: McpServiceOptions): McpService {
           }
         };
         const run = () => afterAuth(r, ctx, fields);
-        return await (hooks.aroundRequest ? hooks.aroundRequest(r, run) : run());
+        const res = await (hooks.aroundRequest ? hooks.aroundRequest(r, run) : run());
+        const d = deferred;
+        if (d === undefined) return res;
+        // aroundRequest may answer its own response: log what is answered.
+        return await finish(res, d.extra, res === d.res ? d.known : undefined);
       } catch (err) {
         return fail("threw", {}, { errorClass: className(err), error: err });
       }
@@ -663,13 +771,19 @@ export function createMcpService(o: McpServiceOptions): McpService {
       const caller = ctx.caller;
       const authInfo: AuthInfo = { token: "", clientId: caller.name, scopes: [...caller.scopes] };
       let timedOut = false;
-      const x: Exchange = { ctx, timedOut: () => timedOut, server: undefined, failure: undefined };
-      if (answer === "auth-then-405") return finish(bodies.methodNotAllowed(), {}, NO_REJECTION);
+      const x: Exchange = {
+        ctx,
+        timedOut: () => timedOut,
+        server: undefined,
+        calls: new Set(),
+        failure: undefined,
+      };
+      if (answer === "auth-then-405") return settle(bodies.methodNotAllowed(), {}, NO_REJECTION);
       if (answer === "auth-then-entry") {
-        return finish(await entry.run(r, x, undefined, authInfo), fields());
+        return settle(await entry.run(r, x, undefined, authInfo), fields());
       }
       // 5.8: the entry's own pre-body checks, in its order and with its bytes.
-      const refuse = (e: EntryRefusal) => finish(e.res, fields(), { rejection: e.rejection });
+      const refuse = (e: EntryRefusal) => settle(e.res, fields(), { rejection: e.rejection });
       const pre = entry.preBody(r);
       if (pre) return refuse(pre);
       const limit = profile.bodyLimit[caller.kind];
@@ -709,13 +823,112 @@ export function createMcpService(o: McpServiceOptions): McpService {
         const won = await raceDeadline(timers, profile.deadlineMs, dispatch, () => {
           timedOut = true;
           x.server?.close().catch(() => {});
+          // Shutdown counts each running call as pending until it settles.
+          for (const c of x.calls) {
+            orphans.add(c);
+            const done = () => orphans.delete(c);
+            c.then(done, done);
+          }
         });
         if (won === "timeout") return fail("deadline", fields());
         res = won.value;
       }
       // 5.11
-      return finish(res, fields());
+      return settle(res, fields());
     }
+  }
+
+  let stopping: ReturnType<McpService["shutdown"]> | undefined;
+
+  async function stop({
+    signal,
+    server,
+    endPool,
+  }: Parameters<McpService["shutdown"]>[0]): ReturnType<McpService["shutdown"]> {
+    const s = profile.shutdown;
+    const sleep = (ms: number) => new Promise<void>((resolve) => timers.set(ms, resolve));
+    /** "ok", "timeout", or "threw:<errorClass>". */
+    const bounded = async (work: () => unknown, ms: number): Promise<string> => {
+      try {
+        const r = await raceDeadline(timers, ms, Promise.resolve().then(work));
+        return r === "timeout" ? "timeout" : "ok";
+      } catch (err) {
+        return `threw:${className(err)}`;
+      }
+    };
+    log("serve.stopping", { signal });
+    // Requests in the server, plus tool calls still running past a deadline.
+    const pending = () => server.pending() + orphans.size;
+    let drained = false;
+    try {
+      void Promise.resolve(server.stop()).catch(() => {});
+      const until = clock.monotonic() + s.drainMs;
+      while (pending() > 0 && clock.monotonic() < until) await sleep(POLL_MS);
+      drained = pending() === 0;
+    } catch {
+      // drained stays false.
+    }
+    const forced = await bounded(() => server.stop(true), s.forceMs);
+    const entryClosed = entry.close === null ? "none" : await bounded(entry.close, s.forceMs);
+    // allSettled: one sink that rejects at once must not end the wait (and
+    // close the pool) under the others. Flushed means every one fulfilled;
+    // flushFailed names the rest.
+    const waits = [
+      ...(o.usage?.sinks ?? []).map((sink, i) => ({
+        name: `sink[${i}]`,
+        work: () => sink.idle?.(),
+      })),
+      ...(o.auth === undefined ? [] : [{ name: "auth", work: () => o.auth?.idle() }]),
+    ].map(({ name, work }) => {
+      const w = { name, state: "timeout", done: Promise.resolve() };
+      w.done = Promise.resolve()
+        .then(work)
+        .then(
+          () => {
+            w.state = "ok";
+          },
+          (err) => {
+            w.state = `threw:${className(err)}`;
+          },
+        );
+      return w;
+    });
+    await raceDeadline(timers, s.flushMs, Promise.all(waits.map((w) => w.done)));
+    const flushFailed = waits.filter((w) => w.state !== "ok").map((w) => `${w.name}:${w.state}`);
+    const flushed = flushFailed.length === 0;
+    let poolClosed = false;
+    let poolReason = "none";
+    let poolMs = 0;
+    let poolErrorClass: string | undefined;
+    if (endPool !== undefined) {
+      const at = clock.monotonic();
+      try {
+        const ended = await raceDeadline(
+          timers,
+          s.poolEndTimeoutS * 1000,
+          Promise.resolve().then(() => endPool(s.poolEndTimeoutS)),
+        );
+        poolMs = Math.round(clock.monotonic() - at);
+        poolClosed = ended !== "timeout";
+        poolReason = poolClosed ? "clean" : "timeout";
+      } catch (err) {
+        poolReason = "threw";
+        poolErrorClass = className(err);
+      }
+    }
+    log("serve.stopped", {
+      signal,
+      drained,
+      flushed,
+      poolClosed,
+      poolReason,
+      poolMs,
+      forced,
+      entryClosed,
+      flushFailed,
+      ...(poolErrorClass === undefined ? {} : { poolErrorClass }),
+    });
+    return { drained, flushed, poolClosed };
   }
 
   const service: McpService = {
@@ -731,7 +944,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         // 2: the private face checks Host/Origin before anything else, a
         // 405-first answer excepted.
         if (!(onMcp && answer === "405-first")) {
-          const r = hostRefusal(req, faces, 2);
+          const r = hostRefusal(req, faces, 2, sourceKey);
           if (r) return r;
         }
         // 1 and 5
@@ -757,64 +970,10 @@ export function createMcpService(o: McpServiceOptions): McpService {
       }
     },
 
-    async shutdown({ signal, server, endPool }) {
-      const s = profile.shutdown;
-      const sleep = (ms: number) => new Promise<void>((resolve) => timers.set(ms, resolve));
-      const bounded = async (work: () => Promise<unknown>, ms: number): Promise<boolean> => {
-        try {
-          return (await raceDeadline(timers, ms, work())) !== "timeout";
-        } catch {
-          return false;
-        }
-      };
-      log("serve.stopping", { signal });
-      let drained = false;
-      try {
-        void Promise.resolve(server.stop()).catch(() => {});
-        const until = clock.monotonic() + s.drainMs;
-        while (server.pending() > 0 && clock.monotonic() < until) await sleep(POLL_MS);
-        drained = server.pending() === 0;
-      } catch {
-        // drained stays false.
-      }
-      await bounded(async () => server.stop(true), s.forceMs);
-      if (entry.close !== null) await bounded(entry.close, s.forceMs);
-      // allSettled: one sink that rejects at once must not end the wait (and
-      // close the pool) under the others. Flushed means every one fulfilled.
-      let flushed = false;
-      try {
-        const settled = await raceDeadline(
-          timers,
-          s.flushMs,
-          Promise.allSettled([
-            ...(o.usage?.sinks ?? []).map((sink) => Promise.resolve().then(() => sink.idle?.())),
-            Promise.resolve().then(() => o.auth?.idle()),
-          ]),
-        );
-        flushed = settled !== "timeout" && settled.value.every((r) => r.status === "fulfilled");
-      } catch {
-        // flushed stays false.
-      }
-      let poolClosed = false;
-      let poolReason = "none";
-      let poolMs = 0;
-      if (endPool !== undefined) {
-        const at = clock.monotonic();
-        try {
-          const ended = await raceDeadline(
-            timers,
-            s.poolEndTimeoutS * 1000,
-            Promise.resolve().then(() => endPool(s.poolEndTimeoutS)),
-          );
-          poolMs = Math.round(clock.monotonic() - at);
-          poolClosed = ended !== "timeout";
-          poolReason = poolClosed ? "clean" : "timeout";
-        } catch {
-          poolReason = "threw";
-        }
-      }
-      log("serve.stopped", { signal, drained, flushed, poolClosed, poolReason, poolMs });
-      return { drained, flushed, poolClosed };
+    shutdown(opts) {
+      // Idempotent: SIGTERM then SIGINT share one shutdown.
+      stopping ??= stop(opts);
+      return stopping;
     },
   };
   return Object.freeze(service);
