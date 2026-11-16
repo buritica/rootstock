@@ -86,12 +86,12 @@ describe("magic-link timing", () => {
     expect(h.logs.map((l) => l.fields.reason)).toEqual(["no-owner"]);
   });
 
-  test("an unknown address gets no send and no log line", async () => {
+  test("an unknown address gets no send and a reason-only refusal", async () => {
     const h = harness("invited");
     await signIn(h.layer, address("stranger"));
     await tick();
     expect(h.sent).toEqual([]);
-    expect(h.logs).toEqual([]);
+    expect(h.logs).toEqual([{ event: "auth.magic_link_refused", fields: { reason: "unknown" } }]);
   });
 });
 
@@ -106,7 +106,15 @@ describe("the per-address send limit", () => {
     await signIn(h.layer, address("owner"));
     await tick();
     expect(h.sent).toHaveLength(3);
-    expect(h.logs).toEqual([{ event: "auth.magic_link_suppressed", fields: { userId: id } }]);
+    // Sends settle on their timers, so only the counts per event are fixed.
+    const of = (event: string) => h.logs.filter((l) => l.event === event);
+    expect(of("auth.magic_link_sent")).toEqual(
+      Array(3).fill({ event: "auth.magic_link_sent", fields: { userId: id } }),
+    );
+    expect(of("auth.magic_link_suppressed")).toEqual([
+      { event: "auth.magic_link_suppressed", fields: { userId: id } },
+    ]);
+    expect(h.logs).toHaveLength(4);
     expect(JSON.stringify(h.logs)).not.toContain("example.test");
     // The first send leaves the 600 s window.
     h.clock.t += 600_000 - 3_000;
@@ -122,11 +130,14 @@ describe("the per-address send limit", () => {
       if (fail) throw new TypeError("mail provider down");
       sent.push(email);
     });
-    await invite(h.layer, address("member"));
+    const id = await invite(h.layer, address("member"));
     await signIn(h.layer, address("member"));
     await tick();
     expect(h.logs).toEqual([
-      { event: "auth.magic_link_send_failed", fields: { errorClass: "TypeError" } },
+      {
+        event: "auth.magic_link_send_failed",
+        fields: { errorClass: "TypeError", userId: id, released: true },
+      },
     ]);
     fail = false;
     await signIn(h.layer, address("member"));
@@ -199,6 +210,7 @@ describe("review fixes", () => {
     expect(ran).toBe(false);
     expect(queued).toHaveLength(1);
     queued[0]?.();
+    await h.layer.idle();
     expect(ran).toBe(true);
   });
 
@@ -218,7 +230,7 @@ describe("review fixes", () => {
     const onUnhandled = (e: unknown) => unhandled.push(e);
     process.on("unhandledRejection", onUnhandled);
     try {
-      const send = createMagicLinkSender(
+      const sender = createMagicLinkSender(
         {
           kind: "magicLink",
           allow: { kind: "invited" },
@@ -234,7 +246,7 @@ describe("review fixes", () => {
           },
         },
       );
-      await send({ email: address("member"), url: "https://app.example.test/x" }, known);
+      await sender.send({ email: address("member"), url: "https://app.example.test/x" }, known);
       await tick();
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -245,7 +257,7 @@ describe("review fixes", () => {
   test("a missing endpoint context sends nothing and says so", async () => {
     const logs: string[] = [];
     let sent = false;
-    const send = createMagicLinkSender(
+    const sender = createMagicLinkSender(
       {
         kind: "magicLink",
         allow: { kind: "invited" },
@@ -257,7 +269,7 @@ describe("review fixes", () => {
       null,
       { clock: new ManualClock(), timers: runNow, log: (_e, f) => logs.push(String(f.reason)) },
     );
-    await send({ email: address("member"), url: "https://app.example.test/x" }, null);
+    await sender.send({ email: address("member"), url: "https://app.example.test/x" }, null);
     expect(sent).toBe(false);
     expect(logs).toEqual(["no-context"]);
   });
@@ -270,5 +282,91 @@ describe("review fixes", () => {
     delete h.db.user;
     expect((await signIn(h.layer, address("owner"))).status).toBe(500);
     expect((await signIn(h.layer, address("member"))).status).toBe(200);
+  });
+});
+
+describe("imagine fixes", () => {
+  test("a sender that returns no promise is a sent link, not a failure", async () => {
+    const h = harness("invited", undefined, (() => undefined) as unknown as () => Promise<void>);
+    const id = await invite(h.layer, address("member"));
+    await signIn(h.layer, address("member"));
+    await h.layer.idle();
+    expect(h.logs).toEqual([{ event: "auth.magic_link_sent", fields: { userId: id } }]);
+  });
+
+  test("a timer that refuses to schedule: same 200, slot released, failure logged", async () => {
+    let refuse = true;
+    const h = harness("owner", (o) => ({
+      ...o,
+      timers: {
+        set: (ms, fn) => {
+          if (refuse) throw new RangeError("no timers left");
+          const handle = setTimeout(fn, ms);
+          return () => clearTimeout(handle);
+        },
+      },
+    }));
+    const id = await invite(h.layer, address("owner"));
+    const first = await signIn(h.layer, address("owner"));
+    expect({ status: first.status, body: await first.text() }).toEqual({
+      status: 200,
+      body: '{"status":true}',
+    });
+    expect(h.logs).toEqual([
+      {
+        event: "auth.magic_link_send_failed",
+        fields: { errorClass: "RangeError", userId: id, released: true },
+      },
+    ]);
+    // releaseOnFailure is false for this shape, yet the unscheduled slot came back.
+    refuse = false;
+    for (let i = 0; i < 3; i++) await signIn(h.layer, address("owner"));
+    await h.layer.idle();
+    expect(h.sent).toHaveLength(3);
+  });
+
+  test("idle() waits for a scheduled and in-flight send, then resolves", async () => {
+    let finish: () => void = () => undefined;
+    const h = harness(
+      "invited",
+      undefined,
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await h.layer.idle();
+    await invite(h.layer, address("member"));
+    await signIn(h.layer, address("member"));
+    let idle = false;
+    const waiting = h.layer.idle().then(() => {
+      idle = true;
+    });
+    await tick();
+    expect(idle).toBe(false);
+    finish();
+    await waiting;
+    expect(idle).toBe(true);
+    expect(h.logs.map((l) => l.event)).toEqual(["auth.magic_link_sent"]);
+  });
+
+  test("idle() resolves at once without a magic link", async () => {
+    await harness("social").layer.idle();
+  });
+
+  test("the send window runs on the monotonic clock, so a wall-clock step back changes nothing", async () => {
+    let wall = 1_800_000_000_000;
+    let mono = 0;
+    const h = harness("invited", (o) => ({
+      ...o,
+      clock: { now: () => wall, monotonic: () => mono },
+    }));
+    await invite(h.layer, address("member"));
+    await signIn(h.layer, address("member"));
+    wall -= 3_600_000; // NTP steps the wall clock back an hour
+    mono += 60_000; // while a full window really passes
+    await signIn(h.layer, address("member"));
+    await h.layer.idle();
+    expect(h.sent).toHaveLength(2);
   });
 });

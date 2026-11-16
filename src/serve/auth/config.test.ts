@@ -366,3 +366,11 @@ describe("/jwks stays unmetered", () => {
     expect(ruleMatches(pattern, `${path}`)).toBe(limited);
   });
 });
+
+describe("imagine fixes", () => {
+  test("an empty ipAddressHeaders is refused", () => {
+    const err = refusal(() => harness("owner", (o) => ({ ...o, ipAddressHeaders: [] })));
+    expect(err.code).toBe(CODE);
+    expect(err.message).toContain("ipAddressHeaders must be a non-empty array");
+  });
+});

@@ -94,3 +94,16 @@ test("a 429 response cut short logs on close, and finish plus close log once", (
   written.emit("close");
   expect(fresh.logs.map((l) => l.fields.path)).toEqual(["/api/auth/a", "/api/auth/b"]);
 });
+
+test("the node path drops a query before logging", () => {
+  const fresh = harness("owner");
+  const res = Object.assign(new EventEmitter(), { statusCode: 429, setHeader: () => undefined });
+  fresh.layer.wrapNodeAuthResponse(
+    res,
+    "/api/auth/magic-link/verify?token=secret-token",
+    "203.0.113.21",
+  );
+  res.emit("finish");
+  expect(fresh.logs.map((l) => l.fields.path)).toEqual(["/api/auth/magic-link/verify"]);
+  expect(JSON.stringify(fresh.logs)).not.toContain("secret-token");
+});

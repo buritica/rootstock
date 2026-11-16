@@ -13,6 +13,12 @@ export function authConfigError(fn: string, detail: string): Error {
   });
 }
 
+/** The class name of a thrown value, never its message. */
+export function errorClassOf(err: unknown): string {
+  if (!(err instanceof Error)) return "non-Error throw";
+  return err.constructor?.name || err.name || "Error";
+}
+
 /** Better Auth's own floor for a production secret. */
 const MIN_SECRET_LENGTH = 32;
 const PLACEHOLDER = /STUB|REPLACE|FIXTURE/i;
@@ -351,7 +357,8 @@ export function checkOptions(o: AuthOptions): CheckedOptions {
   limitRule("rateLimit", rateLimit, ["rules"]);
   const customRules = checkRules(own(rateLimit as Record<string, unknown>, "rules"));
 
-  const ipAddressHeaders = textList("ipAddressHeaders", get("ipAddressHeaders"), false);
+  const ipAddressHeaders = textList("ipAddressHeaders", get("ipAddressHeaders"), true);
+  // Non-empty: with no header every request shares Better Auth's one no-IP bucket.
   for (const h of ipAddressHeaders) {
     if (h.trim().toLowerCase() === "x-forwarded-for") {
       // A client can send its own; a proxy that appends makes it multi-valued,

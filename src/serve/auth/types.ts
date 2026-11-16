@@ -99,6 +99,11 @@ export interface AuthLayer {
   ): Promise<Response>;
   /** Resolves once the store answers and holds the resource row; rejects otherwise. */
   assertStoreReady(): Promise<void>;
+  /**
+   * Resolves once no magic-link send is scheduled or in flight (at once for
+   * social sign-in); never rejects. Shutdown awaits it like a sink's idle().
+   */
+  idle(): Promise<void>;
   /** For a node server that serves Better Auth itself: apply authHeaders and the 429 log around its own handler. */
   wrapNodeAuthResponse(res: NodeAuthResponse, path: string, client: string): void;
 }

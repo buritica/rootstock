@@ -8,43 +8,23 @@ import { fetchClientMetadataResource } from "@better-auth/cimd/node";
 import { mcp, requireMcpAuth } from "@better-auth/mcp";
 import { type BetterAuthOptions, betterAuth } from "better-auth";
 import { jwt, magicLink } from "better-auth/plugins";
-import type { Clock, LogEvent } from "../types.ts";
+import type { LogEvent } from "../types.ts";
 import {
   authConfigError,
   checkAuthSecret,
   checkOptions,
+  errorClassOf,
   MCP_TOOLS_SCOPE,
   resolveBase,
 } from "./config.ts";
-import { createMagicLinkSender } from "./magic-link.ts";
+import { createMagicLinkSender, type MagicLinkSender } from "./magic-link.ts";
+import { createRateLimitLog } from "./rate-limit-log.ts";
 import { isAllowedRedirectUri } from "./redirects.ts";
 import type { AuthLayer, AuthOptions, BetterAuthInstance } from "./types.ts";
 
 const HTML = "text/html; charset=utf-8";
 /** The Client ID Metadata Document profile MCP 2026-07-28 pins (draft-00). */
 const CIMD_PROFILE = "mcp-2026-07-28";
-// The 429 line is written at most once per client and path per window, with
-// the count it held back; the key set is cleared when it overflows, because
-// the path is the caller's choice.
-const RATE_LIMIT_LOG_WINDOW_MS = 60_000;
-const RATE_LIMIT_LOG_MAX_KEYS = 1_000;
-
-function createRateLimitLog(clock: Clock, emit: LogEvent) {
-  const seen = new Map<string, { at: number; suppressed: number }>();
-  return (path: string, client: string | null, retryAfter: string | null): void => {
-    const t = clock.now();
-    const key = `${client ?? ""}|${path}`;
-    const last = seen.get(key);
-    if (last !== undefined && t - last.at >= 0 && t - last.at < RATE_LIMIT_LOG_WINDOW_MS) {
-      last.suppressed += 1;
-      return;
-    }
-    if (last === undefined && seen.size >= RATE_LIMIT_LOG_MAX_KEYS) seen.clear();
-    seen.set(key, { at: t, suppressed: 0 });
-    emit("auth.rate_limited", { path, client, retryAfter, suppressed: last?.suppressed ?? 0 });
-  };
-}
-
 /** Builds the auth layer. Refuses (ERR_ROOTSTOCK_AUTH_CONFIG) any option outside the contract. */
 export function defineAuth(o: AuthOptions): AuthLayer {
   const checked = checkOptions(o);
@@ -81,13 +61,15 @@ export function defineAuth(o: AuthOptions): AuthLayer {
     // The package's DNS-pinning, SSRF-safe fetch, never a plain fetch wrapper.
     cimd({ fetchClientMetadataResource, metadataProfile: CIMD_PROFILE }),
   ];
+  let sender: MagicLinkSender | null = null;
   if (o.signIn.kind === "magicLink") {
-    const send = createMagicLinkSender(o.signIn, checked.owners, {
+    const created = createMagicLinkSender(o.signIn, checked.owners, {
       clock: o.clock,
       timers: o.timers,
       log: emit,
     });
-    plugins.push(magicLink({ disableSignUp: true, sendMagicLink: send }));
+    sender = created;
+    plugins.push(magicLink({ disableSignUp: true, sendMagicLink: created.send }));
   }
 
   const options: BetterAuthOptions = {
@@ -204,8 +186,15 @@ export function defineAuth(o: AuthOptions): AuthLayer {
           where: [{ field: "identifier", value: base.resource }],
         });
       } catch (err) {
+        // The class and a SQLSTATE-shaped code tell a missing table from a bad
+        // password; the cause's text (hosts, users) never reaches the message.
+        const code = (err as { code?: unknown } | null)?.code;
+        const sqlstate = typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? ` ${code}` : "";
         throw Object.assign(
-          authConfigError("assertStoreReady", "the auth store could not be read; see cause"),
+          authConfigError(
+            "assertStoreReady",
+            `the auth store could not be read (${errorClassOf(err)}${sqlstate}); see cause`,
+          ),
           { cause: err },
         );
       }
@@ -217,7 +206,13 @@ export function defineAuth(o: AuthOptions): AuthLayer {
       }
     },
 
-    wrapNodeAuthResponse(res, path, client) {
+    idle(): Promise<void> {
+      return sender === null ? Promise.resolve() : sender.idle();
+    },
+
+    wrapNodeAuthResponse(res, rawPath, client) {
+      // The caller may pass req.url; a query can carry a magic-link token.
+      const path = rawPath.split("?")[0] ?? "";
       // Nothing is set yet: Better Auth's setHeader comes after and replaces any of these.
       addAuthHeaders(
         () => false,

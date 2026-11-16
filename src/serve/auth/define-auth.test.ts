@@ -301,6 +301,33 @@ describe("assertStoreReady", () => {
   });
 });
 
+describe("assertStoreReady's message", () => {
+  test("names the cause's class and SQLSTATE, never its text", async () => {
+    const { layer } = harness("owner");
+    const ctx = await layer.instance.$context;
+    ctx.adapter.findOne = async () => {
+      throw Object.assign(new TypeError("password authentication failed for db.internal.test"), {
+        code: "28P01",
+      });
+    };
+    const err = (await layer.assertStoreReady().catch((e: unknown) => e)) as Error;
+    expect(err.message).toContain("(TypeError 28P01)");
+    expect(err.message).not.toContain("password");
+    expect(err.message).not.toContain("internal.test");
+  });
+
+  test("leaves out a code that is not SQLSTATE-shaped", async () => {
+    const { layer } = harness("owner");
+    const ctx = await layer.instance.$context;
+    ctx.adapter.findOne = async () => {
+      throw Object.assign(new Error("x"), { code: "ECONNREFUSED 10.0.0.1" });
+    };
+    const err = (await layer.assertStoreReady().catch((e: unknown) => e)) as Error;
+    expect(err.message).toContain("(Error)");
+    expect(err.message).not.toContain("ECONNREFUSED");
+  });
+});
+
 describe("verify", () => {
   let layer: AuthLayer | undefined;
   const server = Bun.serve({
