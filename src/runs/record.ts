@@ -1,9 +1,9 @@
 import { pgCode, type Sql } from "../db/index.ts";
-import { intIn, own, perSlice, q } from "../internal/slice.ts";
+import { cut, INT4_MAX, intIn, own, perSlice, q } from "../internal/slice.ts";
 import type { RunLock } from "../lock/index.ts";
 import { type RootstockRunsError, refusals } from "./errors.ts";
 import { type Emit, emitter, failure, type RunStatus, type RunsDeps } from "./events.ts";
-import { cut, priceTokens, type TokenCost } from "./price.ts";
+import { priceTokens } from "./price.ts";
 import {
   assertRunsSlice,
   COUNTER,
@@ -211,8 +211,7 @@ async function notable<T>(slice: RunsSlice, run: () => Promise<T>, job?: string)
   }
 }
 
-const COUNT_MAX = 2_147_483_647;
-const E_COUNT = `a non-negative integer of at most ${COUNT_MAX}`;
+const E_COUNT = `a non-negative integer of at most ${INT4_MAX}`;
 const PHASE = /^[a-z0-9_.:-]{1,32}$/;
 /** R2's retries after a lost connection (§20 A24). */
 const R2_RETRIES = 2;
@@ -258,16 +257,6 @@ function connectionLost(err: unknown): boolean {
 /** UTF-8 bytes of `s`. */
 function bytes(s: string): number {
   return new TextEncoder().encode(s).length;
-}
-
-/** §3.6: the cost of `tokens` under the slice's prices, in integer micro-dollars. */
-function costOf(
-  slice: RunsSlice,
-  decl: JobDecl,
-  tokens: ReadonlyMap<string, { input: number; output: number }>,
-  estimated: boolean,
-): TokenCost {
-  return priceTokens(slice, tokens, { metered: decl.metered, estimated });
 }
 
 interface Identity {
@@ -332,7 +321,7 @@ function checkAccounting(input: unknown, job: string, maxBytes: number): Account
   const out: Record<string, number> = {};
   for (const key of ["listed", "written", "unchanged", "quarantined", "excluded"] as const) {
     const v = own(a, key);
-    if (!intIn(v, 0, COUNT_MAX)) throw fail(`${key} must be ${E_COUNT} — got ${q(v)}`);
+    if (!intIn(v, 0, INT4_MAX)) throw fail(`${key} must be ${E_COUNT} — got ${q(v)}`);
     out[key] = v;
   }
   const raw = own(a, "excludedReasons");
@@ -348,7 +337,7 @@ function checkAccounting(input: unknown, job: string, maxBytes: number): Account
         `excludedReasons keys must be non-empty with no NUL or lone surrogate — got ${q(reason)}`,
       );
     }
-    if (!intIn(n, 0, COUNT_MAX))
+    if (!intIn(n, 0, INT4_MAX))
       throw fail(`excludedReasons[${q(reason)}] must be ${E_COUNT} — got ${q(n)}`);
     sum += n;
     reasons.push([reason, n]);
@@ -483,7 +472,7 @@ function makeRun(
     phase: string | null,
   ): Promise<FinishResult> => {
     const identity = identityOf(decl, job, status, accounting);
-    const cost = costOf(slice, decl, tokens, estimated);
+    const cost = priceTokens(slice, tokens, { metered: decl.metered, estimated });
     const given = reasonIn === undefined ? undefined : reasonIn.replaceAll("\0", "�");
     const composed =
       identity.failed === null

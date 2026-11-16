@@ -17,7 +17,6 @@ function escapeLabelValue(v: string): string {
 interface ToolSeries {
   ok: number;
   error: number;
-  count: number;
   sumSeconds: number;
   /** Cumulative counts, parallel to the buckets. */
   buckets: number[];
@@ -71,7 +70,6 @@ export function prometheusToolMetrics(o: {
         series.set(tool, {
           ok: 0,
           error: 0,
-          count: 0,
           sumSeconds: 0,
           buckets: buckets.map(() => 0),
         });
@@ -83,7 +81,6 @@ export function prometheusToolMetrics(o: {
       if (s === undefined) return;
       const seconds = Math.max(0, r.durationMs) / 1000;
       s[r.ok ? "ok" : "error"] += 1;
-      s.count += 1;
       s.sumSeconds += seconds;
       buckets.forEach((bound, i) => {
         if (seconds <= bound) s.buckets[i] = (s.buckets[i] ?? 0) + 1;
@@ -98,6 +95,7 @@ export function prometheusToolMetrics(o: {
       for (const name of tools) {
         const s = series.get(name) as ToolSeries;
         const tool = escapeLabelValue(name);
+        const count = s.ok + s.error;
         for (const outcome of ["ok", "error"] as const) {
           callLines.push(`${calls}{tool="${tool}",outcome="${outcome}"} ${s[outcome]}`);
         }
@@ -105,9 +103,9 @@ export function prometheusToolMetrics(o: {
           latencyLines.push(`${latency}_bucket{tool="${tool}",le="${bound}"} ${s.buckets[i] ?? 0}`);
         });
         latencyLines.push(
-          `${latency}_bucket{tool="${tool}",le="+Inf"} ${s.count}`,
+          `${latency}_bucket{tool="${tool}",le="+Inf"} ${count}`,
           `${latency}_sum{tool="${tool}"} ${s.sumSeconds}`,
-          `${latency}_count{tool="${tool}"} ${s.count}`,
+          `${latency}_count{tool="${tool}"} ${count}`,
         );
       }
       return `${callLines.join("\n")}\n\n${latencyLines.join("\n")}\n`;

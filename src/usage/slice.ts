@@ -8,6 +8,9 @@ import {
   sliceRefusals,
   tableRef,
 } from "../internal/slice.ts";
+import type { SpendStoreShape, SpendUnit } from "./spend.ts";
+
+type DayUserTokens = Extract<SpendStoreShape, { kind: "day-user-tokens" }>;
 
 export interface UsageSliceInput {
   /** The Postgres call log, or null for none. */
@@ -23,18 +26,9 @@ export interface UsageSliceInput {
   keepOutput: boolean;
   /** The daily per-caller ceiling, or null for none. */
   spend: {
-    unit: "tokens" | "usd";
+    unit: SpendUnit;
     ceiling: number;
-    store:
-      | { kind: "rootstock"; schema?: string }
-      | {
-          kind: "day-user-tokens";
-          schema: string;
-          table: string;
-          day: string;
-          user: string;
-          used: string;
-        };
+    store: { kind: "rootstock"; schema?: string } | DayUserTokens;
   } | null;
 }
 
@@ -49,42 +43,25 @@ export interface UsageSlice {
   readonly keepArgs: boolean;
   readonly keepOutput: boolean;
   readonly spend: {
-    readonly unit: "tokens" | "usd";
+    readonly unit: SpendUnit;
     readonly ceiling: number;
-    readonly store:
-      | { readonly kind: "rootstock"; readonly schema: string }
-      | {
-          readonly kind: "day-user-tokens";
-          readonly schema: string;
-          readonly table: string;
-          readonly day: string;
-          readonly user: string;
-          readonly used: string;
-        };
+    readonly store: Readonly<SpendStoreShape>;
   } | null;
 }
 
 const PARSER = "usageSlice";
-const KEYS: ReadonlySet<string> = new Set(["callLog", "keepArgs", "keepOutput", "spend"]);
 const REQUIRED = ["callLog", "keepArgs", "keepOutput", "spend"] as const;
+const KEYS: ReadonlySet<string> = new Set(REQUIRED);
 const CALL_LOG_KEYS: ReadonlySet<string> = new Set(["table", "maxBuffered", "maxBatch"]);
 const SPEND_KEYS: ReadonlySet<string> = new Set(["unit", "ceiling", "store"]);
 const ROOTSTOCK_STORE_KEYS: ReadonlySet<string> = new Set(["kind", "schema"]);
-const DAY_USER_KEYS: ReadonlySet<string> = new Set([
-  "kind",
-  "schema",
-  "table",
-  "day",
-  "user",
-  "used",
-]);
-const MAX_BUFFERED = 1_000_000;
+const DAY_USER_FIELDS = ["schema", "table", "day", "user", "used"] as const;
+const DAY_USER_KEYS: ReadonlySet<string> = new Set(["kind", ...DAY_USER_FIELDS]);
+/** The largest call log buffer the slice (and postgresCallLog) accepts. */
+export const MAX_BUFFERED = 1_000_000;
 
 const refuse = sliceRefusals(PARSER);
 const brand: Brand<UsageSlice> = sliceBrand("UsageSlice", PARSER);
-
-/** True for a slice `usageSlice` returned. */
-export const isUsageSlice = brand.has;
 
 function bool(path: string, value: unknown): boolean {
   if (typeof value !== "boolean") throw refuse.invalid(path, "a boolean", value);
@@ -123,9 +100,9 @@ function parseStore(raw: unknown, schema: string): NonNullable<UsageSlice["spend
   }
   if (kind === "day-user-tokens") {
     refuse.refuseUnknownKeys(s, DAY_USER_KEYS, "spend.store.");
-    const fields = ["schema", "table", "day", "user", "used"] as const;
-    for (const k of fields) if (own(s, k) === undefined) throw refuse.required(`spend.store.${k}`);
-    const [sc, table, day, user, used] = fields.map((k) =>
+    for (const k of DAY_USER_FIELDS)
+      if (own(s, k) === undefined) throw refuse.required(`spend.store.${k}`);
+    const [sc, table, day, user, used] = DAY_USER_FIELDS.map((k) =>
       identifier(refuse, `spend.store.${k}`, own(s, k)),
     ) as [string, string, string, string, string];
     return Object.freeze({ kind, schema: sc, table, day, user, used });

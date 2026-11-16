@@ -1,3 +1,4 @@
+import { cut } from "../internal/slice.ts";
 import { priceMicros, type RunsSlice } from "./slice.ts";
 
 const NOTE_MODELS_MAX = 200;
@@ -9,11 +10,6 @@ export interface TokenCost {
   costUsd: string | null;
   /** null, "estimated", "unmetered" or "unpriced:<models>". */
   costNote: string | null;
-}
-
-/** `s` cut to its first `max` characters (code points, so no surrogate is split). */
-export function cut(s: string, max: number): string {
-  return s.length <= max ? s : Array.from(s).slice(0, max).join("");
 }
 
 /** `micro` micro-dollars as a decimal string with exactly 6 fractional digits. */

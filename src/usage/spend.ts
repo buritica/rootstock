@@ -1,5 +1,5 @@
 import { quoteIdentifier, type Sql } from "../db/index.ts";
-import { q } from "../internal/slice.ts";
+import { q, quoteTable } from "../internal/slice.ts";
 import { priceTokens, type RunsSlice } from "../runs/index.ts";
 import type { Clock, LogEvent, SpendCharger, Usage } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
@@ -45,7 +45,7 @@ function total(rows: readonly Record<string, unknown>[]): number {
 export function postgresSpendStore(o: { sql: Sql; shape: SpendStoreShape }): SpendStore {
   const { sql, shape } = o;
   if (shape?.kind === "rootstock") {
-    const t = `${quoteIdentifier(shape.schema)}.spend`;
+    const t = quoteTable({ schema: shape.schema, name: "spend" });
     const load = `select used from ${t} where window_start = ${TODAY} and caller = $1 and unit = $2`;
     const add = `insert into ${t} (window_start, caller, unit, used) values (${TODAY}, $1, $2, $3) on conflict (window_start, caller, unit) do update set used = ${t}.used + excluded.used returning used`;
     return Object.freeze({
@@ -57,7 +57,7 @@ export function postgresSpendStore(o: { sql: Sql; shape: SpendStoreShape }): Spe
     });
   }
   if (shape?.kind === "day-user-tokens") {
-    const t = `${quoteIdentifier(shape.schema)}.${quoteIdentifier(shape.table)}`;
+    const t = quoteTable({ schema: shape.schema, name: shape.table });
     const day = quoteIdentifier(shape.day);
     const user = quoteIdentifier(shape.user);
     const used = quoteIdentifier(shape.used);
@@ -98,8 +98,6 @@ const countable = (n: unknown): boolean =>
   typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 
 interface Entry {
-  /** UTC day number of the clock. */
-  day: number;
   /** The store's total as last read or returned; null before either. */
   base: number | null;
   /** Adds sent and not yet answered. */
@@ -138,13 +136,20 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
   if (unit === "usd" && prices === null) {
     throw configError('createSpendCeiling: unit "usd" needs the runs slice\'s prices');
   }
+  // Today's entries only: the first call of a new UTC day clears the map, so
+  // a caller who stops calling is not kept.
   const cache = new Map<string, Entry>();
+  let currentDay: number | null = null;
 
   const entryFor = (caller: string): Entry => {
     const day = Math.floor(clock.now() / DAY_MS);
+    if (day !== currentDay) {
+      cache.clear();
+      currentDay = day;
+    }
     let e = cache.get(caller);
-    if (e === undefined || e.day !== day) {
-      e = { day, base: null, pending: 0, kept: 0 };
+    if (e === undefined) {
+      e = { base: null, pending: 0, kept: 0 };
       cache.set(caller, e);
     }
     return e;

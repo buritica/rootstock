@@ -1,8 +1,9 @@
-import { quoteIdentifier, type Sql } from "../db/index.ts";
-import { intIn, q } from "../internal/slice.ts";
+import type { Sql } from "../db/index.ts";
+import { INT4_MAX, intIn, q, quoteTable } from "../internal/slice.ts";
 import type { CallRecord, CallSink, LogEvent } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
 import { configError } from "./errors.ts";
+import { MAX_BUFFERED } from "./slice.ts";
 
 /** Column → the type `jsonb_to_recordset` reads it as. Fixed names, no column map. */
 const COLUMNS: readonly (readonly [string, string])[] = [
@@ -35,11 +36,8 @@ const COLUMNS: readonly (readonly [string, string])[] = [
 export function callLogInsert(table: { schema: string; name: string }): string {
   const cols = COLUMNS.map(([c]) => c).join(", ");
   const typed = COLUMNS.map(([c, t]) => `${c} ${t}`).join(", ");
-  const target = `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.name)}`;
-  return `insert into ${target} (${cols}) select ${cols} from jsonb_to_recordset($1::text::jsonb) as x(${typed})`;
+  return `insert into ${quoteTable(table)} (${cols}) select ${cols} from jsonb_to_recordset($1::text::jsonb) as x(${typed})`;
 }
-
-const INT_MAX = 2_147_483_647;
 
 /** One record as its row's JSON text. `errorMessage` and `stage` are never stored. */
 function rowJson(r: CallRecord): string {
@@ -49,7 +47,7 @@ function rowJson(r: CallRecord): string {
     turn_id: r.turnId,
     tool: r.tool,
     args: r.args ?? {},
-    duration_ms: Math.min(INT_MAX, Math.max(0, Math.round(r.durationMs))),
+    duration_ms: Math.min(INT4_MAX, Math.max(0, Math.round(r.durationMs))),
     ok: r.ok,
     error_class: r.errorClass,
     result_ids: r.resultIds ?? null,
@@ -108,9 +106,9 @@ export type PostgresCallLog = CallSink & {
  * (`usage.call_log_failed` {stage, rows, tools, errorClass}) and lost.
  */
 export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
-  if (!intIn(o.maxBuffered, 1, 1_000_000)) {
+  if (!intIn(o.maxBuffered, 1, MAX_BUFFERED)) {
     throw configError(
-      `postgresCallLog: maxBuffered must be an integer from 1 to 1000000 — got ${q(o.maxBuffered)}`,
+      `postgresCallLog: maxBuffered must be an integer from 1 to ${MAX_BUFFERED} — got ${q(o.maxBuffered)}`,
     );
   }
   if (!intIn(o.maxBatch, 1, o.maxBuffered)) {

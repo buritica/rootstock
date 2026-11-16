@@ -212,6 +212,16 @@ CREATE TABLE spend (
 `,
 };
 
+/** The group's shipped migrations, by filename; fails unless they sit in the manifest right after `previous`. */
+function shippedAfter(previous: string, group: Readonly<Record<string, string>>) {
+  const names = Object.keys(group);
+  const at = MANIFEST.indexOf(previous) + 1;
+  expect(at).toBeGreaterThan(0);
+  expect(MANIFEST.slice(at, at + names.length)).toEqual(names);
+  return rootstockMigrations().filter((m) => names.includes(m.filename));
+}
+const last = (group: Readonly<Record<string, string>>): string => Object.keys(group).at(-1) ?? "";
+
 describe("the Stage C files", () => {
   for (const [file, text] of Object.entries(STAGE_C)) {
     test(`${file} is byte-equal to the frozen text`, () => {
@@ -220,8 +230,7 @@ describe("the Stage C files", () => {
   }
 
   test("they follow the first file in the manifest, in order, as one statement each", () => {
-    expect(MANIFEST.slice(1, 4)).toEqual(Object.keys(STAGE_C));
-    for (const m of rootstockMigrations().slice(1, 4)) {
+    for (const m of shippedAfter(FILE, STAGE_C)) {
       expect(m.kind).toBe("additive");
       expect(m.statements).toHaveLength(1);
     }
@@ -236,8 +245,7 @@ describe("the Stage D files", () => {
   }
 
   test("they follow the Stage C files, in order, all additive", () => {
-    expect(MANIFEST.slice(4, 7)).toEqual(Object.keys(STAGE_D));
-    for (const m of rootstockMigrations().slice(4, 7)) {
+    for (const m of shippedAfter(last(STAGE_C), STAGE_D)) {
       expect(m.kind).toBe("additive");
       expect(m.statements).toHaveLength(1);
     }
@@ -252,8 +260,7 @@ describe("the W5 files", () => {
   }
 
   test("they follow the Stage D files, in order, both additive", () => {
-    expect(MANIFEST.slice(7)).toEqual(Object.keys(W5));
-    for (const m of rootstockMigrations().slice(7)) {
+    for (const m of shippedAfter(last(STAGE_D), W5)) {
       expect(m.kind).toBe("additive");
       expect(m.statements).toHaveLength(1);
     }
