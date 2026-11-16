@@ -316,11 +316,12 @@ describe("the W5 tables", () => {
       "spend.unit text NO -",
       "spend.used numeric NO 0",
     ]);
+    // Postgres 18 also lists NOT NULL here (contype 'n'); the column rows above pin nullability.
     const constraints = await sql.unsafe<{ def: string }>(
       `SELECT conname || ' ' || pg_get_constraintdef(oid) AS def FROM pg_constraint
        WHERE connamespace = to_regnamespace($1::text)
          AND conrelid IN (to_regclass(quote_ident($1) || '.mcp_calls'), to_regclass(quote_ident($1) || '.spend'))
-         AND contype <> 'n' -- Postgres 18 records NOT NULL here too; the column rows above pin nullability
+         AND contype <> 'n'
        ORDER BY conname`,
       [s],
     );
