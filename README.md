@@ -318,6 +318,19 @@ forward on 0.8.x only: an older line can never ship a migration there.
 - **Events inside a batch can describe a rollback.** `runs.quarantined`,
   `runs.resolved` and `queue.cursor_written` fire inside the batch
   transaction; when the batch rolls back, `runner.batch_rolled_back` follows.
+- **Keep slow calls out of `load`.** `load` runs inside the batch
+  transaction, one doc at a time, so a model call there holds the backend
+  idle in the transaction for as long as the batch's loads take. Do slow
+  work in `fetch` where you can, and size `batchSize` to what the loads
+  cost. Fetch errors never count toward the quota breaker: a source's
+  `fetch` handles its own API's limits.
+- **A killed run's row has no totals.** The buckets, counters and tokens
+  reach the row only when the run settles. A run killed after some batches
+  committed reads `interrupted` with no buckets and no cost, though its
+  rows, quarantine entries (tagged with its `runId`) and paid calls landed.
+- **Check `recorded` before trusting the row.** `runner.pull_finished`
+  carries `recorded: false` (and the report `finish.written: false`) when
+  the settle could not write the run row.
 - **`planPull` writes nothing.** It lists, fetches and classifies each ref
   as the run would, batch by batch, and stops before load. A source with
   `planLoad` gets the docs that would load inside a READ ONLY transaction,
@@ -334,6 +347,8 @@ forward on 0.8.x only: an older line can never ship a migration there.
   (`leftClaimed` counts them). A throw from `record.start` ends the source
   as a `queue` failure, its claimed rows likewise left claimed. A lock
   whose teardown throws emits `drain.release_failed` and pages.
+  Failing a held row charges it an attempt and its backoff, as a reclaim
+  would, so a stop near `maxAttempts` can dead-letter rows no handler saw.
 - **A killed drain's record is settled by the next drain that claims rows.**
   `record.start` runs only after a claim returned rows, so an empty drain
   leaves an earlier `running` row as it was.

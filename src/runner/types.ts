@@ -101,6 +101,7 @@ export interface PullDeps {
 export interface PlanDeps {
   /** Passed to the cursor read unchanged. */
   queueHooks?: QueueHooks;
+  /** Reserved: a plan emits no runner events today. */
   onEvent?: (e: RunnerEvent) => void;
 }
 
@@ -347,9 +348,16 @@ export type RunnerEvent =
       runId: string;
       batch: number;
       kind: "batch" | "lost-lock";
+      error: unknown;
     }
-  | { type: "runner.repoint_failed"; job: string; externalId: string; error: unknown }
-  | { type: "runner.resolve_failed"; job: string; count: number; error: unknown }
+  | {
+      type: "runner.repoint_failed";
+      job: string;
+      runId: string;
+      externalId: string;
+      error: unknown;
+    }
+  | { type: "runner.resolve_failed"; job: string; runId: string; count: number; error: unknown }
   | {
       type: "runner.settle_refused";
       job: string;
@@ -363,6 +371,8 @@ export type RunnerEvent =
       runId: string;
       status: "ok" | "failed";
       failure: PullFailure["kind"] | null;
+      /** Whether the settle wrote the run row (`finish.written`). */
+      recorded: boolean;
     }
   | { type: "drain.no_handler"; source: string }
   | {

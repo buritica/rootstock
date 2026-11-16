@@ -23,7 +23,7 @@ import {
   runRows,
 } from "./fixtures.pg-support.ts";
 import { planPull, runPull } from "./pull.ts";
-import type { PullArgs, PullFailure, PullReport, RunnerEvent } from "./types.ts";
+import type { PullArgs, PullFailure, PullReport } from "./types.ts";
 
 // R-D10 (contract §9): the pull runner against a real server, once per
 // transactor kind, each case in a schema of its own with rootstock's
@@ -720,13 +720,15 @@ describe("the guard and the run record", () => {
     expect(report.written).toBe(0);
     expect(await docs(sql, env)).toEqual([]);
     expect(await cursorOf(sql, env)).toBeUndefined();
-    expect(env.events).toContainEqual({
+    const rolled = env.events.find((e) => e.type === "runner.batch_rolled_back");
+    expect(rolled).toMatchObject({
       type: "runner.batch_rolled_back",
       job: "alpha-sync",
       runId: report.runId,
       batch: 1,
       kind: "lost-lock",
-    } satisfies RunnerEvent);
+    });
+    expect((rolled as { error?: unknown }).error).toBeDefined();
   });
 });
 

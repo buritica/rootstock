@@ -377,6 +377,7 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
       runId: run.id,
       status,
       failure: f?.kind ?? null,
+      recorded: finish.written,
     });
     return {
       job: source.job,
@@ -588,7 +589,13 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
             try {
               claimed = await t.savepoint((_sp, n) => tryRepoint.call(source, n, doc, ctx));
             } catch (error) {
-              emit({ type: "runner.repoint_failed", job: source.job, externalId: id, error });
+              emit({
+                type: "runner.repoint_failed",
+                job: source.job,
+                runId: run.id,
+                externalId: id,
+                error,
+              });
             }
             if (claimed === true) {
               b.repointed += 1;
@@ -654,6 +661,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
             emit({
               type: "runner.resolve_failed",
               job: source.job,
+              runId: run.id,
               count: candidates.length,
               error,
             });
@@ -670,14 +678,16 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
     } catch (error) {
       // P7.6: the batch rolled back; the totals are those before it.
       const kind = lost === undefined ? "batch" : "lost-lock";
+      const cause = lost === undefined ? error : lost.error;
       emit({
         type: "runner.batch_rolled_back",
         job: source.job,
         runId: run.id,
         batch: batchNo,
         kind,
+        error: cause,
       });
-      return settle({ kind, error: lost === undefined ? error : lost.error });
+      return settle({ kind, error: cause });
     }
     for (const id of batchProcessed) processed.add(id);
     counts.fetched += b.fetched;

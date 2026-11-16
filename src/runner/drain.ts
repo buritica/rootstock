@@ -181,8 +181,12 @@ async function drainSource<T, L extends DrainLock>(
       if (failure.kind === "fatal") emit({ type: "drain.aborted", source, error: failure.error });
       return true;
     } catch (err) {
+      // A throw from the settle itself is a settle failure, not a queue one.
+      if (recorded) {
+        emit({ type: "drain.settle_failed", source, error: err });
+        return true;
+      }
       emit({ type: "drain.failed", source, error: err });
-      if (recorded) return true;
       try {
         await i.record.settle(record, { drain, failure: { kind: "queue", error: err } });
       } catch (error) {
