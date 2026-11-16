@@ -96,11 +96,7 @@ export interface StoppableServer {
   pending(): number;
 }
 
-/**
- * How `mcpPath` answers a method other than POST.
- * "405-first": the 405 before anything else. "auth-then-405": authenticate, then the 405.
- * "auth-then-entry": authenticate, then the SDK entry with no body; its answer passes through untouched.
- */
+/** How `mcpPath` answers a method other than POST. "auth-then-entry" hands the bodiless request to the SDK entry and returns its answer untouched. */
 export type MethodAnswer = "405-first" | "auth-then-405" | "auth-then-entry";
 
 /** Every field is required: a profile states each consumer's behaviour, never a default. */
