@@ -151,14 +151,13 @@ const DATE_READS = [
   `${NOT_MEMBER}(?<!\\bnew\\s+|\\binstanceof\\s+|${TYPE_POSITION})\\bDate\\b${NO_MEMBER_OR_CALL}`,
   `(?<=${TYPE_POSITION})\\bDate\\b(?!${TYPE_END}|\\s*\\??\\.|\\s*\\[)`,
 ];
+const ABORT_SIGNAL_READS = [
+  `${NOT_MEMBER}\\bAbortSignal${MEMBER}`,
+  `${NOT_MEMBER}(?<!${TYPE_POSITION})\\bAbortSignal\\b(?!\\s*(?:\\??\\.|\\[))`,
+  `(?<=${TYPE_POSITION})\\bAbortSignal\\b(?!${TYPE_END}|${MEMBER})`,
+];
 const FORBIDDEN_GLOBALS = new RegExp(
-  [
-    ...nameReads(GLOBAL_NAMES),
-    `${NOT_MEMBER}\\bAbortSignal${MEMBER}`,
-    `${NOT_MEMBER}(?<!${TYPE_POSITION})\\bAbortSignal\\b(?!\\s*(?:\\??\\.|\\[))`,
-    `(?<=${TYPE_POSITION})\\bAbortSignal\\b(?!${TYPE_END}|${MEMBER})`,
-    ...DATE_READS,
-  ].join("|"),
+  [...nameReads(GLOBAL_NAMES), ...ABORT_SIGNAL_READS, ...DATE_READS].join("|"),
 );
 
 test("the purity scan tells a read from a key", () => {
@@ -250,8 +249,9 @@ function literalEnd(source: string, start: number): number {
 
 // The code a scan reads: `//` and `/* */` comments outside literals are
 // dropped (a block comment keeps its newlines, so line numbers stay true) and
-// a quoted string's text is blanked, since `"Date"` names nothing.
-function stripComments(source: string): string {
+// a quoted string's text is blanked, since `"Date"` names nothing, unless
+// `keepStrings` asks for comments alone to go (to read import specifiers).
+function stripComments(source: string, keepStrings = false): string {
   let out = "";
   let prev = "";
   let i = 0;
@@ -269,7 +269,8 @@ function stripComments(source: string): string {
       const end = literalEnd(source, i);
       const text = source.slice(i, end);
       // A quoted string's text is no code; a template's `${…}` is, so it stays.
-      out += c === '"' || c === "'" ? `${c}${" ".repeat(Math.max(0, text.length - 2))}${c}` : text;
+      const blank = !keepStrings && (c === '"' || c === "'");
+      out += blank ? `${c}${" ".repeat(Math.max(0, text.length - 2))}${c}` : text;
       prev = c;
       i = end;
     } else {
@@ -457,23 +458,28 @@ const W5_RULES: readonly ImportRule[] = [
     packages: [],
   },
 ];
-// Time, timers, ids and output are injected (contract: no `console`,
-// `Bun.*`, `Date`, `performance`, `setTimeout`, `crypto`). `process.env` is
-// the repo-wide "no non-test file reads the environment" test's job.
-const W5_GLOBALS = new RegExp(
-  [
-    ...nameReads(
-      "setTimeout|setInterval|setImmediate|performance|crypto|console|Bun|Math\\.random",
-    ),
-    ...DATE_READS,
-  ].join("|"),
+// Time, timers, ids, I/O and output are injected (contract: no `console`,
+// `Bun.*`, `Date`, `performance`, `setTimeout`, `crypto`): the same names the
+// pure subpaths forbid. serve/auth alone may read `fetch`, which Better Auth's
+// cimd plugin takes as a parameter.
+const w5Globals = (names: string): RegExp =>
+  new RegExp([...nameReads(names), ...ABORT_SIGNAL_READS, ...DATE_READS].join("|"));
+const W5_GLOBALS = w5Globals(GLOBAL_NAMES);
+const W5_AUTH_GLOBALS = w5Globals(
+  GLOBAL_NAMES.split("|")
+    .filter((n) => n !== "fetch")
+    .join("|"),
 );
+// A dynamic `import(` whose argument is not one plain string literal names a
+// module no scan can check, so it fails closed. Run on stripped code, where a
+// string's quotes stay and its text is blank.
+const NON_LITERAL_IMPORT = /(?<![.\w$])\bimport\s*\((?!\s*(["'])[^"'\n]*\1\s*\))/g;
 
 function w5Offenders(path: string, source: string): string[] {
   const rule = W5_RULES.find((r) => allowed(path, [r.prefix]));
   if (rule === undefined || TEST_FILE.test(path)) return [];
   const offenders: string[] = [];
-  for (const spec of specifiers(source)) {
+  for (const spec of specifiers(stripComments(source, true))) {
     if (spec.startsWith(".")) {
       const target = join(dirname(path), spec);
       const inOwn =
@@ -487,12 +493,16 @@ function w5Offenders(path: string, source: string): string[] {
       offenders.push(`${path} imports ${spec}`);
     }
   }
-  stripComments(source)
-    .split("\n")
-    .forEach((line, i) => {
-      const m = line.match(W5_GLOBALS);
-      if (m) offenders.push(`${path}:${i + 1} uses ${m[0]}`);
-    });
+  const code = stripComments(source);
+  const globals = rule.prefix === "src/serve/auth/" ? W5_AUTH_GLOBALS : W5_GLOBALS;
+  code.split("\n").forEach((line, i) => {
+    const m = line.match(globals);
+    if (m) offenders.push(`${path}:${i + 1} uses ${m[0]}`);
+  });
+  for (const m of code.matchAll(NON_LITERAL_IMPORT)) {
+    const line = code.slice(0, m.index).split("\n").length;
+    offenders.push(`${path}:${line} imports a non-literal specifier`);
+  }
   return offenders;
 }
 
@@ -569,6 +579,28 @@ describe("serve, serve/auth and usage", () => {
       ["src/usage/index.ts", "console.log(x);"],
       ["src/usage/index.ts", "await Bun.sleep(1);"],
       ["src/serve/types.ts", "const r = Math.random();"],
+      // Every global the pure subpaths forbid, however it is reached.
+      ["src/serve/index.ts", "globalThis.setTimeout(f, 5);"],
+      ["src/serve/index.ts", 'const t = globalThis["Date"].now();'],
+      ["src/serve/index.ts", "const g = globalThis;"],
+      ["src/serve/index.ts", "const s = AbortSignal.timeout(5);"],
+      ["src/serve/index.ts", "const s = AbortSignal.any([a, b]);"],
+      ["src/serve/index.ts", "queueMicrotask(f);"],
+      ["src/serve/index.ts", "const t = process.hrtime();"],
+      ["src/usage/index.ts", "const { env } = process;"],
+      ["src/serve/index.ts", "const r = await fetch(u);"],
+      ["src/usage/index.ts", "const f = fetch;"],
+      ["src/serve/auth/index.ts", "const s = AbortSignal.timeout(5);"],
+      ["src/serve/auth/index.ts", "const g = globalThis.fetch;"],
+      // Every way to load a module the specifier scan cannot read.
+      ["src/serve/index.ts", 'const fs = require("node:fs");'],
+      ["src/serve/index.ts", 'import fs = require("node:fs");'],
+      ["src/serve/auth/index.ts", 'const m = require("./pages.ts");'],
+      ["src/usage/index.ts", "const m = await import(`node:fs`);"],
+      ["src/usage/index.ts", "const m = await import(name);"],
+      ["src/usage/index.ts", 'const m = await import("./sinks" + ".ts");'],
+      ["src/usage/index.ts", 'const m = await import(/* c */ "node:fs");'],
+      ["src/usage/index.ts", 'const m = await import(\n  "node:fs"\n);'],
     ];
     const missed = planted.filter(([path, src]) => w5Offenders(path, src).length !== 1);
     expect(missed).toEqual([]);
@@ -581,8 +613,12 @@ describe("serve, serve/auth and usage", () => {
       'log("serve.request", { ms });',
       "const at = new Date(ms).toISOString();",
       "type T = { at: Date; timers: Timers };",
+      "const r = await deps.fetch(u);",
+      'import x from "./sinks.ts"; // import "node:fs"',
+      '/* import("node:fs") */ const s = "import(name)";',
     ];
     expect(clean.flatMap((src) => w5Offenders("src/serve/index.ts", src))).toEqual([]);
+    expect(w5Offenders("src/serve/auth/index.ts", "const r = await fetch(u);")).toEqual([]);
     expect(w5Offenders("src/serve/index.test.ts", 'import "better-auth"; Date.now();')).toEqual([]);
   });
 });

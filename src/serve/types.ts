@@ -161,22 +161,28 @@ export interface ServeProfile {
 
 const ID = /^[a-z0-9][a-z0-9.-]*$/;
 
-// types.ts imports nothing (contract §1.3), so this and isPlainRecord below
-// stay local copies of internal/slice.ts's failAs-style error and isRecord.
-function configError(detail: string, value: unknown): Error {
+// Deliberately local: types.ts imports nothing (contract §1.3). The value
+// printing matches internal/slice.ts's q(); isPlainRecord is stricter than its
+// isRecord (plain objects only, so a Map or class instance is refused).
+function configError(fn: string, detail: string, value: unknown): Error {
   let got: string;
-  try {
-    got = JSON.stringify(value) ?? String(value);
-  } catch {
-    got = "an unserializable value";
+  if (typeof value === "number" && !Number.isFinite(value)) got = String(value);
+  else {
+    try {
+      got = JSON.stringify(value);
+    } catch {
+      got = typeof value === "bigint" ? `${value}n` : "an unserializable value";
+    }
   }
-  return Object.assign(new Error(`rootstock serve: defineToolScopes(): ${detail} — got ${got}`), {
+  return Object.assign(new Error(`rootstock serve: ${fn}(): ${detail} — got ${got}`), {
     code: "ERR_ROOTSTOCK_SERVE_CONFIG",
   });
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 const isScope = (s: unknown): s is string => typeof s === "string" && s.length > 0;
@@ -185,34 +191,38 @@ const isScope = (s: unknown): s is string => typeof s === "string" && s.length >
  * A frozen copy of `t`. Refuses (ERR_ROOTSTOCK_SERVE_CONFIG) an id outside
  * `/^[a-z0-9][a-z0-9.-]*$/`, a tool without a scope, an `implies` entry that
  * does not list its own scope, and an implied scope that is not itself a key
- * of `implies`.
+ * of `implies`. Every key, `__proto__` included, is kept as an own data
+ * property (Object.fromEntries), and the checks run against the copy returned.
  */
 export function defineToolScopes(t: ToolScopes): ToolScopes {
-  if (!isPlainRecord(t)) throw configError("the registry must be an object", t);
-  if (typeof t.id !== "string" || !ID.test(t.id)) {
-    throw configError(`id must match ${ID}`, t.id);
-  }
-  if (!isPlainRecord(t.tools)) throw configError("tools must be an object", t.tools);
-  if (!isPlainRecord(t.implies)) throw configError("implies must be an object", t.implies);
-  const tools: Record<string, string> = {};
-  for (const [tool, scope] of Object.entries(t.tools)) {
-    if (!isScope(scope)) throw configError(`tools.${tool} must be a non-empty string`, scope);
-    tools[tool] = scope;
-  }
-  const implies: Record<string, readonly string[]> = {};
-  for (const [scope, granted] of Object.entries(t.implies)) {
-    if (!Array.isArray(granted) || !granted.every(isScope)) {
-      throw configError(`implies.${scope} must be an array of non-empty strings`, granted);
-    }
+  const fail = (detail: string, value: unknown) => configError("defineToolScopes", detail, value);
+  if (!isPlainRecord(t)) throw fail("the registry must be an object", t);
+  if (typeof t.id !== "string" || !ID.test(t.id)) throw fail(`id must match ${ID}`, t.id);
+  if (!isPlainRecord(t.tools)) throw fail("tools must be an object", t.tools);
+  if (!isPlainRecord(t.implies)) throw fail("implies must be an object", t.implies);
+  const tools: Record<string, string> = Object.fromEntries(
+    Object.entries(t.tools).map(([tool, scope]) => {
+      if (!isScope(scope)) throw fail(`tools.${tool} must be a non-empty string`, scope);
+      return [tool, scope];
+    }),
+  );
+  const implies: Record<string, readonly string[]> = Object.fromEntries(
+    Object.entries(t.implies).map(([scope, granted]) => {
+      if (!Array.isArray(granted) || !granted.every(isScope)) {
+        throw fail(`implies.${scope} must be an array of non-empty strings`, granted);
+      }
+      return [scope, Object.freeze([...granted])];
+    }),
+  );
+  for (const [scope, granted] of Object.entries(implies)) {
     if (!granted.includes(scope)) {
-      throw configError(`implies.${scope} must include ${scope} itself`, granted);
+      throw fail(`implies.${scope} must include ${scope} itself`, granted);
     }
     for (const g of granted) {
-      if (!Object.hasOwn(t.implies, g)) {
-        throw configError(`implies.${scope} grants ${g}, which implies does not declare`, g);
+      if (!Object.hasOwn(implies, g)) {
+        throw fail(`implies.${scope} grants ${g}, which implies does not declare`, g);
       }
     }
-    implies[scope] = Object.freeze([...granted]);
   }
   return Object.freeze({
     id: t.id,
@@ -226,6 +236,9 @@ export function defineToolScopes(t: ToolScopes): ToolScopes {
  * A scope `implies` does not declare is kept as given and grants nothing more.
  */
 export function expandScopes(reg: ToolScopes, scopes: Iterable<string>): ReadonlySet<string> {
+  if (typeof scopes === "string") {
+    throw configError("expandScopes", "scopes must be an iterable, not one string", scopes);
+  }
   const out = new Set<string>();
   const pending = [...scopes];
   for (let s = pending.pop(); s !== undefined; s = pending.pop()) {

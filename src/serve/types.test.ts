@@ -97,6 +97,52 @@ describe("defineToolScopes", () => {
     });
   }
 
+  test("refuses a Map or class instance as tools", () => {
+    const err = refusal(() =>
+      defineToolScopes({ id: "x", tools: new Map() as never, implies: {} }),
+    );
+    expect(err.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
+    expect(err.message).toBe(
+      "rootstock serve: defineToolScopes(): tools must be an object — got {}",
+    );
+  });
+
+  test("keeps JSON-parsed __proto__ keys as own data properties", () => {
+    const reg = defineToolScopes(
+      JSON.parse(
+        '{"id":"x","tools":{"__proto__":"admin","echo":"mcp:tools"},' +
+          '"implies":{"__proto__":["__proto__","mcp:tools"],"mcp:tools":["mcp:tools"]}}',
+      ),
+    );
+    expect(Object.getPrototypeOf(reg.tools)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(reg.implies)).toBe(Object.prototype);
+    expect(Object.keys(reg.tools).sort()).toEqual(["__proto__", "echo"]);
+    expect(Object.keys(reg.implies).sort()).toEqual(["__proto__", "mcp:tools"]);
+    expect(Object.getOwnPropertyDescriptor(reg.tools, "__proto__")?.value).toBe("admin");
+    expect(Object.isFrozen(Object.getOwnPropertyDescriptor(reg.implies, "__proto__")?.value)).toBe(
+      true,
+    );
+    const admin: Caller = { name: "a", kind: "oauth", scopes: expandScopes(reg, ["__proto__"]) };
+    expect([...admin.scopes].sort()).toEqual(["__proto__", "mcp:tools"]);
+    expect(canCallTool(reg, admin, "__proto__")).toBe(false);
+    expect(canCallTool(reg, admin, "echo")).toBe(true);
+    const tool: Caller = { name: "a", kind: "oauth", scopes: expandScopes(reg, ["mcp:tools"]) };
+    expect([...tool.scopes]).toEqual(["mcp:tools"]);
+    expect(canCallTool(reg, tool, "__proto__")).toBe(false);
+  });
+
+  test("every scope the returned registry grants is declared by it", () => {
+    const reg = defineToolScopes(
+      JSON.parse(
+        '{"id":"x","tools":{},"implies":{"a":["a","__proto__"],"__proto__":["__proto__"]}}',
+      ),
+    );
+    for (const granted of Object.values(reg.implies)) {
+      for (const g of granted) expect(Object.hasOwn(reg.implies, g)).toBe(true);
+    }
+    expect([...expandScopes(reg, ["a"])].sort()).toEqual(["__proto__", "a"]);
+  });
+
   test("an inherited implied scope is not declared", () => {
     const err = refusal(() =>
       defineToolScopes({ id: "x", tools: {}, implies: { openid: ["openid", "toString"] } }),
@@ -116,6 +162,14 @@ describe("expandScopes", () => {
 
   test("keeps an undeclared scope and grants nothing for it", () => {
     expect([...expandScopes(REG, ["openid", "toString"])].sort()).toEqual(["openid", "toString"]);
+  });
+
+  test("refuses a bare string instead of splitting it into characters", () => {
+    const err = refusal(() => expandScopes(REG, "a b"));
+    expect(err.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
+    expect(err.message).toBe(
+      'rootstock serve: expandScopes(): scopes must be an iterable, not one string — got "a b"',
+    );
   });
 
   test("an empty input expands to nothing", () => {
