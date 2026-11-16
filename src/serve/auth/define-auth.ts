@@ -8,7 +8,7 @@ import { fetchClientMetadataResource } from "@better-auth/cimd/node";
 import { mcp, requireMcpAuth } from "@better-auth/mcp";
 import { type BetterAuthOptions, betterAuth } from "better-auth";
 import { jwt, magicLink } from "better-auth/plugins";
-import type { LogEvent } from "../types.ts";
+import type { Clock, LogEvent } from "../types.ts";
 import {
   authConfigError,
   checkAuthSecret,
@@ -21,16 +21,18 @@ import { isAllowedRedirectUri } from "./redirects.ts";
 import type { AuthLayer, AuthOptions, BetterAuthInstance } from "./types.ts";
 
 const HTML = "text/html; charset=utf-8";
+/** The Client ID Metadata Document profile MCP 2026-07-28 pins (draft-00). */
+const CIMD_PROFILE = "mcp-2026-07-28";
 // The 429 line is written at most once per client and path per window, with
 // the count it held back; the key set is cleared when it overflows, because
 // the path is the caller's choice.
 const RATE_LIMIT_LOG_WINDOW_MS = 60_000;
 const RATE_LIMIT_LOG_MAX_KEYS = 1_000;
 
-function createRateLimitLog(o: Pick<AuthOptions, "clock">, emit: LogEvent) {
+function createRateLimitLog(clock: Clock, emit: LogEvent) {
   const seen = new Map<string, { at: number; suppressed: number }>();
   return (path: string, client: string | null, retryAfter: string | null): void => {
-    const t = o.clock.now();
+    const t = clock.now();
     const key = `${client ?? ""}|${path}`;
     const last = seen.get(key);
     if (last !== undefined && t - last.at >= 0 && t - last.at < RATE_LIMIT_LOG_WINDOW_MS) {
@@ -45,11 +47,9 @@ function createRateLimitLog(o: Pick<AuthOptions, "clock">, emit: LogEvent) {
 
 /** Builds the auth layer. Refuses (ERR_ROOTSTOCK_AUTH_CONFIG) any option outside the contract. */
 export function defineAuth(o: AuthOptions): AuthLayer {
-  if (o === null || typeof o !== "object")
-    throw authConfigError("defineAuth", "options are required");
+  const checked = checkOptions(o);
   const base = resolveBase(o.baseURL, o.baseUrlRule);
   const secret = checkAuthSecret(o.secret);
-  const checked = checkOptions(o);
   const emit: LogEvent = (event, fields) => {
     try {
       o.log(event, fields);
@@ -59,7 +59,7 @@ export function defineAuth(o: AuthOptions): AuthLayer {
   };
 
   const { dcr } = o.registration;
-  const redirectHosts = checked.redirectHosts;
+  const { redirectHosts } = checked;
   const plugins: NonNullable<BetterAuthOptions["plugins"]> = [
     jwt(),
     mcp({
@@ -79,11 +79,10 @@ export function defineAuth(o: AuthOptions): AuthLayer {
         : {}),
     }),
     // The package's DNS-pinning, SSRF-safe fetch, never a plain fetch wrapper.
-    cimd({ fetchClientMetadataResource, metadataProfile: "mcp-2026-07-28" }),
+    cimd({ fetchClientMetadataResource, metadataProfile: CIMD_PROFILE }),
   ];
-  const signIn = o.signIn;
-  if (signIn.kind === "magicLink") {
-    const send = createMagicLinkSender(signIn, checked.owners, { clock: o.clock, log: emit });
+  if (o.signIn.kind === "magicLink") {
+    const send = createMagicLinkSender(o.signIn, checked.owners, { clock: o.clock, log: emit });
     plugins.push(magicLink({ disableSignUp: true, sendMagicLink: send }));
   }
 
@@ -94,19 +93,21 @@ export function defineAuth(o: AuthOptions): AuthLayer {
     rateLimit: {
       // Never NODE_ENV-dependent: Better Auth leaves it off outside production otherwise.
       enabled: true,
+      // One map per process (shared by every instance in it): counts are per
+      // process and reset on restart, which suits one container.
       storage: "memory",
       window: o.rateLimit.window,
       max: o.rateLimit.max,
       customRules: { ...checked.customRules },
     },
     advanced: { ipAddress: { ipAddressHeaders: [...checked.ipAddressHeaders] } },
-    ...(signIn.kind === "social"
+    ...(o.signIn.kind === "social"
       ? {
           socialProviders: {
-            [signIn.provider]: {
-              clientId: signIn.clientId,
-              clientSecret: signIn.clientSecret,
-              hd: signIn.hd,
+            [o.signIn.provider]: {
+              clientId: o.signIn.clientId,
+              clientSecret: o.signIn.clientSecret,
+              hd: o.signIn.hd,
             },
           },
         }
@@ -115,16 +116,31 @@ export function defineAuth(o: AuthOptions): AuthLayer {
   };
   const instance = betterAuth(options) as unknown as BetterAuthInstance;
 
-  const logRateLimited = createRateLimitLog(o, emit);
+  const logRateLimited = createRateLimitLog(o.clock, emit);
   const clientOf = (headers: Headers): string | null => {
     for (const name of checked.ipAddressHeaders) {
       const value = headers.get(name);
-      if (value !== null) return value.slice(0, 64);
+      if (value !== null) return value;
     }
     return null;
   };
   const authHeaderEntries = Object.entries(checked.authHeaders);
   const pageHeaderEntries = Object.entries(checked.pageHeaders);
+  // One header rule for both entries: a header Better Auth sets itself wins.
+  // Through node, setHeader runs before toNodeHandler writes, so Better Auth's
+  // own setHeader replaces ours; on fetch, ours fill only what is absent.
+  const addAuthHeaders = (has: (name: string) => boolean, set: (n: string, v: string) => void) => {
+    for (const [name, value] of authHeaderEntries) if (!has(name)) set(name, value);
+  };
+  const logIf429 = (
+    status: number,
+    path: string,
+    client: string | null,
+    retryAfter: string | null,
+  ) => {
+    if (status === 429)
+      logRateLimited(path.slice(0, 100), client?.slice(0, 64) ?? null, retryAfter);
+  };
 
   return Object.freeze({
     resource: base.resource,
@@ -134,42 +150,38 @@ export function defineAuth(o: AuthOptions): AuthLayer {
     async handle(req: Request): Promise<Response> {
       let res = await instance.handler(req);
       if (authHeaderEntries.length > 0) {
-        // A header Better Auth set wins, as it does through node's setHeader.
         const headers = new Headers(res.headers);
-        for (const [name, value] of authHeaderEntries) {
-          if (!headers.has(name)) headers.set(name, value);
-        }
+        addAuthHeaders(
+          (n) => headers.has(n),
+          (n, v) => headers.set(n, v),
+        );
         res = new Response(res.body, { status: res.status, statusText: res.statusText, headers });
       }
-      if (res.status === 429) {
-        logRateLimited(
-          new URL(req.url).pathname.slice(0, 100),
-          clientOf(req.headers),
-          res.headers.get("x-retry-after"),
-        );
-      }
+      logIf429(
+        res.status,
+        new URL(req.url).pathname,
+        clientOf(req.headers),
+        res.headers.get("x-retry-after"),
+      );
       return res;
     },
 
     page(path: "/login" | "/consent", url: URL): Response {
-      let html: string;
-      if (path === "/login") html = o.pages.login();
-      else if (path === "/consent") html = o.pages.consent(url.search.slice(1));
-      else throw authConfigError("page", `path must be "/login" or "/consent" — got ${path}`);
+      const html = path === "/login" ? o.pages.login() : o.pages.consent(url.search.slice(1));
       const headers = new Headers(pageHeaderEntries);
       headers.set("content-type", HTML);
       return new Response(html, { status: 200, headers });
     },
 
     asset(path: string): Response | null {
-      if (!Object.hasOwn(o.assets, path)) return null;
-      const asset = o.assets[path];
-      if (asset === undefined) return null;
-      return new Response(asset.body(), { status: 200, headers: { ...asset.headers } });
+      const asset = Object.hasOwn(o.assets, path) ? o.assets[path] : undefined;
+      return asset === undefined
+        ? null
+        : new Response(asset.body(), { status: 200, headers: asset.headers });
     },
 
     verify(req, next) {
-      return requireMcpAuth(instance, (request, claims) => next(request, claims), {
+      return requireMcpAuth(instance, next, {
         resource: base.resource,
         requiredScopes: [MCP_TOOLS_SCOPE],
       })(req);
@@ -193,10 +205,12 @@ export function defineAuth(o: AuthOptions): AuthLayer {
     },
 
     wrapNodeAuthResponse(res, path, client) {
-      for (const [name, value] of authHeaderEntries) res.setHeader(name, value);
-      res.on("finish", () => {
-        if (res.statusCode === 429) logRateLimited(path.slice(0, 100), client.slice(0, 64), null);
-      });
+      // Nothing is set yet: Better Auth's setHeader comes after and replaces any of these.
+      addAuthHeaders(
+        () => false,
+        (n, v) => res.setHeader(n, v),
+      );
+      res.on("finish", () => logIf429(res.statusCode, path, client, null));
     },
   } satisfies AuthLayer);
 }

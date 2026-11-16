@@ -6,8 +6,10 @@ import { ANTI_FRAMING, harness, IP_HEADER } from "./auth.test-support.ts";
 
 // A node server that serves Better Auth itself, as the contract's §6.4 has it:
 // the helper first, then Better Auth's own `toNodeHandler`.
+// authHeaders also names content-type, which Better Auth sets itself and must keep.
 const h = harness("owner", (o) => ({
   ...o,
+  authHeaders: { ...ANTI_FRAMING, "content-type": "text/plain" },
   rateLimit: {
     ...o.rateLimit,
     rules: { ...o.rateLimit.rules, "/sign-out": { window: 600, max: 1 } },
@@ -57,6 +59,7 @@ test("wrapNodeAuthResponse keeps several Set-Cookie headers through toNodeHandle
   expect(cookies.length).toBeGreaterThanOrEqual(3);
   expect(cookies.every((c) => c.includes("Max-Age=0"))).toBe(true);
   for (const [name, value] of Object.entries(ANTI_FRAMING)) expect(res.headers[name]).toBe(value);
+  expect(res.headers["content-type"]).toBe("application/json");
 });
 
 test("a 429 written by Better Auth is logged once, with the path and client given", async () => {

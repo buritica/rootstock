@@ -249,6 +249,16 @@ describe("headers per profile on pages and auth responses", () => {
     expect(res.headers.get("x-frame-options")).toBe("DENY");
   });
 
+  test("a header Better Auth sets itself wins over authHeaders", async () => {
+    const { layer } = harness("owner", (o) => ({
+      ...o,
+      authHeaders: { ...ANTI_FRAMING, "content-type": "text/plain" },
+    }));
+    const res = await layer.handle(authRequest("/jwks"));
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+  });
+
   test("assets answer by exact path, unchanged; anything else is null", async () => {
     const { layer } = harness("invited");
     const res = layer.asset("/assets/face.woff2");

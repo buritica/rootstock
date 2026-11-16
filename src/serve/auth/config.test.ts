@@ -154,6 +154,83 @@ describe("defineAuth refuses at build", () => {
     expect(build(shape, change).code).toBe(CODE);
   });
 
+  test.each<[string, Shape, (o: AuthOptions) => Record<string, unknown>, string]>([
+    [
+      "a mistyped top-level key",
+      "owner",
+      (o) => ({ ...o, ipAddressHeader: ["x-real-ip"] }),
+      "options.ipAddressHeader",
+    ],
+    [
+      "a key outside the sign-in kind",
+      "social",
+      (o) => ({ ...o, signIn: { ...o.signIn, sendLimit: {} } }),
+      "signIn.sendLimit",
+    ],
+    [
+      "a key in signIn.allow",
+      "invited",
+      (o) => ({ ...o, signIn: { ...o.signIn, allow: { kind: "invited", emails: [] } } }),
+      "signIn.allow.emails",
+    ],
+    [
+      "a key in signIn.sendLimit",
+      "owner",
+      (o) => ({
+        ...o,
+        signIn: {
+          ...o.signIn,
+          sendLimit: { max: 1, windowMs: 1, releaseOnFailure: true, burst: 2 },
+        },
+      }),
+      "signIn.sendLimit.burst",
+    ],
+    [
+      "a key in registration",
+      "owner",
+      (o) => ({ ...o, registration: { dcr: false, open: true } }),
+      "registration.open",
+    ],
+    [
+      "hosts on an any redirect",
+      "social",
+      (o) => ({ ...o, redirects: { kind: "any", hosts: ["client.example.test"] } }),
+      "redirects.hosts",
+    ],
+    [
+      "a key in rateLimit",
+      "owner",
+      (o) => ({ ...o, rateLimit: { ...o.rateLimit, customRules: {} } }),
+      "rateLimit.customRules",
+    ],
+    [
+      "a key in a rule",
+      "owner",
+      (o) => ({
+        ...o,
+        rateLimit: { ...o.rateLimit, rules: { "/x": { window: 1, max: 1, burst: 1 } } },
+      }),
+      "burst",
+    ],
+    [
+      "a key in pages",
+      "owner",
+      (o) => ({ ...o, pages: { ...o.pages, logout: () => "" } }),
+      "pages.logout",
+    ],
+    [
+      "a key in an asset",
+      "invited",
+      (o) => ({ ...o, assets: { "/a.css": { body: () => new Blob([]), headers: {}, etag: "x" } } }),
+      "etag",
+    ],
+  ])("unknown key: %s", (_name, shape, change, named) => {
+    const err = build(shape, change);
+    expect(err.code).toBe(CODE);
+    expect(err.message).toContain(named);
+    expect(err.message).toContain("is not a known key");
+  });
+
   test("a social client secret is never echoed", () => {
     const err = build("social", (o) => ({ ...o, signIn: { ...o.signIn, clientId: "" } }));
     expect(err.message).not.toContain("client-secret-value");

@@ -12,6 +12,8 @@ export interface MagicLinkContext {
   context: { internalAdapter: { findUserByEmail(email: string): Promise<unknown> } };
 }
 
+const SWEEP_AT = 1_000;
+
 function errorClassOf(err: unknown): string {
   if (!(err instanceof Error)) return "non-Error throw";
   return err.constructor?.name || err.name || "Error";
@@ -31,33 +33,44 @@ export function createMagicLinkSender(
   owners: ReadonlySet<string> | null,
   deps: { clock: Clock; log: LogEvent },
 ): (data: { email: string; url: string }, ctx?: MagicLinkContext | null) => Promise<void> {
+  // deps.log must not throw: defineAuth hands in one that swallows its own throws.
   const { max, windowMs, releaseOnFailure } = signIn.sendLimit;
+  // Send times per address, oldest first. Only known addresses enter, so the
+  // map is bounded by the account count; a sweep still runs past SWEEP_AT.
   const sends = new Map<string, number[]>();
-  // defineAuth hands in a log that swallows its own throws.
-  const emit = deps.log;
 
-  // Drops expired send times, so the map holds only addresses sent to within one window.
-  const prune = (t: number) => {
-    for (const [key, times] of sends) {
-      const live = times.filter((at) => t - at < windowMs);
-      if (live.length === 0) sends.delete(key);
-      else if (live.length !== times.length) sends.set(key, live);
-    }
+  // The address's live send times, expired ones dropped from the front.
+  const live = (key: string, t: number): number[] => {
+    const times = sends.get(key) ?? [];
+    let expired = 0;
+    while (expired < times.length && t - (times[expired] ?? t) >= windowMs) expired++;
+    if (expired > 0) times.splice(0, expired);
+    return times;
+  };
+  const sweep = (t: number) => {
+    for (const key of [...sends.keys()]) if (live(key, t).length === 0) sends.delete(key);
+  };
+  const release = (key: string, t: number) => {
+    const times = sends.get(key);
+    const at = times?.indexOf(t) ?? -1;
+    if (times === undefined || at < 0) return;
+    times.splice(at, 1);
+    if (times.length === 0) sends.delete(key);
   };
 
   return async ({ email, url }, ctx) => {
     const key = email.trim().toLowerCase();
     if (owners !== null && !owners.has(key)) {
-      emit("auth.magic_link_refused", { reason: owners.size === 0 ? "no-owner" : "not-owner" });
+      deps.log("auth.magic_link_refused", { reason: owners.size === 0 ? "no-owner" : "not-owner" });
       return;
     }
     const found = await ctx?.context.internalAdapter.findUserByEmail(email);
     if (!found) return;
     const t = deps.clock.now();
-    prune(t);
-    const times = sends.get(key) ?? [];
+    if (sends.size > SWEEP_AT) sweep(t);
+    const times = live(key, t);
     if (times.length >= max) {
-      emit("auth.magic_link_suppressed", { userId: userIdOf(found) });
+      deps.log("auth.magic_link_suppressed", { userId: userIdOf(found) });
       return;
     }
     times.push(t);
@@ -66,15 +79,8 @@ export function createMagicLinkSender(
     Promise.resolve()
       .then(() => signIn.send(email, url))
       .catch((err: unknown) => {
-        if (releaseOnFailure) {
-          const current = sends.get(key);
-          const at = current?.indexOf(t) ?? -1;
-          if (current !== undefined && at >= 0) {
-            current.splice(at, 1);
-            if (current.length === 0) sends.delete(key);
-          }
-        }
-        emit("auth.magic_link_send_failed", { errorClass: errorClassOf(err) });
+        if (releaseOnFailure) release(key, t);
+        deps.log("auth.magic_link_send_failed", { errorClass: errorClassOf(err) });
       });
   };
 }

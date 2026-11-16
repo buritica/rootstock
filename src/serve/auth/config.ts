@@ -2,8 +2,8 @@
 // option. Each refusal is an Error with code ERR_ROOTSTOCK_AUTH_CONFIG, thrown
 // before Better Auth is built, so a half-configured layer fails the boot.
 
-import { isRecord, q } from "../../internal/slice.ts";
-import type { AuthOptions } from "./types.ts";
+import { intIn, isRecord, q } from "../../internal/slice.ts";
+import type { AuthOptions, RateLimitRule } from "./types.ts";
 
 export const AUTH_CONFIG_CODE = "ERR_ROOTSTOCK_AUTH_CONFIG";
 
@@ -85,14 +85,25 @@ export function resolveBase(raw: unknown, rule: unknown): ResolvedBase {
 }
 
 const isText = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
-const isPositive = (v: unknown): v is number =>
-  typeof v === "number" && Number.isFinite(v) && v > 0;
-const isPositiveInt = (v: unknown): v is number => isPositive(v) && Number.isInteger(v);
+const isPositiveInt = (v: unknown): v is number => intIn(v, 1, Number.MAX_SAFE_INTEGER);
+const fail = (detail: string) => authConfigError("defineAuth", detail);
+
+/** `value` itself when it is an object holding only `known` keys. A refusal never echoes a value. */
+function knownRecord(
+  path: string,
+  value: unknown,
+  known: readonly string[],
+): Record<string, unknown> {
+  if (!isRecord(value)) throw fail(`${path} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!known.includes(key)) throw fail(`${path}.${key} is not a known key`);
+  }
+  return value;
+}
 
 function textList(path: string, value: unknown, nonEmpty: boolean): string[] {
   if (!Array.isArray(value) || !value.every(isText) || (nonEmpty && value.length === 0)) {
-    throw authConfigError(
-      "defineAuth",
+    throw fail(
       `${path} must be ${nonEmpty ? "a non-empty" : "an"} array of non-empty strings — got ${q(value)}`,
     );
   }
@@ -100,120 +111,132 @@ function textList(path: string, value: unknown, nonEmpty: boolean): string[] {
 }
 
 function headerRecord(path: string, value: unknown): Readonly<Record<string, string>> {
-  if (!isRecord(value)) throw authConfigError("defineAuth", `${path} must be an object`);
+  if (!isRecord(value)) throw fail(`${path} must be an object`);
   try {
     // Headers refuses an invalid name or value, so a typo fails here, not per response.
     new Headers(value as Record<string, string>);
   } catch {
-    throw authConfigError("defineAuth", `${path} holds an invalid header — got ${q(value)}`);
+    throw fail(`${path} holds an invalid header — got ${q(value)}`);
   }
   for (const [name, v] of Object.entries(value)) {
-    if (typeof v !== "string") {
-      throw authConfigError("defineAuth", `${path}[${q(name)}] must be a string — got ${q(v)}`);
-    }
+    if (typeof v !== "string") throw fail(`${path}[${q(name)}] must be a string — got ${q(v)}`);
   }
   return Object.freeze({ ...(value as Record<string, string>) });
 }
 
-function limitRule(path: string, value: unknown): { window: number; max: number } {
-  if (!isRecord(value) || !isPositiveInt(value.window) || !isPositiveInt(value.max)) {
-    throw authConfigError(
-      "defineAuth",
-      `${path} must be { window, max } with positive integers — got ${q(value)}`,
-    );
+function limitRule(path: string, value: unknown, extra: readonly string[] = []): RateLimitRule {
+  const rule = knownRecord(path, value, ["window", "max", ...extra]);
+  if (!isPositiveInt(rule.window) || !isPositiveInt(rule.max)) {
+    throw fail(`${path} must be { window, max } with positive integers — got ${q(value)}`);
   }
-  return { window: value.window, max: value.max };
+  return { window: rule.window, max: rule.max };
 }
 
 const BASE_SCOPES = ["openid", "profile", "email", "offline_access", "mcp:tools"] as const;
 export const MCP_TOOLS_SCOPE = "mcp:tools";
 const JWKS_RULE = "/jwks";
 
+const OPTION_KEYS: readonly (keyof AuthOptions)[] = [
+  "baseURL",
+  "baseUrlRule",
+  "secret",
+  "database",
+  "signIn",
+  "registration",
+  "clientPrivileges",
+  "redirects",
+  "extraScopes",
+  "rateLimit",
+  "ipAddressHeaders",
+  "pages",
+  "pageHeaders",
+  "authHeaders",
+  "assets",
+  "clock",
+  "timers",
+  "log",
+];
+
 /** Everything defineAuth reads, checked and copied; the secret and base are checked apart. */
 export interface CheckedOptions {
   readonly scopes: readonly string[];
   readonly redirectHosts: readonly string[] | null;
   readonly owners: ReadonlySet<string> | null;
-  readonly customRules: Readonly<Record<string, { window: number; max: number } | false>>;
+  readonly customRules: Readonly<Record<string, RateLimitRule | false>>;
   readonly ipAddressHeaders: readonly string[];
   readonly pageHeaders: Readonly<Record<string, string>>;
   readonly authHeaders: Readonly<Record<string, string>>;
 }
 
-/** Refuses (ERR_ROOTSTOCK_AUTH_CONFIG) any option outside its contract shape. */
-export function checkOptions(o: AuthOptions): CheckedOptions {
-  const fail = (detail: string) => authConfigError("defineAuth", detail);
-  if (o.database === undefined || o.database === null) throw fail("database is required");
-
-  const signIn: unknown = o.signIn;
-  let owners: Set<string> | null = null;
-  if (!isRecord(signIn)) throw fail("signIn must be an object");
-  if (signIn.kind === "magicLink") {
-    const allow = signIn.allow;
+function checkSignIn(value: unknown): ReadonlySet<string> | null {
+  if (!isRecord(value)) throw fail("signIn must be an object");
+  if (value.kind === "magicLink") {
+    knownRecord("signIn", value, ["kind", "allow", "send", "sendLimit"]);
+    const allow = value.allow;
     if (!isRecord(allow) || (allow.kind !== "owner" && allow.kind !== "invited")) {
       throw fail(`signIn.allow must be { kind: "owner", emails } or { kind: "invited" }`);
     }
-    if (allow.kind === "owner") {
-      // An empty list is allowed and sends no link at all: fail closed.
-      owners = new Set(
-        textList("signIn.allow.emails", allow.emails, false).map((e) => e.trim().toLowerCase()),
-      );
-    }
-    if (typeof signIn.send !== "function") throw fail("signIn.send must be a function");
-    const limit = signIn.sendLimit;
+    if (typeof value.send !== "function") throw fail("signIn.send must be a function");
+    const limit = knownRecord("signIn.sendLimit", value.sendLimit, [
+      "max",
+      "windowMs",
+      "releaseOnFailure",
+    ]);
     if (
-      !isRecord(limit) ||
       !isPositiveInt(limit.max) ||
-      !isPositive(limit.windowMs) ||
+      !(
+        typeof limit.windowMs === "number" &&
+        Number.isFinite(limit.windowMs) &&
+        limit.windowMs > 0
+      ) ||
       typeof limit.releaseOnFailure !== "boolean"
     ) {
       throw fail(
         `signIn.sendLimit must be { max: positive integer, windowMs: positive number, releaseOnFailure: boolean } — got ${q(limit)}`,
       );
     }
-  } else if (signIn.kind === "social") {
-    if (signIn.provider !== "google") throw fail(`signIn.provider must be "google"`);
+    if (allow.kind === "invited") {
+      knownRecord("signIn.allow", allow, ["kind"]);
+      return null;
+    }
+    knownRecord("signIn.allow", allow, ["kind", "emails"]);
+    // An empty list is allowed and sends no link at all: fail closed.
+    return new Set(
+      textList("signIn.allow.emails", allow.emails, false).map((e) => e.trim().toLowerCase()),
+    );
+  }
+  if (value.kind === "social") {
+    knownRecord("signIn", value, ["kind", "provider", "clientId", "clientSecret", "hd"]);
+    if (value.provider !== "google") throw fail(`signIn.provider must be "google"`);
     // Never echoed: clientSecret is a credential.
     for (const key of ["clientId", "clientSecret", "hd"] as const) {
-      if (!isText(signIn[key])) throw fail(`signIn.${key} must be a non-empty string`);
+      if (!isText(value[key])) throw fail(`signIn.${key} must be a non-empty string`);
     }
-  } else {
-    throw fail(`signIn.kind must be "magicLink" or "social" — got ${q(signIn.kind)}`);
+    return null;
   }
+  throw fail(`signIn.kind must be "magicLink" or "social" — got ${q(value.kind)}`);
+}
 
-  if (!isRecord(o.registration) || typeof o.registration.dcr !== "boolean") {
-    throw fail("registration must be { dcr: boolean }");
+function checkRedirects(value: unknown): string[] | null {
+  if (!isRecord(value)) throw fail("redirects must be an object");
+  if (value.kind === "any") {
+    knownRecord("redirects", value, ["kind"]);
+    return null;
   }
-  if (o.clientPrivileges !== "deny" && o.clientPrivileges !== "unset") {
-    throw fail(`clientPrivileges must be "deny" or "unset" — got ${q(o.clientPrivileges)}`);
+  if (value.kind !== "listed") {
+    throw fail(`redirects.kind must be "any" or "listed" — got ${q(value.kind)}`);
   }
+  knownRecord("redirects", value, ["kind", "hosts", "loopback"]);
+  if (value.loopback !== "if-listed") {
+    throw fail(`redirects.loopback must be "if-listed" — got ${q(value.loopback)}`);
+  }
+  return textList("redirects.hosts", value.hosts, true).map((h) => h.trim().toLowerCase());
+}
 
-  const redirects: unknown = o.redirects;
-  let redirectHosts: string[] | null = null;
-  if (!isRecord(redirects)) throw fail("redirects must be an object");
-  if (redirects.kind === "listed") {
-    if (redirects.loopback !== "if-listed") {
-      throw fail(`redirects.loopback must be "if-listed" — got ${q(redirects.loopback)}`);
-    }
-    redirectHosts = textList("redirects.hosts", redirects.hosts, true).map((h) =>
-      h.trim().toLowerCase(),
-    );
-  } else if (redirects.kind !== "any") {
-    throw fail(`redirects.kind must be "any" or "listed" — got ${q(redirects.kind)}`);
-  }
-
-  const extra = textList("extraScopes", o.extraScopes, false);
-  const scopes = [...BASE_SCOPES, ...extra];
-  if (new Set(scopes).size !== scopes.length) {
-    throw fail(`extraScopes repeats a scope already offered — got ${q(extra)}`);
-  }
-
-  const rateLimit: unknown = o.rateLimit;
-  if (!isRecord(rateLimit)) throw fail("rateLimit must be an object");
-  limitRule("rateLimit", { window: rateLimit.window, max: rateLimit.max });
-  if (!isRecord(rateLimit.rules)) throw fail("rateLimit.rules must be an object");
-  const customRules: Record<string, { window: number; max: number } | false> = {};
-  for (const [path, rule] of Object.entries(rateLimit.rules)) {
+function checkRules(value: unknown): Record<string, RateLimitRule | false> {
+  if (!isRecord(value)) throw fail("rateLimit.rules must be an object");
+  const customRules: Record<string, RateLimitRule | false> = {};
+  for (const [path, rule] of Object.entries(value)) {
     if (!path.startsWith("/")) throw fail(`rateLimit.rules key ${q(path)} must start with "/"`);
     if (path === JWKS_RULE && rule !== false) {
       // The server fetches its own JWKS through its public URL, so a limit on
@@ -225,6 +248,30 @@ export function checkOptions(o: AuthOptions): CheckedOptions {
     customRules[path] = rule === false ? false : limitRule(`rateLimit.rules[${q(path)}]`, rule);
   }
   customRules[JWKS_RULE] = false;
+  return customRules;
+}
+
+/** Refuses (ERR_ROOTSTOCK_AUTH_CONFIG) any option outside its contract shape, unknown keys included. */
+export function checkOptions(o: AuthOptions): CheckedOptions {
+  knownRecord("options", o, OPTION_KEYS);
+  if (o.database === undefined || o.database === null) throw fail("database is required");
+  const owners = checkSignIn(o.signIn);
+
+  const registration = knownRecord("registration", o.registration, ["dcr"]);
+  if (typeof registration.dcr !== "boolean") throw fail("registration must be { dcr: boolean }");
+  if (o.clientPrivileges !== "deny" && o.clientPrivileges !== "unset") {
+    throw fail(`clientPrivileges must be "deny" or "unset" — got ${q(o.clientPrivileges)}`);
+  }
+  const redirectHosts = checkRedirects(o.redirects);
+
+  const extra = textList("extraScopes", o.extraScopes, false);
+  const scopes = [...BASE_SCOPES, ...extra];
+  if (new Set(scopes).size !== scopes.length) {
+    throw fail(`extraScopes repeats a scope already offered — got ${q(extra)}`);
+  }
+
+  limitRule("rateLimit", o.rateLimit, ["rules"]);
+  const customRules = checkRules(o.rateLimit.rules);
 
   const ipAddressHeaders = textList("ipAddressHeaders", o.ipAddressHeaders, false);
   for (const h of ipAddressHeaders) {
@@ -237,22 +284,23 @@ export function checkOptions(o: AuthOptions): CheckedOptions {
     }
   }
 
-  if (!isRecord(o.pages) || typeof o.pages.login !== "function") {
-    throw fail("pages.login must be a function");
-  }
-  if (typeof o.pages.consent !== "function") throw fail("pages.consent must be a function");
+  const pages = knownRecord("pages", o.pages, ["login", "consent"]);
+  if (typeof pages.login !== "function") throw fail("pages.login must be a function");
+  if (typeof pages.consent !== "function") throw fail("pages.consent must be a function");
   const pageHeaders = headerRecord("pageHeaders", o.pageHeaders);
   const authHeaders = headerRecord("authHeaders", o.authHeaders);
 
   if (!isRecord(o.assets)) throw fail("assets must be an object");
   for (const [path, asset] of Object.entries(o.assets)) {
     if (!path.startsWith("/")) throw fail(`assets key ${q(path)} must start with "/"`);
-    if (!isRecord(asset) || typeof asset.body !== "function") {
+    const checked = knownRecord(`assets[${q(path)}]`, asset, ["body", "headers"]);
+    if (typeof checked.body !== "function") {
       throw fail(`assets[${q(path)}] must be { body: () => Blob, headers }`);
     }
-    headerRecord(`assets[${q(path)}].headers`, asset.headers);
+    headerRecord(`assets[${q(path)}].headers`, checked.headers);
   }
 
+  // `timers` is reserved: the contract lists it, and nothing in §6 needs a timer yet.
   for (const key of ["clock", "timers"] as const) {
     if (!isRecord(o[key])) throw fail(`${key} is required`);
   }
