@@ -457,23 +457,20 @@ const W5_RULES: readonly ImportRule[] = [
     packages: [],
   },
 ];
-// Time, timers, ids and output are injected (contract: no `process.env`,
-// `console`, `Bun.*`, `Date`, `performance`, `setTimeout`, `crypto`).
+// Time, timers, ids and output are injected (contract: no `console`,
+// `Bun.*`, `Date`, `performance`, `setTimeout`, `crypto`). `process.env` is
+// the repo-wide "no non-test file reads the environment" test's job.
 const W5_GLOBALS = new RegExp(
   [
     ...nameReads(
       "setTimeout|setInterval|setImmediate|performance|crypto|console|Bun|Math\\.random",
     ),
-    `${NOT_MEMBER}\\bprocess\\s*(?:\\??\\.\\s*env\\b|\\[)`,
     ...DATE_READS,
   ].join("|"),
 );
 
-const under = (path: string, entry: string): boolean =>
-  entry.endsWith("/") ? path.startsWith(entry) : path === entry;
-
 function w5Offenders(path: string, source: string): string[] {
-  const rule = W5_RULES.find((r) => under(path, r.prefix));
+  const rule = W5_RULES.find((r) => allowed(path, [r.prefix]));
   if (rule === undefined || TEST_FILE.test(path)) return [];
   const offenders: string[] = [];
   for (const spec of specifiers(source)) {
@@ -483,7 +480,7 @@ function w5Offenders(path: string, source: string): string[] {
         rule.own !== null &&
         target.startsWith(rule.own) &&
         !(rule.notOwn !== undefined && target.startsWith(rule.notOwn));
-      if (!inOwn && !rule.targets.some((t) => under(target, t))) {
+      if (!inOwn && !allowed(target, rule.targets)) {
         offenders.push(`${path} imports ${spec}`);
       }
     } else if (!rule.packages.some((p) => spec === p || spec.startsWith(`${p}/`))) {
@@ -504,7 +501,7 @@ describe("serve, serve/auth and usage", () => {
     const offenders: string[] = [];
     let scanned = 0;
     for (const path of await sourceFiles()) {
-      if (!W5_RULES.some((r) => under(path, r.prefix)) || TEST_FILE.test(path)) continue;
+      if (!W5_RULES.some((r) => allowed(path, [r.prefix])) || TEST_FILE.test(path)) continue;
       scanned++;
       offenders.push(...w5Offenders(path, await Bun.file(`${ROOT}/${path}`).text()));
     }
@@ -571,7 +568,6 @@ describe("serve, serve/auth and usage", () => {
       ["src/serve/auth/index.ts", "const id = crypto.randomUUID();"],
       ["src/usage/index.ts", "console.log(x);"],
       ["src/usage/index.ts", "await Bun.sleep(1);"],
-      ["src/usage/index.ts", "const u = process.env.DATABASE_URL;"],
       ["src/serve/types.ts", "const r = Math.random();"],
     ];
     const missed = planted.filter(([path, src]) => w5Offenders(path, src).length !== 1);

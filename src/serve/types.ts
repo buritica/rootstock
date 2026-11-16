@@ -161,6 +161,8 @@ export interface ServeProfile {
 
 const ID = /^[a-z0-9][a-z0-9.-]*$/;
 
+// types.ts imports nothing (contract §1.3), so this and isPlainRecord below
+// stay local copies of internal/slice.ts's failAs-style error and isRecord.
 function configError(detail: string, value: unknown): Error {
   let got: string;
   try {
@@ -205,14 +207,12 @@ export function defineToolScopes(t: ToolScopes): ToolScopes {
     if (!granted.includes(scope)) {
       throw configError(`implies.${scope} must include ${scope} itself`, granted);
     }
-    implies[scope] = Object.freeze([...granted]);
-  }
-  for (const [scope, granted] of Object.entries(implies)) {
     for (const g of granted) {
-      if (!Object.hasOwn(implies, g)) {
+      if (!Object.hasOwn(t.implies, g)) {
         throw configError(`implies.${scope} grants ${g}, which implies does not declare`, g);
       }
     }
+    implies[scope] = Object.freeze([...granted]);
   }
   return Object.freeze({
     id: t.id,
