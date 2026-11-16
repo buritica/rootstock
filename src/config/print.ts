@@ -117,6 +117,26 @@ function runsView(runs: NonNullable<RootstockConfig["runs"]>): unknown {
   };
 }
 
+function usageView(usage: NonNullable<RootstockConfig["usage"]>): unknown {
+  const { callLog, spend } = usage;
+  return {
+    callLog:
+      callLog === null
+        ? null
+        : {
+            maxBatch: callLog.maxBatch,
+            maxBuffered: callLog.maxBuffered,
+            table: table(callLog.table),
+          },
+    keepArgs: usage.keepArgs,
+    keepOutput: usage.keepOutput,
+    spend:
+      spend === null
+        ? null
+        : { ceiling: spend.ceiling, store: { ...spend.store }, unit: spend.unit },
+  };
+}
+
 /**
  * The config as canonical JSON, every field spelled out, for a repo to pin
  * as its config golden. No version field: a patch release must not move it.
@@ -159,6 +179,8 @@ export function printRootstockConfig(config: RootstockConfig): string {
   // Printed only when given, so a config without it prints byte-identically
   // to 0.7.0's and no consumer's config golden moves with the bump (§0.4).
   if (config.runs !== null) view.runs = runsView(config.runs);
+  // Likewise: a config without a usage slice prints as before.
+  if (config.usage !== null) view.usage = usageView(config.usage);
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;
 }

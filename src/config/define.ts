@@ -1,4 +1,10 @@
-import { lockProfileSingle, runsJobLocks, runsLockTable, runsStaleHeartbeat } from "./builtin.ts";
+import {
+  lockProfileSingle,
+  runsJobLocks,
+  runsLockTable,
+  runsStaleHeartbeat,
+  usageSpendPrices,
+} from "./builtin.ts";
 import type {
   ClientInput,
   ClientSlice,
@@ -13,6 +19,8 @@ import type {
   RunsInput,
   RunsSlice,
   SliceParsers,
+  UsageInput,
+  UsageSlice,
 } from "./slices.ts";
 
 export interface Invariant {
@@ -29,6 +37,7 @@ export interface RootstockConfigInput {
   lock?: LockInput;
   queue?: QueueInput;
   runs?: RunsInput;
+  usage?: UsageInput;
   invariants?: readonly Invariant[];
 }
 
@@ -41,10 +50,12 @@ export interface RootstockConfig {
   readonly lock: LockSlice | null;
   readonly queue: QueueSlice | null;
   readonly runs: RunsSlice | null;
+  readonly usage: UsageSlice | null;
   /**
    * Every invariant id, in input order, after the built-in ones that apply
    * (`lock-profile-single` when there is a lock; `runs-lock-table`,
-   * `runs-job-locks` and `runs-stale-heartbeat` when there is a runs slice);
+   * `runs-job-locks` and `runs-stale-heartbeat` when there is a runs slice;
+   * `usage-spend-prices` when the usage slice's spend is in dollars);
    * all held, or define threw.
    */
   readonly invariants: readonly string[];
@@ -59,6 +70,7 @@ const INPUT_KEYS: readonly string[] = [
   "lock",
   "queue",
   "runs",
+  "usage",
   "invariants",
 ];
 const INVARIANT_ID = /^[a-z0-9][a-z0-9.-]*$/;
@@ -100,6 +112,7 @@ export function composeRootstockConfig(
       ? { ...input.runs, lockTable: { schema: lock.table.schema, name: lock.table.name } }
       : input.runs;
   const runs = runsInput === undefined ? null : parsers.runsSlice(runsInput, defaults);
+  const usage = input.usage === undefined ? null : parsers.usageSlice(input.usage, defaults);
 
   // A misspelled key would otherwise drop its slice or its invariants and
   // still build green. The value is never echoed, as in every slice parser.
@@ -119,6 +132,7 @@ export function composeRootstockConfig(
   const invariants = [
     ...(lock === null ? [] : [lockProfileSingle]),
     ...(runs === null ? [] : [runsLockTable, runsJobLocks, runsStaleHeartbeat]),
+    ...(usage?.spend?.unit === "usd" ? [usageSpendPrices] : []),
     ...(input.invariants ?? []),
   ];
   const ids: string[] = [];
@@ -141,6 +155,7 @@ export function composeRootstockConfig(
     lock,
     queue,
     runs,
+    usage,
     invariants: ids,
   } satisfies Omit<RootstockConfig, typeof rootstockConfigBrand>);
   built.add(config);
