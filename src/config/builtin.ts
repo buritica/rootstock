@@ -151,3 +151,16 @@ export const runsStaleHeartbeat: Invariant = Object.freeze({
     return `${who} must set staleHeartbeatSeconds to at least ${floor}: 6 × probeStallSeconds ${stall} + endTimeoutSeconds ${end} + 1 + 2 × heartbeatSeconds ${beat}, or a live run would read interrupted during a lock recovery`;
   },
 });
+
+/**
+ * Built in, never exported: a spend ceiling in dollars prices each call
+ * with the runs slice's table, so there must be one, with at least one price.
+ */
+export const usageSpendPrices: Invariant = Object.freeze({
+  id: "usage-spend-prices",
+  check(config: RootstockConfig): string | null {
+    if (config.usage?.spend?.unit !== "usd") return null;
+    if (config.runs !== null && Object.keys(config.runs.prices).length > 0) return null;
+    return 'usage.spend.unit "usd" needs the runs slice\'s prices: declare a runs slice with prices, or count "tokens"';
+  },
+});

@@ -92,6 +92,14 @@ export function sliceBrand<T extends object>(type: string, parser: string): Bran
   };
 }
 
+/** The largest Postgres `integer` (int4). */
+export const INT4_MAX = 2_147_483_647;
+
+/** `s` cut to its first `max` characters (code points, so no surrogate is split). */
+export function cut(s: string, max: number): string {
+  return s.length <= max ? s : Array.from(s).slice(0, max).join("");
+}
+
 /** True when `v` is an integer from `min` to `max`. */
 export function intIn(v: unknown, min: number, max: number): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;

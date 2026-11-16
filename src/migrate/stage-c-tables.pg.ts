@@ -10,11 +10,12 @@ import { rootstockMigrationStatus } from "./status.ts";
 // R-C1: the three Stage C tables, applied by the real applier as part of
 // rootstock's own source, once per transactor kind, each case in schemas of
 // its own. R-D1 (0.8.0) adds the Stage D files: two tables and two
-// work_queue columns.
+// work_queue columns; W5 (0.12.0) adds mcp_calls and spend.
 
 const SHIPPED = rootstockMigrations();
 const STAGE_C = SHIPPED.slice(1, 4).map((m) => m.filename);
-const STAGE_D = SHIPPED.slice(4).map((m) => m.filename);
+const STAGE_D = SHIPPED.slice(4, 7).map((m) => m.filename);
+const W5 = SHIPPED.slice(7).map((m) => m.filename);
 
 let main: TestTransactor;
 let sql: Sql;
@@ -127,7 +128,7 @@ describe("the Stage C tables", () => {
     const slice = migrateSlice({ schema: schema() });
     await applyMigrationList(main.transactor, slice, SHIPPED.slice(0, 3));
     const rerun = await applyRootstockMigrations(main.transactor, slice);
-    expect(rerun.applied).toEqual([...STAGE_C.slice(2), ...STAGE_D]);
+    expect(rerun.applied).toEqual([...STAGE_C.slice(2), ...STAGE_D, ...W5]);
     expect((await rootstockMigrationStatus(sql, slice)).red).toBe(false);
   });
 
@@ -136,9 +137,9 @@ describe("the Stage C tables", () => {
     const slice = migrateSlice({ schema: s });
     await applyMigrationList(main.transactor, slice, SHIPPED.slice(0, 1));
     const status = await rootstockMigrationStatus(sql, slice);
-    expect(status.pending.map((m) => m.filename)).toEqual([...STAGE_C, ...STAGE_D]);
+    expect(status.pending.map((m) => m.filename)).toEqual([...STAGE_C, ...STAGE_D, ...W5]);
     const upgrade = await applyRootstockMigrations(main.transactor, slice);
-    expect(upgrade.applied).toEqual([...STAGE_C, ...STAGE_D]);
+    expect(upgrade.applied).toEqual([...STAGE_C, ...STAGE_D, ...W5]);
     expect(await applied(s)).toEqual(SHIPPED.map((m) => m.filename));
   });
 
@@ -175,9 +176,9 @@ describe("the Stage D tables (R-D1)", () => {
       )[0]?.f;
     const before = await fileNode();
     const status = await rootstockMigrationStatus(sql, slice);
-    expect(status.pending.map((m) => m.filename)).toEqual(STAGE_D);
+    expect(status.pending.map((m) => m.filename)).toEqual([...STAGE_D, ...W5]);
     const upgrade = await applyRootstockMigrations(main.transactor, slice);
-    expect(upgrade.applied).toEqual(STAGE_D);
+    expect(upgrade.applied).toEqual([...STAGE_D, ...W5]);
     expect((await rootstockMigrationStatus(sql, slice)).red).toBe(false);
     const [row] = await sql.unsafe<{ version: string; token: string | null }>(
       `SELECT version::text AS version, claim_token::text AS token FROM "${s}".work_queue`,
@@ -274,5 +275,72 @@ describe("the Stage D tables (R-D1)", () => {
         (e: unknown) => e,
       );
     expect(bad).not.toBeNull();
+  });
+});
+
+describe("the W5 tables", () => {
+  test("mcp_calls and spend: columns, keys, checks and indexes equal the contract", async () => {
+    const s = schema();
+    await applyRootstockMigrations(main.transactor, migrateSlice({ schema: s }));
+    const cols = await sql.unsafe<{ line: string }>(
+      `SELECT table_name || '.' || column_name || ' ' || data_type || ' ' || is_nullable || ' ' ||
+              coalesce(column_default, '-') AS line
+       FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name IN ('mcp_calls', 'spend')
+       ORDER BY table_name, ordinal_position`,
+      [s],
+    );
+    expect(cols.map((r) => r.line)).toEqual([
+      "mcp_calls.id uuid NO gen_random_uuid()",
+      `mcp_calls.created_at ${TS} NO now()`,
+      "mcp_calls.caller text NO -",
+      "mcp_calls.on_behalf_of text YES -",
+      "mcp_calls.turn_id text YES -",
+      "mcp_calls.tool text NO -",
+      "mcp_calls.args jsonb NO -",
+      "mcp_calls.duration_ms integer NO -",
+      "mcp_calls.ok boolean NO -",
+      "mcp_calls.error_class text YES -",
+      "mcp_calls.result_ids jsonb YES -",
+      "mcp_calls.phases jsonb YES -",
+      "mcp_calls.tokens jsonb YES -",
+      "mcp_calls.cost_usd numeric YES -",
+      "mcp_calls.cost_note text YES -",
+      "mcp_calls.output_text text YES -",
+      "mcp_calls.extra jsonb YES -",
+      "mcp_calls.server_sha text YES -",
+      "mcp_calls.client_ua text YES -",
+      "mcp_calls.mcp_protocol text YES -",
+      "spend.window_start date NO -",
+      "spend.caller text NO -",
+      "spend.unit text NO -",
+      "spend.used numeric NO 0",
+    ]);
+    // Postgres 18 also lists NOT NULL here (contype 'n'); the column rows above pin nullability.
+    const constraints = await sql.unsafe<{ def: string }>(
+      `SELECT conname || ' ' || pg_get_constraintdef(oid) AS def FROM pg_constraint
+       WHERE connamespace = to_regnamespace($1::text)
+         AND conrelid IN (to_regclass(quote_ident($1) || '.mcp_calls'), to_regclass(quote_ident($1) || '.spend'))
+         AND contype <> 'n'
+       ORDER BY conname`,
+      [s],
+    );
+    expect(constraints.map((r) => r.def)).toEqual([
+      "mcp_calls_pkey PRIMARY KEY (id)",
+      "spend_pkey PRIMARY KEY (window_start, caller, unit)",
+      "spend_unit_check CHECK ((unit = ANY (ARRAY['tokens'::text, 'usd'::text])))",
+    ]);
+    const indexes = await sql.unsafe<{ def: string }>(
+      `SELECT indexdef AS def FROM pg_indexes
+       WHERE schemaname = $1 AND tablename = 'mcp_calls' AND indexname NOT LIKE '%_pkey'
+       ORDER BY indexname`,
+      [s],
+    );
+    expect(indexes.map((r) => r.def)).toEqual([
+      `CREATE INDEX mcp_calls_caller_created_idx ON ${s}.mcp_calls USING btree (caller, created_at DESC)`,
+      `CREATE INDEX mcp_calls_created_idx ON ${s}.mcp_calls USING btree (created_at DESC)`,
+      `CREATE INDEX mcp_calls_tool_created_idx ON ${s}.mcp_calls USING btree (tool, created_at DESC)`,
+      `CREATE INDEX mcp_calls_turn_id_idx ON ${s}.mcp_calls USING btree (turn_id) WHERE (turn_id IS NOT NULL)`,
+    ]);
   });
 });

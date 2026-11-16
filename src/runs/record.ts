@@ -1,8 +1,9 @@
 import { pgCode, type Sql } from "../db/index.ts";
-import { intIn, own, perSlice, q } from "../internal/slice.ts";
+import { cut, INT4_MAX, intIn, own, perSlice, q } from "../internal/slice.ts";
 import type { RunLock } from "../lock/index.ts";
 import { type RootstockRunsError, refusals } from "./errors.ts";
 import { type Emit, emitter, failure, type RunStatus, type RunsDeps } from "./events.ts";
+import { priceTokens } from "./price.ts";
 import {
   assertRunsSlice,
   COUNTER,
@@ -10,7 +11,6 @@ import {
   jobDecl,
   lockNameFor,
   MODEL,
-  priceMicros,
   type RunsSlice,
 } from "./slice.ts";
 import { type RunsStatements, runsStatements } from "./statements.ts";
@@ -211,11 +211,8 @@ async function notable<T>(slice: RunsSlice, run: () => Promise<T>, job?: string)
   }
 }
 
-const COUNT_MAX = 2_147_483_647;
-const E_COUNT = `a non-negative integer of at most ${COUNT_MAX}`;
+const E_COUNT = `a non-negative integer of at most ${INT4_MAX}`;
 const PHASE = /^[a-z0-9_.:-]{1,32}$/;
-const NOTE_MODELS_MAX = 200;
-const MICRO = 1_000_000n;
 /** R2's retries after a lost connection (§20 A24). */
 const R2_RETRIES = 2;
 /**
@@ -257,48 +254,9 @@ function connectionLost(err: unknown): boolean {
   return state !== undefined && CONNECTION_STATE.test(state);
 }
 
-/** `s` cut to its first `max` characters (code points, so no surrogate is split). */
-function cut(s: string, max: number): string {
-  return s.length <= max ? s : Array.from(s).slice(0, max).join("");
-}
-
 /** UTF-8 bytes of `s`. */
 function bytes(s: string): number {
   return new TextEncoder().encode(s).length;
-}
-
-/** `micro` micro-dollars as a decimal string with exactly 6 fractional digits. */
-function dollars(micro: bigint): string {
-  return `${micro / MICRO}.${(micro % MICRO).toString().padStart(6, "0")}`;
-}
-
-interface Cost {
-  costUsd: string | null;
-  costNote: string | null;
-}
-
-/** §3.6: the cost of `tokens` under the slice's prices, in integer micro-dollars. */
-function costOf(
-  slice: RunsSlice,
-  decl: JobDecl,
-  tokens: ReadonlyMap<string, { input: number; output: number }>,
-  estimated: boolean,
-): Cost {
-  if (!decl.metered) return { costUsd: null, costNote: "unmetered" };
-  const prices = priceMicros(slice);
-  const unpriced = [...tokens.keys()].filter((m) => !prices.has(m)).sort();
-  if (unpriced.length > 0) {
-    return { costUsd: null, costNote: `unpriced:${cut(unpriced.join(","), NOTE_MODELS_MAX)}` };
-  }
-  let sum = 0n;
-  for (const [model, t] of tokens) {
-    const p = prices.get(model) as { input: bigint; output: bigint };
-    sum += BigInt(t.input) * p.input + BigInt(t.output) * p.output;
-  }
-  return {
-    costUsd: dollars((sum + 500_000n) / MICRO),
-    costNote: estimated ? "estimated" : null,
-  };
 }
 
 interface Identity {
@@ -363,7 +321,7 @@ function checkAccounting(input: unknown, job: string, maxBytes: number): Account
   const out: Record<string, number> = {};
   for (const key of ["listed", "written", "unchanged", "quarantined", "excluded"] as const) {
     const v = own(a, key);
-    if (!intIn(v, 0, COUNT_MAX)) throw fail(`${key} must be ${E_COUNT} — got ${q(v)}`);
+    if (!intIn(v, 0, INT4_MAX)) throw fail(`${key} must be ${E_COUNT} — got ${q(v)}`);
     out[key] = v;
   }
   const raw = own(a, "excludedReasons");
@@ -379,7 +337,7 @@ function checkAccounting(input: unknown, job: string, maxBytes: number): Account
         `excludedReasons keys must be non-empty with no NUL or lone surrogate — got ${q(reason)}`,
       );
     }
-    if (!intIn(n, 0, COUNT_MAX))
+    if (!intIn(n, 0, INT4_MAX))
       throw fail(`excludedReasons[${q(reason)}] must be ${E_COUNT} — got ${q(n)}`);
     sum += n;
     reasons.push([reason, n]);
@@ -514,7 +472,7 @@ function makeRun(
     phase: string | null,
   ): Promise<FinishResult> => {
     const identity = identityOf(decl, job, status, accounting);
-    const cost = costOf(slice, decl, tokens, estimated);
+    const cost = priceTokens(slice, tokens, { metered: decl.metered, estimated });
     const given = reasonIn === undefined ? undefined : reasonIn.replaceAll("\0", "�");
     const composed =
       identity.failed === null
