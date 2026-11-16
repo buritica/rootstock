@@ -163,6 +163,55 @@ ALTER TABLE work_queue
 `,
 };
 
+// The two W5 files (contract §7.2, §7.4), byte for byte.
+const W5: Readonly<Record<string, string>> = {
+  "20261116220000_mcp_calls.sql": `-- rootstock-migration: additive
+-- The call log: one row per MCP tool call, written off the response path by
+-- usage's postgresCallLog. The arguments are always kept (\`{}\` when a call had
+-- none); a failure keeps its class, never its message. Run with search_path
+-- set to the target schema, so nothing here is schema-qualified.
+CREATE TABLE mcp_calls (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  caller text NOT NULL,
+  on_behalf_of text,
+  turn_id text,
+  tool text NOT NULL,
+  args jsonb NOT NULL,
+  duration_ms integer NOT NULL,
+  ok boolean NOT NULL,
+  error_class text,
+  result_ids jsonb,
+  phases jsonb,
+  tokens jsonb,
+  cost_usd numeric,
+  cost_note text,
+  output_text text,
+  extra jsonb,
+  server_sha text,
+  client_ua text,
+  mcp_protocol text
+);
+CREATE INDEX mcp_calls_created_idx ON mcp_calls (created_at DESC);
+CREATE INDEX mcp_calls_caller_created_idx ON mcp_calls (caller, created_at DESC);
+CREATE INDEX mcp_calls_tool_created_idx ON mcp_calls (tool, created_at DESC);
+CREATE INDEX mcp_calls_turn_id_idx ON mcp_calls (turn_id) WHERE turn_id IS NOT NULL;
+`,
+  "20261116220001_spend.sql": `-- rootstock-migration: additive
+-- What each caller spent per UTC day, in tokens or dollars: the store behind
+-- usage's spend ceiling. Every write is an upsert that adds to \`used\` and
+-- returns the new total. Run with search_path set to the target schema.
+CREATE TABLE spend (
+  window_start date NOT NULL,
+  caller text NOT NULL,
+  unit text NOT NULL,
+  used numeric NOT NULL DEFAULT 0,
+  PRIMARY KEY (window_start, caller, unit),
+  CONSTRAINT spend_unit_check CHECK (unit IN ('tokens', 'usd'))
+);
+`,
+};
+
 describe("the Stage C files", () => {
   for (const [file, text] of Object.entries(STAGE_C)) {
     test(`${file} is byte-equal to the frozen text`, () => {
@@ -187,8 +236,24 @@ describe("the Stage D files", () => {
   }
 
   test("they follow the Stage C files, in order, all additive", () => {
-    expect(MANIFEST.slice(4)).toEqual(Object.keys(STAGE_D));
-    for (const m of rootstockMigrations().slice(4)) {
+    expect(MANIFEST.slice(4, 7)).toEqual(Object.keys(STAGE_D));
+    for (const m of rootstockMigrations().slice(4, 7)) {
+      expect(m.kind).toBe("additive");
+      expect(m.statements).toHaveLength(1);
+    }
+  });
+});
+
+describe("the W5 files", () => {
+  for (const [file, text] of Object.entries(W5)) {
+    test(`${file} is byte-equal to the frozen text`, () => {
+      expect(readFileSync(new URL(file, DIR), "utf8")).toBe(text);
+    });
+  }
+
+  test("they follow the Stage D files, in order, both additive", () => {
+    expect(MANIFEST.slice(7)).toEqual(Object.keys(W5));
+    for (const m of rootstockMigrations().slice(7)) {
       expect(m.kind).toBe("additive");
       expect(m.statements).toHaveLength(1);
     }
