@@ -6,6 +6,7 @@ test("runs exports exactly the frozen surface", async () => {
     "consecutiveBreaker",
     "jobDecl",
     "pendingQuarantine",
+    "priceTokens",
     "proportionalBrake",
     "pruneRuns",
     "pushVerdictFor",

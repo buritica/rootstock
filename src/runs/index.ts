@@ -8,6 +8,7 @@ export type {
   RunsEvent,
   ScopeJudgement,
 } from "./events.ts";
+export { priceTokens, type TokenCost } from "./price.ts";
 export {
   type PendingRow,
   pendingQuarantine,
