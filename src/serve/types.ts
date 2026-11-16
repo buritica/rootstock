@@ -81,8 +81,21 @@ export interface UsageWiring {
   sinks: readonly CallSink[];
   keepArgs: boolean;
   keepOutput: boolean;
-  /** A RunsSlice, typed in `usage`; null → costNote "unpriced:<models>". */
-  prices: unknown | null;
+  /**
+   * Built by `usage` from the runs prices (serve cannot import `runs`). Called once per call, only when it
+   * metered tokens; no prices → costUsd null, costNote "unpriced:<models>" (models sorted). costUsd is a
+   * decimal string. The seam guards it: a throw records costUsd null, costNote "price_failed" and logs
+   * `usage.price_failed`, never failing the call.
+   */
+  price: (
+    tokens: Readonly<Record<string, { input: number; output: number }>>,
+    estimated: boolean,
+  ) => { costUsd: string | null; costNote: string | null };
+  /**
+   * `usage`'s errorClassOf: `classify` first (the seam passes the service's classifyError hook), then the
+   * generic walk; never a message. The seam guards it: a throw records "unreadable error".
+   */
+  errorClassOf: (err: unknown, classify?: (err: unknown) => string | undefined) => string;
   spend: SpendCharger | null;
   serverSha: string | null;
 }
@@ -96,13 +109,20 @@ export interface StoppableServer {
   pending(): number;
 }
 
+/**
+ * How `mcpPath` answers a method other than POST (contract §3.2 step 1).
+ * "405-first": the 405 before auth. "auth-then-405": auth (steps 5.1–5.7), then the 405.
+ * "auth-then-entry": auth, then the SDK entry with no body (5.8 and 5.9 skipped); its answer passes through untouched.
+ */
+export type MethodAnswer = "405-first" | "auth-then-405" | "auth-then-entry";
+
 /** Every field is required: a profile states each consumer's behaviour, never a default. */
 export interface ServeProfile {
   id: string;
   /** "/mcp" */
   mcpPath: string;
-  /** "auth": hand to requireMcpAuth as today. */
-  methods: { get: "405"; head: "405" | "auth"; other: "post-path" | "auth" };
+  /** "other" = every method but GET and POST, HEAD included. */
+  methods: { get: MethodAnswer; other: MethodAnswer };
   /** true: return null for paths the service does not own. */
   passUnknown: boolean;
   /** Matched with startsWith. */
@@ -147,7 +167,7 @@ export interface ServeProfile {
   /** Response bytes that differ per consumer. */
   bodies: {
     unauthorizedNoSub: "jsonrpc-401" | "empty-401";
-    jwksFailure: "503-retry" | "500-empty" | "500-json";
+    jwksFailure: "503-retry" | "500-empty" | "jsonrpc-500";
     notFound: "empty-no-store" | "text-not-found" | "json-not-found";
     internal: "empty-500" | "json-500" | "text-500";
     /** The SDK's text with the profile's limit. */

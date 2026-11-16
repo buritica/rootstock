@@ -8,6 +8,7 @@ export {
   defineToolScopes,
   expandScopes,
   type LogEvent,
+  type MethodAnswer,
   type RandomId,
   type ServeProfile,
   type SpendCharger,
