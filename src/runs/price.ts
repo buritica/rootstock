@@ -21,6 +21,11 @@ function dollars(micro: bigint): string {
   return `${micro / MICRO}.${(micro % MICRO).toString().padStart(6, "0")}`;
 }
 
+/** "unpriced:<models>", the models sorted and the list cut at 200 characters. */
+export function unpricedNote(models: readonly string[]): string {
+  return `unpriced:${cut([...models].sort().join(","), NOTE_MODELS_MAX)}`;
+}
+
 /**
  * The cost of `tokens` (model → counts) under the slice's prices, summed in
  * integer micro-dollars and rounded half up once. Not `metered`: "unmetered".
@@ -34,10 +39,8 @@ export function priceTokens(
 ): TokenCost {
   if (!o.metered) return { costUsd: null, costNote: "unmetered" };
   const prices = priceMicros(slice);
-  const unpriced = [...tokens.keys()].filter((m) => !prices.has(m)).sort();
-  if (unpriced.length > 0) {
-    return { costUsd: null, costNote: `unpriced:${cut(unpriced.join(","), NOTE_MODELS_MAX)}` };
-  }
+  const unpriced = [...tokens.keys()].filter((m) => !prices.has(m));
+  if (unpriced.length > 0) return { costUsd: null, costNote: unpricedNote(unpriced) };
   let sum = 0n;
   for (const [model, t] of tokens) {
     const p = prices.get(model) as { input: bigint; output: bigint };

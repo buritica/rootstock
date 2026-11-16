@@ -19,6 +19,7 @@ test("runs exports exactly the frozen surface", async () => {
     "runsSnapshot",
     "scopeGuard",
     "startRun",
+    "unpricedNote",
     "verdictFor",
     "windowedBudget",
   ]);
