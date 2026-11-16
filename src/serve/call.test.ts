@@ -9,7 +9,7 @@ import {
   localRequestContext,
   type RequestContext,
 } from "./call.ts";
-import { captureLog, fakeTime } from "./fakes.test-support.ts";
+import { captureLog, fakeTime, flush } from "./fakes.test-support.ts";
 import type { Limits } from "./limits.ts";
 import { connectPeer } from "./rpc.test-support.ts";
 import {
@@ -27,10 +27,8 @@ const SCOPES = defineToolScopes({
     slow: "mcp:tools",
     boom: "mcp:tools",
     spend: "mcp:tools",
-    admin: "admin",
-    later: "mcp:tools",
   },
-  implies: { "mcp:tools": ["mcp:tools"], admin: ["admin", "mcp:tools"] },
+  implies: { "mcp:tools": ["mcp:tools"] },
 });
 
 const NO_LIMITS: Limits = {
@@ -68,18 +66,21 @@ interface Setup {
   ctx?: RequestContext;
   hooks?: Parameters<typeof installSeams>[1]["hooks"];
   register?: (server: McpServer) => void;
+  time?: ReturnType<typeof fakeTime>;
+  toolScopes?: typeof SCOPES;
+  log?: ReturnType<typeof captureLog>;
 }
 
 async function stdio(s: Setup = {}) {
-  const time = fakeTime();
-  const log = captureLog();
+  const time = s.time ?? fakeTime();
+  const log = s.log ?? captureLog();
   const records: CallRecord[] = [];
   const caller = s.caller ?? LOCAL_CALLER(new Set(["mcp:tools"]));
   const server = new McpServer({ name: "t", version: "0" });
   installSeams(server, {
     profile: { unknownTool: s.unknownTool ?? "protocolError" },
     caller,
-    toolScopes: SCOPES,
+    toolScopes: s.toolScopes ?? SCOPES,
     limits: s.limits === undefined ? NO_LIMITS : s.limits,
     usage: s.usage === undefined ? wiring(records) : s.usage,
     ctx: s.ctx ?? localRequestContext(caller),
@@ -158,11 +159,20 @@ describe("SDK details both seams rely on (stdio; the HTTP entries repeat this in
 
   test("batch-style concurrency: each call's handle is its own", async () => {
     const seen: string[] = [];
+    // All three start, then finish in reverse order: each must still see its own handle.
+    const gates = new Map<number, () => void>();
+    let allStarted: () => void = () => {};
+    const started = new Promise<void>((r) => {
+      allStarted = r;
+    });
     const { peer } = await stdio({
       register: (server) =>
         server.registerTool("slow", { inputSchema: { n: z.number() } }, async ({ n }) => {
           currentCall().setArgs({ n });
-          await new Promise((r) => setTimeout(r, 10 - n));
+          await new Promise<void>((r) => {
+            gates.set(n, r);
+            if (gates.size === 3) allStarted();
+          });
           seen.push(
             `${n}:${JSON.stringify(currentCall().tool)}:${(currentCall() as CallHandle).tool}`,
           );
@@ -170,7 +180,13 @@ describe("SDK details both seams rely on (stdio; the HTTP entries repeat this in
           return { content: [{ type: "text", text: String(n) }] };
         }),
     });
-    const all = await Promise.all([1, 2, 3].map((n) => peer.callTool("slow", { n })));
+    const pending = Promise.all([1, 2, 3].map((n) => peer.callTool("slow", { n })));
+    await started;
+    for (const n of [3, 2, 1]) {
+      gates.get(n)?.();
+      await flush();
+    }
+    const all = await pending;
     expect(all.map((m) => (resultOf(m).content as { text: string }[])[0]?.text)).toEqual([
       "1",
       "2",
@@ -188,21 +204,28 @@ describe("registration seam", () => {
     const usage = wiring(records, {
       sinks: [{ record: (r) => records.push(r), onRegister: (t) => registered.push(t) }],
     });
+    // slow needs a scope this caller lacks; spend is not declared at all.
+    const toolScopes = defineToolScopes({
+      id: "test",
+      tools: { echo: "mcp:tools", boom: "mcp:tools", slow: "profile" },
+      implies: { "mcp:tools": ["mcp:tools"], profile: ["profile", "mcp:tools"] },
+    });
     const { peer } = await stdio({
       usage,
+      toolScopes,
       hooks: { onRegister: (n) => names.push(n) },
       register: (server) => {
-        server.registerTool("admin", {}, async () => ({ content: [] }));
-        server.registerTool("undeclared", {}, async () => ({ content: [] }));
+        server.registerTool("slow", {}, async () => ({ content: [] }));
+        server.registerTool("spend", {}, async () => ({ content: [] }));
       },
     });
     const list = resultOf(await peer.request("tools/list", {})).tools as { name: string }[];
     expect(list.map((t) => t.name)).toEqual(["echo", "boom"]);
-    expect(names).toEqual(["echo", "boom", "admin", "undeclared"]);
+    expect(names).toEqual(["echo", "boom", "slow", "spend"]);
     expect(registered).toEqual(["echo", "boom"]);
-    expect((await peer.callTool("admin")).error).toEqual({
+    expect((await peer.callTool("slow")).error).toEqual({
       code: -32602,
-      message: "Tool admin not found",
+      message: "Tool slow not found",
     });
   });
 
@@ -220,18 +243,18 @@ describe("registration seam", () => {
   test("both seams cover a tool registered after the first call", async () => {
     const { server, peer, records } = await stdio();
     await peer.callTool("echo", { text: "a" });
-    server.registerTool("later", { inputSchema: { v: z.string() } }, async ({ v }) => {
+    server.registerTool("slow", { inputSchema: { v: z.string() } }, async ({ v }) => {
       currentCall().setExtra({ late: true });
       return { content: [{ type: "text", text: v }] };
     });
-    expect((await peer.callTool("later", { v: 1 })).result).toMatchObject({ isError: true });
-    expect(resultOf(await peer.callTool("later", { v: "b" })).content).toEqual([
+    expect((await peer.callTool("slow", { v: 1 })).result).toMatchObject({ isError: true });
+    expect(resultOf(await peer.callTool("slow", { v: "b" })).content).toEqual([
       { type: "text", text: "b" },
     ]);
     expect(records.map((r) => [r.tool, r.stage, r.errorClass, r.extra])).toEqual([
       ["echo", "handler", null, null],
-      ["later", "rejected", "InvalidParams", null],
-      ["later", "handler", null, { late: true }],
+      ["slow", "rejected", "InvalidParams", null],
+      ["slow", "handler", null, { late: true }],
     ]);
   });
 });
@@ -374,15 +397,24 @@ describe("the handle", () => {
   });
 
   test("a rejected spend write never becomes an unhandled rejection", async () => {
-    const unhandled: unknown[] = [];
-    const onUnhandled = (e: unknown) => unhandled.push(e);
-    process.on("unhandledRejection", onUnhandled);
-    try {
+    // The seam must attach a rejection handler to the promise the charger returns.
+    let handled = false;
+    const rejected = () => {
+      const p = Promise.reject(new Error("write failed"));
+      const then = p.then.bind(p);
+      // biome-ignore lint/suspicious/noThenProperty: spying on the handler the seam attaches is the point
+      p.then = ((ok, bad) => {
+        if (bad !== undefined) handled = true;
+        return then(ok, bad);
+      }) as typeof p.then;
+      return p;
+    };
+    {
       const usage = wiring([], {
         spend: {
           forCaller: () => ({
             assertWithin: async () => {},
-            record: () => Promise.reject(new Error("write failed")),
+            record: rejected,
           }),
         },
       });
@@ -395,10 +427,7 @@ describe("the handle", () => {
           }),
       });
       await peer.callTool("spend");
-      await new Promise((r) => setTimeout(r, 10));
-      expect(unhandled).toEqual([]);
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
+      expect(handled).toBe(true);
     }
   });
 
@@ -483,6 +512,10 @@ describe("limits in the seams", () => {
     const gate = new Promise<void>((r) => {
       release = r;
     });
+    let slowStarted: () => void = () => {};
+    const started = new Promise<void>((r) => {
+      slowStarted = r;
+    });
     const limits: Limits = {
       ...NO_LIMITS,
       concurrency: { pass: { tools: ["slow", "spend"], max: 1, busy: (t) => `${t} is busy` } },
@@ -491,6 +524,7 @@ describe("limits in the seams", () => {
       limits,
       register: (server) => {
         server.registerTool("slow", {}, async () => {
+          slowStarted();
           await gate;
           return { content: [{ type: "text", text: "done" }] };
         });
@@ -500,7 +534,7 @@ describe("limits in the seams", () => {
       },
     });
     const first = peer.callTool("slow");
-    await new Promise((r) => setTimeout(r, 5));
+    await started;
     const busy = resultOf(await peer.callTool("spend"));
     expect(JSON.stringify(busy)).toBe(
       '{"content":[{"type":"text","text":"{\\"error\\":\\"spend is busy\\"}"}],"isError":true}',
@@ -567,15 +601,19 @@ describe("limits in the seams", () => {
     await expect(stdio({ limits })).rejects.toThrow(/limits.perTool names "ghost"/);
   });
 
-  test("the same Limits object shares bucket state across servers", async () => {
+  test("the same Limits object and deps share bucket state across servers; other deps do not", async () => {
     const limits: Limits = {
       ...NO_LIMITS,
       perTool: { echo: { capacity: 1, refillPerSecond: 1, maxKeys: 10 } },
     };
-    const a = await stdio({ limits });
-    const b = await stdio({ limits });
+    const time = fakeTime();
+    const log = captureLog();
+    const a = await stdio({ limits, time, log });
+    const b = await stdio({ limits, time, log });
+    const other = await stdio({ limits, time }); // its own log: its own state
     expect(resultOf(await a.peer.callTool("echo", { text: "x" })).isError).toBeUndefined();
     expect(resultOf(await b.peer.callTool("echo", { text: "x" })).isError).toBe(true);
+    expect(resultOf(await other.peer.callTool("echo", { text: "x" })).isError).toBeUndefined();
   });
 });
 
@@ -589,4 +627,141 @@ test("installSeams on a stdio-style server with no usage wiring", async () => {
     client: { ua: null, mcpProtocol: null },
   });
   expect([...localRequestContext(LOCAL_CALLER(new Set())).request.headers]).toEqual([]);
+});
+
+describe("throws out of rootstock's own seam", () => {
+  const throwingLog = () =>
+    Object.assign(
+      () => {
+        throw new Error("log down");
+      },
+      { lines: [], names: () => [] },
+    ) as unknown as ReturnType<typeof captureLog>;
+
+  test("an aroundCall throw answers a generic error, never its message, recorded by errorClassOf", async () => {
+    const { peer, records } = await stdio({
+      hooks: {
+        aroundCall: async () => {
+          throw new RangeError("secret detail");
+        },
+      },
+    });
+    const res = await peer.callTool("echo", { text: "x" });
+    expect(res.error).toEqual({ code: -32603, message: "Internal error" });
+    expect(JSON.stringify(res)).not.toContain("secret detail");
+    expect(records.map((r) => [r.stage, r.ok, r.errorClass])).toEqual([
+      ["rejected", false, "RangeError"],
+    ]);
+  });
+
+  test("an aroundCall that rethrows the SDK's own error passes it through", async () => {
+    const { peer } = await stdio({
+      hooks: { aroundCall: async (_c, next) => next() },
+    });
+    expect((await peer.callTool("nope")).error).toEqual({
+      code: -32602,
+      message: "Tool nope not found",
+    });
+  });
+
+  test("a turnBudget.exhausted throw answers a generic error, recorded", async () => {
+    const caller: Caller = { name: "agent", kind: "oauth", scopes: new Set(["mcp:tools"]) };
+    const ctx = { ...localRequestContext(caller), delegated: { onBehalfOf: null, turnId: "t" } };
+    const { peer, records } = await stdio({
+      caller,
+      ctx,
+      limits: {
+        ...NO_LIMITS,
+        turnBudget: {
+          cap: 1,
+          warnAt: 0,
+          maxTurns: 10,
+          exhausted: () => {
+            throw new TypeError("wording broke");
+          },
+        },
+      },
+    });
+    await peer.callTool("echo", { text: "a" });
+    const res = await peer.callTool("echo", { text: "b" });
+    expect(res.error).toEqual({ code: -32603, message: "Internal error" });
+    expect(records.map((r) => [r.stage, r.errorClass])).toEqual([
+      ["handler", null],
+      ["rejected", "TypeError"],
+    ]);
+  });
+
+  test("a throwing log never changes an answer, and every sink still records", async () => {
+    const caller: Caller = { name: "agent", kind: "oauth", scopes: new Set(["mcp:tools"]) };
+    const ctx = { ...localRequestContext(caller), delegated: { onBehalfOf: null, turnId: "t" } };
+    const kept: CallRecord[] = [];
+    const usage = wiring([], {
+      sinks: [
+        {
+          record: () => {
+            throw new Error("sink down");
+          },
+          onRegister: () => {
+            throw new Error("sink down");
+          },
+        },
+        { record: (r) => kept.push(r) },
+      ],
+      price: () => {
+        throw new Error("no prices");
+      },
+    });
+    const { peer } = await stdio({
+      caller,
+      ctx,
+      usage,
+      log: throwingLog(),
+      limits: {
+        ...NO_LIMITS,
+        perTool: { echo: { capacity: 1, refillPerSecond: 1, maxKeys: 10 } },
+        turnBudget: { cap: 3, warnAt: 0, maxTurns: 10, exhausted: (n) => `spent ${n}` },
+      },
+      register: (server) =>
+        server.registerTool("spend", {}, async () => {
+          currentCall().meter({ model: "m", input: 1, output: 0 });
+          return { content: [{ type: "text", text: "ran" }] };
+        }),
+    });
+    expect(resultOf(await peer.callTool("spend")).content).toEqual([{ type: "text", text: "ran" }]);
+    expect(resultOf(await peer.callTool("echo", { text: "a" })).isError).toBeUndefined();
+    expect(resultOf(await peer.callTool("echo", { text: "b" })).isError).toBe(true); // rate limited
+    expect(resultOf(await peer.callTool("echo", { text: "c" })).content).toEqual([
+      { type: "text", text: '{"turnBudget":{"remaining":0,"exhausted":true},"message":"spent 3"}' },
+    ]);
+    expect(kept.map((r) => [r.tool, r.errorClass, r.costNote])).toEqual([
+      ["spend", null, "price_failed"],
+      ["echo", null, null],
+      ["echo", "RateLimited", null],
+      ["echo", "TurnBudgetExhausted", null],
+    ]);
+  });
+});
+
+test("installSeams on a server that already has tools throws ERR_ROOTSTOCK_SERVE_CONFIG", () => {
+  const server = new McpServer({ name: "t", version: "0" });
+  server.registerTool("echo", {}, async () => ({ content: [] }));
+  const caller = LOCAL_CALLER(new Set(["mcp:tools"]));
+  let caught: unknown;
+  try {
+    installSeams(server, {
+      profile: { unknownTool: "protocolError" },
+      caller,
+      toolScopes: SCOPES,
+      limits: NO_LIMITS,
+      usage: null,
+      ctx: localRequestContext(caller),
+      hooks: {},
+      clock: fakeTime(),
+      log: captureLog(),
+    });
+  } catch (err) {
+    caught = err;
+  }
+  expect((caught as { code?: string })?.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
+  expect(String(caught)).toMatch(/before the first registerTool/);
 });

@@ -10,11 +10,6 @@ import type { Clock, LogEvent } from "./types.ts";
 export interface RateLimiter {
   /** Spends one token for `key`; false means refuse. */
   allow(key: string): boolean;
-  /**
-   * Spends `n` tokens for `key` in one charge; false means refuse. A refusal
-   * spends the whole tokens the bucket held, as `n` single charges would.
-   */
-  allowN(key: string, n: number): boolean;
   /** True when `key` holds a whole token, spending nothing. */
   peek(key: string): boolean;
 }
@@ -70,6 +65,23 @@ export interface Limits {
  * of fresh keys still inserts).
  */
 export function createRateLimiter(o: BucketLimits & { clock: Clock }): RateLimiter {
+  const { allow, peek } = createBucketLimiter(o);
+  return Object.freeze({ allow, peek });
+}
+
+/** serve's own limiter: a RateLimiter plus the batch charge (not public, §5). */
+export interface BucketLimiter extends RateLimiter {
+  /** Keys held now (tests read it to see the prune bound). */
+  readonly size: number;
+  /**
+   * Spends `n` tokens for `key` in one charge; false means refuse. A refusal
+   * spends the whole tokens the bucket held, as `n` single charges would.
+   * `n` must be an integer >= 0.
+   */
+  allowN(key: string, n: number): boolean;
+}
+
+export function createBucketLimiter(o: BucketLimits & { clock: Clock }): BucketLimiter {
   for (const field of ["capacity", "refillPerSecond", "maxKeys"] as const) {
     if (!isPositiveNumber(o?.[field])) {
       throw configError("createRateLimiter", `${field} must be a finite number > 0`, o?.[field]);
@@ -97,6 +109,9 @@ export function createRateLimiter(o: BucketLimits & { clock: Clock }): RateLimit
     return b;
   };
   const spend = (key: string, n: number): boolean => {
+    if (!Number.isInteger(n) || n < 0) {
+      throw configError("allowN", "n must be an integer >= 0", n);
+    }
     const b = touch(key);
     if (b.tokens < n) {
       b.tokens -= Math.floor(b.tokens);
@@ -109,6 +124,9 @@ export function createRateLimiter(o: BucketLimits & { clock: Clock }): RateLimit
   return Object.freeze({
     allow: (key: string): boolean => spend(key, 1),
     allowN: spend,
+    get size() {
+      return buckets.size;
+    },
     peek(key: string): boolean {
       const b = buckets.get(key);
       return b === undefined ? capacity >= 1 : refilled(b, clock.now()) >= 1;

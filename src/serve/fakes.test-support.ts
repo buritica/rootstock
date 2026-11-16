@@ -68,3 +68,24 @@ export function captureLog(): LogEvent & {
 export async function flush(times = 5): Promise<void> {
   for (let i = 0; i < times; i++) await Promise.resolve();
 }
+
+/**
+ * Turns the event loop (one macrotask per round, no wall-clock wait) until
+ * `cond` holds; throws after `rounds` so a broken test fails instead of hanging.
+ */
+export async function until(cond: () => boolean, rounds = 200): Promise<void> {
+  for (let i = 0; i < rounds; i++) {
+    if (cond()) return;
+    await new Promise<void>((r) => setImmediate(r));
+  }
+  if (!cond()) throw new Error(`until: condition still false after ${rounds} rounds`);
+}
+
+/** A promise and the function that resolves it. */
+export function signal<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } {
+  let resolve: (v: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}

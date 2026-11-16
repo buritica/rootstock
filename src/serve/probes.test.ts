@@ -82,6 +82,47 @@ describe("cachedProbe", () => {
     expect(log.lines[0]?.[1]).toMatchObject({ probe: "x", errorClass: "TypeError" });
   });
 
+  test("a failure is cached like any verdict: no recompute inside the ttl, one after it", async () => {
+    const time = fakeTime();
+    const log = captureLog();
+    let calls = 0;
+    const probe = cachedProbe(
+      async () => {
+        calls++;
+        throw new TypeError("boom");
+      },
+      timing,
+      "x",
+      { clock: time, timers: time, log },
+    );
+    expect(await probe()).toBeUndefined();
+    expect(await probe()).toBeUndefined();
+    expect(calls).toBe(1);
+    time.advance(timing.cacheTtlMs);
+    expect(await probe()).toBeUndefined();
+    expect(calls).toBe(2);
+    expect(log.names()).toEqual(["serve.probe_failed", "serve.probe_failed"]);
+  });
+
+  test("a throwing logger never rejects the probe", async () => {
+    const time = fakeTime();
+    const probe = cachedProbe(
+      async () => {
+        throw new TypeError("boom");
+      },
+      timing,
+      "x",
+      {
+        clock: time,
+        timers: time,
+        log: () => {
+          throw new Error("log down");
+        },
+      },
+    );
+    expect(await probe()).toBeUndefined();
+  });
+
   test("refuses a negative timing", () => {
     const time = fakeTime();
     expect(() =>

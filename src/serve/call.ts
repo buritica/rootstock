@@ -14,7 +14,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type McpServer, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import { isRecord, safeHook } from "../internal/slice.ts";
-import { className, configError } from "./errors.ts";
+import { className, configError, safeLog } from "./errors.ts";
 import {
   type BucketLimits,
   createConcurrencyLimiter,
@@ -202,7 +202,11 @@ interface Runtime {
   rateLimited: (bucket: string, fields: Readonly<Record<string, unknown>>) => void;
 }
 
-const runtimes = new WeakMap<Limits, Runtime>();
+/** Per Limits object, one runtime per (toolScopes, clock, log) it was installed with. */
+const runtimes = new WeakMap<
+  Limits,
+  { toolScopes: ToolScopes; clock: Clock; log: LogEvent; rt: Runtime }[]
+>();
 const NO_LIMITS: Runtime = {
   perTool: new Map(),
   groups: new Map(),
@@ -212,8 +216,9 @@ const NO_LIMITS: Runtime = {
 
 /**
  * The bucket, group and budget state for `limits`, built once per Limits
- * object (so every per-request server that is handed the same object shares
- * it). Refuses a tool that `toolScopes` does not declare.
+ * object and deps (so every per-request server handed the same `limits`,
+ * `toolScopes`, `clock` and `log` shares it; other deps get their own state).
+ * Refuses a tool that `toolScopes` does not declare.
  */
 export function seamRuntime(
   limits: Limits | null,
@@ -222,8 +227,12 @@ export function seamRuntime(
   log: LogEvent,
 ): Runtime {
   if (limits === null) return NO_LIMITS;
-  const cached = runtimes.get(limits);
-  if (cached) return cached;
+  const installs = runtimes.get(limits) ?? [];
+  runtimes.set(limits, installs);
+  const cached = installs.find(
+    (i) => i.toolScopes === toolScopes && i.clock === clock && i.log === log,
+  );
+  if (cached) return cached.rt;
   const declared = (where: string, tool: string) => {
     if (!Object.hasOwn(toolScopes.tools, tool)) {
       throw configError(
@@ -274,9 +283,9 @@ export function seamRuntime(
     perTool,
     groups,
     turn,
-    rateLimited: rateLimitedLog(log, clock, limits.logIntervalMs),
+    rateLimited: rateLimitedLog(safeLog(log), clock, limits.logIntervalMs),
   };
-  runtimes.set(limits, rt);
+  installs.push({ toolScopes, clock, log, rt });
   return rt;
 }
 
@@ -317,16 +326,33 @@ function errorMessage(err: unknown): string | null {
 }
 
 /**
- * Installs both seams. Call it before the first `registerTool`. `extra` is
- * the per-request deadline flag the service owns; a stdio server leaves it out.
+ * Installs both seams. Call it before the first `registerTool`: a server that
+ * already has a `tools/call` handler throws ERR_ROOTSTOCK_SERVE_CONFIG.
  */
-export function installSeams(
+export function installSeams(server: McpServer, o: InstallSeamsOptions): void {
+  installSeamsWith(server, o, { timedOut: () => false });
+}
+
+/** The generic answer to a throw out of rootstock's own seam: never its message. */
+const seamFault = () => new ProtocolError(ProtocolErrorCode.InternalError, "Internal error");
+
+/** installSeams plus the per-request deadline flag the service owns (internal). */
+export function installSeamsWith(
   server: McpServer,
   o: InstallSeamsOptions,
-  extra: { timedOut: () => boolean } = { timedOut: () => false },
+  extra: { timedOut: () => boolean },
 ): void {
-  const { caller, toolScopes, usage, ctx, hooks, clock, log } = o;
-  const rt = seamRuntime(o.limits, toolScopes, clock, log);
+  const { caller, toolScopes, usage, ctx, hooks, clock } = o;
+  try {
+    server.server.assertCanSetRequestHandler("tools/call");
+  } catch {
+    throw configError(
+      "installSeams",
+      "the server already has tools (or a tools/call handler); install the seams before the first registerTool",
+    );
+  }
+  const log = safeLog(o.log);
+  const rt = seamRuntime(o.limits, toolScopes, clock, o.log);
   const sinks = usage?.sinks ?? [];
 
   const classOf = (err: unknown): string => {
@@ -434,7 +460,30 @@ export function installSeams(
       estimated: false,
     };
     const handle = makeHandle(state, usage, caller);
+    // The SDK handler's own throw (a ProtocolError it means the client to
+    // see) passes through; anything else rootstock's seam throws, aroundCall
+    // and the turn budget included, is recorded and answered generically.
+    let sdkThrow: { err: unknown } | undefined;
+    const run = async () => {
+      try {
+        return await sdkHandler(request, reqCtx);
+      } catch (err) {
+        sdkThrow = { err };
+        throw err;
+      }
+    };
     return calls.run({ state, handle }, async () => {
+      try {
+        return await dispatch();
+      } catch (err) {
+        if (sdkThrow !== undefined && err === sdkThrow.err) throw err;
+        state.thrown ??= { err };
+        record(state.ran ? "handler" : "rejected", undefined);
+        throw seamFault();
+      }
+    });
+
+    async function dispatch(): Promise<unknown> {
       const turnId = ctx.delegated.turnId;
       if (rt.turn && turnId !== null) {
         const charge = rt.turn.budget.forTurn(turnId)();
@@ -447,11 +496,12 @@ export function installSeams(
           return result;
         }
       }
-      const run = () => sdkHandler(request, reqCtx);
       let result: unknown;
       try {
         result = hooks.aroundCall ? await hooks.aroundCall(handle, run) : await run();
       } catch (err) {
+        // Not the SDK's: the outer catch records it.
+        if (sdkThrow === undefined || err !== sdkThrow.err) throw err;
         if (
           !state.ran &&
           err instanceof ProtocolError &&
@@ -482,7 +532,7 @@ export function installSeams(
         record("handler", result);
       }
       return result;
-    });
+    }
 
     // The row this call hands every sink; closes over the call's state.
     function record(stage: CallStage, result: unknown, fixedClass?: string): void {

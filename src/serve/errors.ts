@@ -1,4 +1,5 @@
 import { q } from "../internal/slice.ts";
+import type { LogEvent } from "./types.ts";
 
 const NO_VALUE: unique symbol = Symbol("no value");
 
@@ -30,4 +31,15 @@ export function className(err: unknown): string {
   } catch {
     return "unreadable error";
   }
+}
+
+/** `log`, made safe: a logger that throws never changes what its caller does. */
+export function safeLog(log: LogEvent): LogEvent {
+  return (event, fields) => {
+    try {
+      log(event, fields);
+    } catch {
+      // Dropped: the line is lost, the request is not.
+    }
+  };
 }

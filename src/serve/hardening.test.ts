@@ -53,7 +53,7 @@ describe("sourceKeyFor", () => {
   const req = (h: Record<string, string>) =>
     new Request("http://app.example.test/mcp", { headers: h });
   test("rightmost entry of the header, trimmed", () => {
-    expect(sourceKeyFor(req({ "x-ff": "1.1.1.1, 192.0.2.7 " }), {}, "x-ff")).toBe("192.0.2.7");
+    expect(sourceKeyFor(req({ "x-ff": "203.0.113.9, 192.0.2.7 " }), {}, "x-ff")).toBe("192.0.2.7");
   });
   test("falls back to the socket address, then unknown", () => {
     expect(sourceKeyFor(req({}), { remoteAddress: "198.51.100.2" }, "x-ff")).toBe("198.51.100.2");

@@ -17,11 +17,25 @@ type HostCheck = Exclude<ServeProfile["hostCheck"], false>;
 export type HostGuard = (req: Request) => Response | undefined;
 
 export function hostGuard(hc: HostCheck): HostGuard {
-  if (hc.hosts.match === "exact" && hc.refusal === "sdk-403") {
-    throw configError(
-      "createMcpService",
-      'hostCheck.refusal "sdk-403" carries the SDK\'s hostname texts, so it needs hosts.match "hostname"',
-    );
+  if (hc.hosts.match === "exact") {
+    // Exact matching compares raw `host:port` values, so the loopback
+    // hostnames (no port) would refuse every request.
+    const bad =
+      hc.refusal === "sdk-403"
+        ? 'refusal "sdk-403" carries the SDK\'s hostname texts'
+        : hc.hosts.whenEmpty === "loopback-only"
+          ? 'hosts.whenEmpty "loopback-only" lists bare loopback hostnames'
+          : hc.hosts.loopback === "union"
+            ? 'hosts.loopback "union" adds bare loopback hostnames'
+            : hc.origins.whenEmpty === "same-as-hosts"
+              ? 'origins.whenEmpty "same-as-hosts" compares origins to host values'
+              : undefined;
+    if (bad !== undefined) {
+      throw configError(
+        "createMcpService",
+        `hostCheck: ${bad}, so it needs hosts.match "hostname"`,
+      );
+    }
   }
   const loopback = localhostAllowedHostnames();
   // null: no host check at all. Built once; the SDK validators take a mutable array.
@@ -55,8 +69,9 @@ export function hostGuard(hc: HostCheck): HostGuard {
     const host = req.headers.get("host");
     if (hosts !== null && (host === null || !hosts.includes(host)))
       return notFound("text-not-found");
+    // An absent or empty Origin passes (§3.4), as under the SDK's validator.
     const origin = req.headers.get("origin");
-    if (origin !== null && origins !== null && !origins.includes(origin)) {
+    if (origin !== null && origin !== "" && origins !== null && !origins.includes(origin)) {
       return notFound("text-not-found");
     }
     return undefined;

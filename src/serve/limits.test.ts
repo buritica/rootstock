@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  createBucketLimiter,
   createConcurrencyLimiter,
   createRateLimiter,
   createTurnBudget,
@@ -66,20 +67,34 @@ describe("createRateLimiter", () => {
     expect(rl.allow("a")).toBe(true);
   });
 
-  test("prunes full buckets once past maxKeys", () => {
+  test("a spray of keys stays at maxKeys once the old buckets are full again", () => {
     const clock = fakeClock();
-    const rl = createRateLimiter({ capacity: 1, refillPerSecond: 1, maxKeys: 2, clock });
+    const rl = createBucketLimiter({ capacity: 1, refillPerSecond: 1, maxKeys: 5, clock });
+    for (let i = 0; i < 100; i++) {
+      rl.allow(`k${i}`);
+      clock.advance(1_000); // every earlier bucket is full again
+      expect(rl.size).toBeLessThanOrEqual(5);
+    }
+    // A spray inside one refill window cannot be pruned (the bound is a
+    // trigger, not a cap): the five full buckets go, then all ten fresh keys stay.
+    for (let i = 0; i < 10; i++) rl.allow(`burst${i}`);
+    expect(rl.size).toBe(10);
+  });
+
+  test("prunes from the least recently touched end and stops at the first bucket not yet full", () => {
+    const clock = fakeClock();
+    const rl = createBucketLimiter({ capacity: 1, refillPerSecond: 1, maxKeys: 2, clock });
     rl.allow("a");
-    rl.allow("b");
     clock.advance(1_000);
-    // a and b are full again, so both are dropped before c is added; a then starts full
-    rl.allow("c");
-    expect(rl.allow("a")).toBe(true);
+    rl.allow("b"); // a is full again, b is empty; order a, b
+    rl.allow("c"); // prunes a, stops at b
+    expect(rl.size).toBe(2);
+    expect(rl.allow("b")).toBe(false); // b kept its empty bucket
   });
 
   test("allowN spends n at once; a refusal spends the whole tokens, as n single charges would", () => {
     const clock = fakeClock();
-    const rl = createRateLimiter({ capacity: 3, refillPerSecond: 1, maxKeys: 10, clock });
+    const rl = createBucketLimiter({ capacity: 3, refillPerSecond: 1, maxKeys: 10, clock });
     expect(rl.allowN("a", 0)).toBe(true);
     expect(rl.allowN("a", 2)).toBe(true); // 1 left
     clock.advance(500); // 1.5
@@ -89,15 +104,27 @@ describe("createRateLimiter", () => {
     expect(rl.allow("a")).toBe(true);
   });
 
-  test("prunes from the least recently touched end, stopping at the first bucket not yet full", () => {
-    const clock = fakeClock();
-    const rl = createRateLimiter({ capacity: 1, refillPerSecond: 1, maxKeys: 2, clock });
-    rl.allow("a");
-    clock.advance(1_000);
-    rl.allow("b"); // a is full again, b is empty; order a, b
-    rl.allow("c"); // prunes a, stops at b
-    expect(rl.allow("b")).toBe(false);
-    expect(rl.allow("a")).toBe(true);
+  test("allowN refuses NaN, negative and fractional counts", () => {
+    const rl = createBucketLimiter({
+      capacity: 3,
+      refillPerSecond: 1,
+      maxKeys: 10,
+      clock: fakeClock(),
+    });
+    for (const n of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => rl.allowN("a", n)).toThrow(/n must be an integer >= 0/);
+    }
+    expect(rl.allowN("a", 3)).toBe(true); // nothing was spent by the refusals
+  });
+
+  test("the public limiter is allow and peek only", () => {
+    const rl = createRateLimiter({
+      capacity: 1,
+      refillPerSecond: 1,
+      maxKeys: 1,
+      clock: fakeClock(),
+    });
+    expect(Object.keys(rl).sort()).toEqual(["allow", "peek"]);
   });
 
   for (const [field, bad] of [

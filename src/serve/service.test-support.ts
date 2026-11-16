@@ -9,7 +9,7 @@ import * as z from "zod/v4";
 import { currentCall } from "./call.ts";
 import { captureLog, fakeTime } from "./fakes.test-support.ts";
 import type { Limits } from "./limits.ts";
-import { type AuthLayer, createMcpService, type McpServiceOptions } from "./service.ts";
+import { createMcpService, type McpServiceOptions } from "./service.ts";
 import {
   type CallRecord,
   type CallSink,
@@ -23,10 +23,15 @@ export const ORIGIN = "http://app.example.test";
 export const TOOL_SCOPES = defineToolScopes({
   id: "test",
   tools: { echo: "mcp:tools", slow: "mcp:tools", boom: "mcp:tools", spend: "mcp:tools" },
-  implies: { "mcp:tools": ["mcp:tools"], extra: ["extra", "mcp:tools"] },
+  implies: { "mcp:tools": ["mcp:tools"], profile: ["profile", "mcp:tools"] },
 });
 
-/** Shaped like a JSON transport consumer with buckets, a deadline and empty bodies. */
+/**
+ * Stands in for §9's transport (JSON) column with GET 405-first, a deadline,
+ * delegated headers, empty bodies and renamed log lines. Deviations from §9:
+ * deadline 1,000 (not 30,000) so tests run fast; delegated header names and
+ * shapes are synthetic; clientIpHeader is `x-client-ip`; limits are per test.
+ */
 export const TRANSPORT_EMPTY: ServeProfile = {
   id: "test.transport-empty",
   mcpPath: "/mcp",
@@ -58,7 +63,13 @@ export const TRANSPORT_EMPTY: ServeProfile = {
   shutdown: { drainMs: 200, forceMs: 50, poolEndTimeoutS: 1, flushMs: 50 },
 };
 
-/** Shaped like a JSON transport consumer with text bodies and an exact host list. */
+/**
+ * Stands in for §9's transport (JSON) column with GET auth-then-405, exact
+ * host matching and text bodies. Deviations from §9: bodyLimit 4,096 (not
+ * 4,194,304) so a 413 is cheap to provoke; host and origin lists are
+ * synthetic; clientIpHeader is `x-client-ip` (not cf-connecting-ip); limits
+ * are per test.
+ */
 export const TRANSPORT_TEXT: ServeProfile = {
   ...TRANSPORT_EMPTY,
   id: "test.transport-text",
@@ -86,7 +97,15 @@ export const TRANSPORT_TEXT: ServeProfile = {
   logNames: {},
 };
 
-/** Shaped like a handler-entry consumer with per-kind caps, two faces and the SDK's 403s. */
+/**
+ * Stands in for §9's handler-entry column: stateless legacy, passUnknown,
+ * hostname matching with the SDK's 403s on all but the public auth face,
+ * JSON bodies. Deviations from §9: bodyLimit oauth/none 2,048 and
+ * bearer/local 8,192 (not 4,194,304 and 9,437,184); authPrefixes keep the
+ * transport columns' prefix lists (§9's exact `/api/auth` route is not
+ * expressible with prefixes); clientIpHeader null (not cf-connecting-ip);
+ * logNames identity (not the consumer's texts); limits are per test.
+ */
 export const HANDLER_JSON: ServeProfile = {
   ...TRANSPORT_EMPTY,
   id: "test.handler",
@@ -131,10 +150,14 @@ export const noLimits = (): Limits => ({
 
 /**
  * Bearer tokens: `good:<sub>` → next with that sub, `nosub` → next with no
- * sub, `jwks` / `nojwks` → the two JWKS throws, `throw` → a TypeError, `deny`
- * → a 403; no token → a 401 challenge.
+ * sub, `jwks` / `nojwks` → the two JWKS throws, `jwksnet` → Better Auth's
+ * network-error text, `throw` → a TypeError, `deny` → a 403; no token → a
+ * 401 challenge.
  */
-export function fakeAuth(): AuthLayer & { handled: string[]; idled: number } {
+export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
+  handled: string[];
+  idled: number;
+} {
   const handled: string[] = [];
   const layer = {
     handled,
@@ -164,11 +187,10 @@ export function fakeAuth(): AuthLayer & { handled: string[]; idled: number } {
       if (token === "nosub") return next(req, { azp: "client" });
       if (token === "jwks") throw new Error("Jwks failed: fetch refused");
       if (token === "nojwks") throw new Error("No jwks found");
+      if (token === "jwksnet") throw new Error("JWKS fetch failed");
       if (token === "deny") return new Response(null, { status: 403 });
       throw new TypeError("verifier broke");
     },
-    async assertStoreReady() {},
-    wrapNodeAuthResponse() {},
     async idle() {
       layer.idled++;
     },

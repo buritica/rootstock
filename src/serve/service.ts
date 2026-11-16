@@ -14,17 +14,23 @@ import {
 } from "@modelcontextprotocol/server";
 import * as bodies from "./bodies.ts";
 import {
-  installSeams,
+  installSeamsWith,
   LOCAL_CALLER,
   type RequestContext,
   type ServeHooks,
   seamRuntime,
 } from "./call.ts";
 import { raceDeadline } from "./deadline.ts";
-import { className, configError, isNonNegativeNumber, isPositiveInteger } from "./errors.ts";
+import {
+  className,
+  configError,
+  isNonNegativeNumber,
+  isPositiveInteger,
+  safeLog,
+} from "./errors.ts";
 import { sourceKeyFor } from "./hardening.ts";
 import { hostGuard } from "./host-check.ts";
-import { createRateLimiter, type Limits, type RateLimiter } from "./limits.ts";
+import { type BucketLimiter, createBucketLimiter, type Limits } from "./limits.ts";
 import {
   type Caller,
   type Clock,
@@ -40,10 +46,11 @@ import {
 } from "./types.ts";
 
 /**
- * The part of `serve/auth`'s AuthLayer that serve uses, declared here
- * because serve may not import serve/auth (contract §3.1).
+ * The part of `serve/auth`'s AuthLayer that serve calls, declared here
+ * because serve may not import serve/auth (contract §3.1). Not exported under
+ * that name; a test pins serve/auth's AuthLayer assignable to it.
  */
-export interface AuthLayer {
+interface ServeAuthLayer {
   /** Better Auth's routes, with the layer's own headers and 429 log. */
   handle(req: Request): Promise<Response>;
   page(path: "/login" | "/consent", url: URL): Response;
@@ -53,16 +60,6 @@ export interface AuthLayer {
     req: Request,
     next: (req: Request, claims: Readonly<Record<string, unknown>>) => Promise<Response>,
   ): Promise<Response>;
-  assertStoreReady(): Promise<void>;
-  wrapNodeAuthResponse(
-    res: {
-      setHeader(n: string, v: string): void;
-      on(e: "finish", f: () => void): void;
-      statusCode: number;
-    },
-    path: string,
-    client: string,
-  ): void;
   /** Resolves when no send the layer scheduled is pending. */
   idle(): Promise<void>;
 }
@@ -71,15 +68,19 @@ export interface McpServiceOptions {
   profile: ServeProfile;
   serverInfo: { name: string; version: string };
   registerTools(server: McpServer, ctx: RequestContext): void | Promise<void>;
-  auth?: AuthLayer;
-  /** Static tokens: a Caller stops auth here, a Response is returned, undefined falls through. */
+  auth?: ServeAuthLayer;
+  /**
+   * Static tokens: a Caller stops auth here, a Response is returned, undefined
+   * falls through. A returned Response spends no refusal token, so answer a
+   * wrong token with undefined (the bearer 401, charged) unless that is meant.
+   */
   credentials?: (req: Request) => Caller | Response | undefined;
   /** Which credentials this request may present; `bearer: false` is a public (OAuth-only) face. */
   acceptCredentials?: (
     req: Request,
     info: { remoteAddress?: string },
   ) => { bearer: boolean; oauth: boolean };
-  /** Scopes added to `oauthScopes`; a throw falls back to `oauthScopes`. */
+  /** Scopes added to `oauthScopes`; a throw, or an answer that is not a string array, falls back to `oauthScopes`. */
   resolveScopes?: (claims: Readonly<Record<string, unknown>>) => Promise<readonly string[]>;
   toolScopes: ToolScopes;
   limits: Limits;
@@ -88,6 +89,11 @@ export interface McpServiceOptions {
   clock: Clock;
   timers: Timers;
   randomId: RandomId;
+  /**
+   * Every line the service writes. Failure lines carry the raw error as
+   * `error: err` beside `errorClass`; the logger decides what of it to keep.
+   * A throwing logger loses its line, never the request.
+   */
   log: LogEvent;
 }
 
@@ -193,6 +199,24 @@ function validate(o: McpServiceOptions): void {
       );
     }
   }
+  if (p.delegated !== false) {
+    for (const which of ["onBehalfOf", "turnId"] as const) {
+      const shape = p.delegated[which].shape;
+      // A g or y flag makes test() stateful; an unanchored shape matches a substring.
+      if (
+        !(shape instanceof RegExp) ||
+        /[gy]/.test(shape.flags) ||
+        !shape.source.startsWith("^") ||
+        !shape.source.endsWith("$")
+      ) {
+        throw configError(
+          "createMcpService",
+          `profile.delegated.${which}.shape must be anchored ^…$ with no g or y flag`,
+          String(shape),
+        );
+      }
+    }
+  }
   if (
     p.hostCheck !== false &&
     p.hostCheck.appliesTo === "all-but-public-auth" &&
@@ -205,10 +229,14 @@ function validate(o: McpServiceOptions): void {
   }
 }
 
-/** The per-request state the handler entry's factory reads. */
+/** The per-request state the entry and the handler entry's factory read. */
 interface Exchange {
   ctx: RequestContext;
   timedOut: () => boolean;
+  /** The per-request server, once built; closed when the deadline expires. */
+  server: McpServer | undefined;
+  /** The first error the handler entry reported for this request (factory throws included). */
+  failure: { err: unknown } | undefined;
 }
 
 /** A refusal the entry would make itself, with the JSON-RPC message its log line carries. */
@@ -232,13 +260,15 @@ interface Entry {
 export function createMcpService(o: McpServiceOptions): McpService {
   validate(o);
   const { profile, clock, timers, toolScopes, hooks } = o;
-  const log: LogEvent = (event, fields) =>
+  // Wrapped once: a throwing logger never changes an answer.
+  const log: LogEvent = safeLog((event, fields) =>
     o.log(
       Object.hasOwn(profile.logNames, event) ? (profile.logNames[event] ?? event) : event,
       fields,
-    );
-  const limiter = (b: Limits["refusal"]): RateLimiter | null =>
-    b === null ? null : createRateLimiter({ ...b, clock });
+    ),
+  );
+  const limiter = (b: Limits["refusal"]): BucketLimiter | null =>
+    b === null ? null : createBucketLimiter({ ...b, clock });
   const refusal = limiter(o.limits.refusal);
   const serving = limiter(o.limits.serving);
   // Built now so a limits tool toolScopes lacks is refused at build; its
@@ -252,6 +282,11 @@ export function createMcpService(o: McpServiceOptions): McpService {
     profile.delegated === false
       ? null
       : { ...profile.delegated, clients: new Set(profile.delegated.clients) };
+  if (o.auth === undefined && o.credentials === undefined && !profile.requireCaller) {
+    // Every HTTP caller is the local caller with every scope: right for a
+    // loopback dev server, wrong anywhere else, so it is said once at boot.
+    log("serve.unauthenticated_http", { mcpPath: profile.mcpPath });
+  }
   const hc = profile.hostCheck;
   const host =
     hc === false
@@ -276,7 +311,8 @@ export function createMcpService(o: McpServiceOptions): McpService {
 
   const buildServer = async (x: Exchange): Promise<McpServer> => {
     const server = new McpServer(o.serverInfo);
-    installSeams(
+    x.server = server;
+    installSeamsWith(
       server,
       {
         profile,
@@ -318,21 +354,37 @@ export function createMcpService(o: McpServiceOptions): McpService {
 
     if (kind === "handler") {
       const limits = Object.values(profile.bodyLimit).filter((v): v is number => v !== null);
+      // A factory throw, or any other fault the entry reports, is kept on the
+      // exchange: the entry's own 500 then becomes serve's (bodies.internal
+      // and serve.request_failed), on the legacy leg as on the modern one.
+      const report = (err: unknown) => {
+        const x = exchange.getStore();
+        if (x !== undefined) x.failure ??= { err };
+      };
       const handler = createMcpHandler(
         async () => {
           const x = exchange.getStore();
           if (x === undefined)
             throw new Error("rootstock serve: the MCP handler ran outside a request");
-          return buildServer(x);
+          try {
+            return await buildServer(x);
+          } catch (err) {
+            report(err);
+            throw err;
+          }
         },
         {
           legacy: "stateless",
+          onerror: report,
           ...(limits.length > 0 ? { maxRequestBodySize: Math.max(...limits) } : {}),
         },
       );
       return {
-        run: (req, x, parsedBody, authInfo) =>
-          exchange.run(x, () => handler.fetch(req, optsOf(parsedBody, authInfo))),
+        async run(req, x, parsedBody, authInfo) {
+          const res = await exchange.run(x, () => handler.fetch(req, optsOf(parsedBody, authInfo)));
+          if (res.status === 500 && x.failure !== undefined) throw x.failure.err;
+          return res;
+        },
         preBody: contentType,
         // An unparsable or 2025-era body goes to the legacy leg, whose
         // transport checks Accept before anything else.
@@ -380,7 +432,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
     req: Request,
     sourceKey: string,
     pathname: string,
-    auth: AuthLayer,
+    auth: ServeAuthLayer,
   ) => {
     const res = await auth.handle(req);
     log("serve.auth_request", { method: req.method, sourceKey, pathname, status: res.status });
@@ -418,11 +470,14 @@ export function createMcpService(o: McpServiceOptions): McpService {
     const read = (spec: { header: string; shape: RegExp }): string | null => {
       const value = req.headers.get(spec.header);
       if (value === null) return null;
-      const reason = !d.clients.has(caller.name)
-        ? "not-delegating-client"
-        : !spec.shape.test(value)
-          ? "malformed"
-          : null;
+      // Delegated clients are OAuth clients (their sub): a static token or a
+      // local caller with the same name is not one.
+      const reason =
+        caller.kind !== "oauth" || !d.clients.has(caller.name)
+          ? "not-delegating-client"
+          : !spec.shape.test(value)
+            ? "malformed"
+            : null;
       if (reason === null) return value;
       log("serve.delegated_header_ignored", { caller: caller.name, header: spec.header, reason });
       return null;
@@ -441,6 +496,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
     const method = req.method;
     const started = clock.monotonic();
     let callerName: string | undefined;
+    const passedAuth = new WeakSet<Response>();
     // Set by the first serve.request or serve.request_failed line; one per exchange.
     let logged = false;
     const common = (status: number) => ({
@@ -520,7 +576,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
     }
 
     // 5.4–5.6
-    async function viaOAuth(auth: AuthLayer): Promise<Response> {
+    async function viaOAuth(auth: ServeAuthLayer): Promise<Response> {
       let res: Response;
       try {
         res = await auth.verify(req, async (verified, claims) => {
@@ -531,7 +587,10 @@ export function createMcpService(o: McpServiceOptions): McpService {
           let extra: readonly string[] = [];
           if (o.resolveScopes !== undefined) {
             try {
-              extra = await o.resolveScopes(claims);
+              const got: unknown = await o.resolveScopes(claims);
+              if (Array.isArray(got) && got.every((v) => typeof v === "string")) extra = got;
+              else
+                log("serve.scope_resolve_failed", { caller: sub, errorClass: "NotAStringArray" });
             } catch (err) {
               log("serve.scope_resolve_failed", { caller: sub, errorClass: className(err) });
             }
@@ -553,35 +612,43 @@ export function createMcpService(o: McpServiceOptions): McpService {
           ? bodies.jwksFailure(profile.bodies.jwksFailure)
           : bodies.internal(profile.bodies.internal);
       }
-      if (res.status === 401 || res.status === 403) {
+      // A 401/403 from past authentication (the SDK's scope 403, an
+      // aroundRequest answer) is the request's, not an auth refusal.
+      if ((res.status === 401 || res.status === 403) && !passedAuth.has(res)) {
         chargeRefusal("serve.unauthorized", { status: res.status });
       }
       return res;
     }
 
-    // 5.7 onward; never throws.
+    // 5.7 onward; never throws, and marks what it answers as authenticated.
     async function proceed(r: Request, caller: Caller): Promise<Response> {
+      const res = await proceedUnmarked(r, caller);
+      passedAuth.add(res);
+      return res;
+    }
+
+    async function proceedUnmarked(r: Request, caller: Caller): Promise<Response> {
       callerName = caller.name;
-      if (serving !== null && !serving.allow(caller.name)) {
-        rateLimited("serving", { method, sourceKey, caller: caller.name });
-        return bodies.tooManyRequests();
-      }
-      const ctx: RequestContext = Object.freeze({
-        caller,
-        requestId: o.randomId(),
-        request: { headers: r.headers, url },
-        delegated: delegatedOf(r, caller),
-        client: clientOf(r.headers),
-      });
-      const fields = (): Readonly<Record<string, unknown>> => {
-        try {
-          return hooks.requestFields?.(ctx) ?? {};
-        } catch {
-          return {};
-        }
-      };
-      const run = () => afterAuth(r, ctx, fields);
       try {
+        if (serving !== null && !serving.allow(caller.name)) {
+          rateLimited("serving", { method, sourceKey, caller: caller.name });
+          return bodies.tooManyRequests();
+        }
+        const ctx: RequestContext = Object.freeze({
+          caller,
+          requestId: o.randomId(),
+          request: { headers: r.headers, url },
+          delegated: delegatedOf(r, caller),
+          client: clientOf(r.headers),
+        });
+        const fields = (): Readonly<Record<string, unknown>> => {
+          try {
+            return hooks.requestFields?.(ctx) ?? {};
+          } catch {
+            return {};
+          }
+        };
+        const run = () => afterAuth(r, ctx, fields);
         return await (hooks.aroundRequest ? hooks.aroundRequest(r, run) : run());
       } catch (err) {
         return fail("threw", {}, { errorClass: className(err), error: err });
@@ -596,7 +663,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
       const caller = ctx.caller;
       const authInfo: AuthInfo = { token: "", clientId: caller.name, scopes: [...caller.scopes] };
       let timedOut = false;
-      const x: Exchange = { ctx, timedOut: () => timedOut };
+      const x: Exchange = { ctx, timedOut: () => timedOut, server: undefined, failure: undefined };
       if (answer === "auth-then-405") return finish(bodies.methodNotAllowed(), {}, NO_REJECTION);
       if (answer === "auth-then-entry") {
         return finish(await entry.run(r, x, undefined, authInfo), fields());
@@ -631,17 +698,19 @@ export function createMcpService(o: McpServiceOptions): McpService {
         rateLimited("serving", { method, sourceKey, caller: caller.name, batch: parsed.length });
         return bodies.tooManyRequests();
       }
-      // 5.9–5.10. A dispatch that loses the race runs on; raceDeadline keeps
-      // its rejection handled.
+      // 5.9–5.10. On expiry the per-request server is closed, but a tool
+      // handler cannot be stopped: one that never returns keeps its
+      // concurrency slot until it does. raceDeadline keeps the losing
+      // dispatch's rejection handled.
       const dispatch = entry.run(r, x, parsed, authInfo);
       let res: Response;
       if (profile.deadlineMs === null) res = await dispatch;
       else {
-        const won = await raceDeadline(timers, profile.deadlineMs, dispatch);
-        if (won === "timeout") {
+        const won = await raceDeadline(timers, profile.deadlineMs, dispatch, () => {
           timedOut = true;
-          return fail("deadline", fields());
-        }
+          x.server?.close().catch(() => {});
+        });
+        if (won === "timeout") return fail("deadline", fields());
         res = won.value;
       }
       // 5.11
@@ -710,19 +779,35 @@ export function createMcpService(o: McpServiceOptions): McpService {
       }
       await bounded(async () => server.stop(true), s.forceMs);
       if (entry.close !== null) await bounded(entry.close, s.forceMs);
-      const flushed = await bounded(
-        () => Promise.all([...(o.usage?.sinks ?? []).map((sink) => sink.idle?.()), o.auth?.idle()]),
-        s.flushMs,
-      );
+      // allSettled: one sink that rejects at once must not end the wait (and
+      // close the pool) under the others. Flushed means every one fulfilled.
+      let flushed = false;
+      try {
+        const settled = await raceDeadline(
+          timers,
+          s.flushMs,
+          Promise.allSettled([
+            ...(o.usage?.sinks ?? []).map((sink) => Promise.resolve().then(() => sink.idle?.())),
+            Promise.resolve().then(() => o.auth?.idle()),
+          ]),
+        );
+        flushed = settled !== "timeout" && settled.value.every((r) => r.status === "fulfilled");
+      } catch {
+        // flushed stays false.
+      }
       let poolClosed = false;
       let poolReason = "none";
       let poolMs = 0;
       if (endPool !== undefined) {
         const at = clock.monotonic();
         try {
-          await endPool(s.poolEndTimeoutS);
+          const ended = await raceDeadline(
+            timers,
+            s.poolEndTimeoutS * 1000,
+            Promise.resolve().then(() => endPool(s.poolEndTimeoutS)),
+          );
           poolMs = Math.round(clock.monotonic() - at);
-          poolClosed = poolMs < s.poolEndTimeoutS * 1000;
+          poolClosed = ended !== "timeout";
           poolReason = poolClosed ? "clean" : "timeout";
         } catch {
           poolReason = "threw";

@@ -40,7 +40,6 @@ export {
   readiness,
 } from "./probes.ts";
 export {
-  type AuthLayer,
   createMcpService,
   type McpService,
   type McpServiceOptions,

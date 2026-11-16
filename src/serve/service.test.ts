@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import { currentCall } from "./call.ts";
-import { flush } from "./fakes.test-support.ts";
+import { type FakeTime, signal, until } from "./fakes.test-support.ts";
 import type { Limits } from "./limits.ts";
 import {
   CALL_HEADERS,
@@ -21,7 +21,7 @@ import {
   TRANSPORT_TEXT,
 } from "./service.test-support.ts";
 import type { McpServiceOptions } from "./service.ts";
-import type { Caller, ServeProfile } from "./types.ts";
+import type { Caller, CallSink, ServeProfile, UsageWiring } from "./types.ts";
 
 const HOST = { host: "app.example.test" };
 const both = { bearer: true, oauth: true };
@@ -404,7 +404,7 @@ describe("step 5.2–5.7: credentials", () => {
       seen.push([...ctx.caller.scopes].sort());
       registerSynthetic(server);
     };
-    const ok = withAuth(TRANSPORT_EMPTY, { registerTools, resolveScopes: async () => ["extra"] });
+    const ok = withAuth(TRANSPORT_EMPTY, { registerTools, resolveScopes: async () => ["profile"] });
     await ok.service.handle(mcpRequest(call("echo", { text: "x" }), { token: "good:u" }), {});
     const bad = withAuth(TRANSPORT_EMPTY, {
       registerTools,
@@ -417,7 +417,7 @@ describe("step 5.2–5.7: credentials", () => {
       {},
     );
     expect(res?.status).toBe(200);
-    expect(seen).toEqual([["extra", "mcp:tools"], ["mcp:tools"]]);
+    expect(seen).toEqual([["mcp:tools", "profile"], ["mcp:tools"]]);
     expect(bad.log.lines.find(([e]) => e === "serve.scope_resolve_failed")?.[1]).toEqual({
       caller: "u",
       errorClass: "SyntaxError",
@@ -444,10 +444,15 @@ describe("step 5.2–5.7: credentials", () => {
     ).toMatchObject({
       result: { content: [{ text: "x" }] },
     });
-    expect(callers.map((c) => [c.name, c.kind, [...c.scopes]])).toEqual([
+    expect(callers.map((c) => [c.name, c.kind, [...c.scopes].sort()])).toEqual([
       ["none", "none", []],
-      ["local", "local", ["extra", "mcp:tools"]],
+      ["local", "local", ["mcp:tools", "profile"]],
     ]);
+    // Said once, at build: every HTTP caller is the local caller with every scope.
+    expect(open.log.lines.filter(([e]) => e === "serve.unauthenticated_http")).toEqual([
+      ["serve.unauthenticated_http", { mcpPath: "/mcp" }],
+    ]);
+    expect(strict.log.names()).not.toContain("serve.unauthenticated_http");
   });
 
   test("5.7: the serving bucket by caller name", async () => {
@@ -660,7 +665,15 @@ describe("step 5.8: batch charge order", () => {
       limits: limits({ serving: bucket(3) }),
     });
     const batch = Array.from({ length: 10 }, (_, i) => call("echo", { text: `${i}` }, i + 1));
-    expect((await service.handle(mcpRequest(batch, { token: "good:u" }), {}))?.status).toBe(429);
+    const res = await service.handle(mcpRequest(batch, { token: "good:u" }), {});
+    expect(await snapshot(res)).toEqual({
+      status: 429,
+      headers: [
+        ["cache-control", "no-store"],
+        ["retry-after", "10"],
+      ],
+      body: "",
+    });
     expect(records).toEqual([]);
   });
 
@@ -681,13 +694,16 @@ describe("step 5.8: batch charge order", () => {
 
 describe("step 5.9: deadline", () => {
   test("expiry answers bodies.internal; the late tool records DeadlineExceeded, no ids", async () => {
-    let finish: () => void = () => {};
-    const gate = new Promise<void>((r) => {
-      finish = r;
+    const gate = signal();
+    const started = signal();
+    const { service, time, log, records } = withAuth(TRANSPORT_EMPTY, {
+      slow: () => {
+        started.resolve();
+        return gate.promise;
+      },
     });
-    const { service, time, log, records } = withAuth(TRANSPORT_EMPTY, { slow: () => gate });
     const pending = service.handle(mcpRequest(call("slow"), { token: "good:u" }), {});
-    await new Promise((r) => setTimeout(r, 20));
+    await started.promise;
     time.advance(1_000);
     const res = await pending;
     expect(await snapshot(res ?? null)).toEqual({ status: 500, headers: [], body: "" });
@@ -696,8 +712,8 @@ describe("step 5.9: deadline", () => {
       caller: "u",
       status: 500,
     });
-    finish();
-    await new Promise((r) => setTimeout(r, 20));
+    gate.resolve();
+    await until(() => records.length > 0);
     expect(records[0]).toMatchObject({
       tool: "slow",
       stage: "handler",
@@ -706,6 +722,34 @@ describe("step 5.9: deadline", () => {
       resultIds: null,
     });
     expect(time.pending()).toBe(0);
+  });
+
+  test("a handler past the deadline keeps its concurrency slot until it returns", async () => {
+    const gate = signal();
+    const started = signal();
+    const { service, time, records } = withAuth(TRANSPORT_EMPTY, {
+      limits: limits({
+        concurrency: { one: { tools: ["slow"], max: 1, busy: (t) => `${t} is busy` } },
+      }),
+      slow: () => {
+        started.resolve();
+        return gate.promise;
+      },
+    });
+    const post = () => service.handle(mcpRequest(call("slow"), { token: "good:u" }), {});
+    const first = post();
+    await started.promise;
+    time.advance(1_000);
+    expect((await first)?.status).toBe(500);
+    // Expired, but the handler still runs: the slot is still held.
+    expect(await rpcOf((await post()) as Response)).toMatchObject({
+      result: { isError: true, content: [{ text: '{"error":"slow is busy"}' }] },
+    });
+    gate.resolve();
+    await until(() => records.some((r) => r.errorClass === "DeadlineExceeded"));
+    expect(await rpcOf((await post()) as Response)).toMatchObject({
+      result: { content: [{ text: "slow done" }] },
+    });
   });
 
   test("a call that beats the deadline clears its timer", async () => {
@@ -918,6 +962,35 @@ describe("build-time refusals", () => {
   });
 });
 
+/** Advances fake time in `stepMs` steps whenever a timer is waiting, until `p` settles (bounded). */
+async function settle<T>(p: Promise<T>, time: FakeTime, stepMs = 50, rounds = 400): Promise<T> {
+  let done = false;
+  p.then(
+    () => {
+      done = true;
+    },
+    () => {
+      done = true;
+    },
+  );
+  for (let i = 0; i < rounds && !done; i++) {
+    await until(() => done || time.pending() > 0);
+    if (!done) time.advance(stepMs);
+  }
+  if (!done) throw new Error("settle: still pending");
+  return p;
+}
+
+const usageWith = (sinks: CallSink[]): UsageWiring => ({
+  sinks,
+  keepArgs: false,
+  keepOutput: false,
+  price: () => ({ costUsd: null, costNote: null }),
+  errorClassOf: () => "x",
+  spend: null,
+  serverSha: null,
+});
+
 describe("shutdown", () => {
   test("drains, forces, flushes every sink and the auth layer, ends the pool", async () => {
     const { service, auth, log, time } = withAuth(TRANSPORT_EMPTY);
@@ -936,11 +1009,10 @@ describe("shutdown", () => {
         expect(s).toBe(1);
       },
     });
-    await flush();
+    await until(() => time.pending() > 0); // the first drain poll
     pending = 0;
     time.advance(50);
-    await flush(20);
-    const r = await done;
+    const r = await settle(done, time);
     expect(r).toEqual({ drained: true, flushed: true, poolClosed: true });
     expect(stops).toEqual([undefined, true]);
     expect(auth.idled).toBe(1);
@@ -955,29 +1027,75 @@ describe("shutdown", () => {
         poolMs: 0,
       },
     ]);
+    expect(time.pending()).toBe(0);
   });
 
-  test("a request that never finishes costs the drain window, a stuck flush the flush window", async () => {
+  test("a hanging sink and a rejecting one: the flush waits its window, auth idles, the pool still ends", async () => {
+    const auth = fakeAuth();
+    const { service, time, log } = makeService({
+      auth,
+      acceptCredentials: () => both,
+      usage: usageWith([
+        { record: () => {}, idle: () => new Promise(() => {}) },
+        { record: () => {}, idle: () => Promise.reject(new Error("flush failed")) },
+      ]),
+    });
+    const stops: (boolean | undefined)[] = [];
+    let ended = 0;
+    const done = service.shutdown({
+      signal: "SIGINT",
+      server: {
+        stop: (force) => {
+          stops.push(force);
+        },
+        pending: () => 1,
+      },
+      endPool: async () => {
+        ended++;
+      },
+    });
+    expect(await settle(done, time)).toEqual({
+      drained: false,
+      flushed: false,
+      poolClosed: true,
+    });
+    expect(stops).toEqual([undefined, true]);
+    expect(auth.idled).toBe(1);
+    expect(ended).toBe(1);
+    expect(log.lines.at(-1)?.[1]).toMatchObject({
+      drained: false,
+      flushed: false,
+      poolReason: "clean",
+    });
+  });
+
+  test("an endPool that never settles is bounded by poolEndTimeoutS: poolReason timeout", async () => {
+    const { service, time, log } = makeService();
+    const done = service.shutdown({
+      signal: "SIGTERM",
+      server: { stop: () => {}, pending: () => 0 },
+      endPool: () => new Promise(() => {}),
+    });
+    expect(await settle(done, time)).toEqual({ drained: true, flushed: true, poolClosed: false });
+    expect(log.lines.at(-1)?.[1]).toMatchObject({
+      poolClosed: false,
+      poolReason: "timeout",
+      poolMs: 1_000,
+    });
+    expect(time.pending()).toBe(0);
+  });
+
+  test("a throwing logger: shutdown still resolves", async () => {
     const { service, time } = makeService({
-      usage: {
-        sinks: [{ record: () => {}, idle: () => new Promise(() => {}) }],
-        keepArgs: false,
-        keepOutput: false,
-        price: () => ({ costUsd: null, costNote: null }),
-        errorClassOf: () => "x",
-        spend: null,
-        serverSha: null,
+      log: () => {
+        throw new Error("log down");
       },
     });
     const done = service.shutdown({
-      signal: "SIGINT",
-      server: { stop: () => {}, pending: () => 1 },
+      signal: "SIGTERM",
+      server: { stop: () => {}, pending: () => 0 },
     });
-    for (let i = 0; i < 20; i++) {
-      await flush(10);
-      time.advance(50);
-    }
-    expect(await done).toEqual({ drained: false, flushed: false, poolClosed: false });
+    expect(await settle(done, time)).toEqual({ drained: true, flushed: true, poolClosed: false });
   });
 });
 
