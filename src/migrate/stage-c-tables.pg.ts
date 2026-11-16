@@ -320,6 +320,7 @@ describe("the W5 tables", () => {
       `SELECT conname || ' ' || pg_get_constraintdef(oid) AS def FROM pg_constraint
        WHERE connamespace = to_regnamespace($1::text)
          AND conrelid IN (to_regclass(quote_ident($1) || '.mcp_calls'), to_regclass(quote_ident($1) || '.spend'))
+         AND contype <> 'n' -- Postgres 18 records NOT NULL here too; the column rows above pin nullability
        ORDER BY conname`,
       [s],
     );
