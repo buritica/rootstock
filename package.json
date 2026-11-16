@@ -57,7 +57,7 @@
     "@better-auth/cimd": "1.7.17",
     "@better-auth/core": "1.7.17",
     "@better-auth/mcp": "1.7.17",
-    "@better-auth/oauth-provider": "1.7.18",
+    "@better-auth/oauth-provider": "1.7.17",
     "@biomejs/biome": "2.5.14",
     "@modelcontextprotocol/node": "2.1.2",
     "@modelcontextprotocol/server": "2.4.0",
@@ -113,6 +113,6 @@
   },
   "overrides": {
     "@better-auth/core": "1.7.17",
-    "@better-auth/oauth-provider": "1.7.18"
+    "@better-auth/oauth-provider": "1.7.17"
   }
 }

@@ -202,26 +202,45 @@ export function defineToolScopes(t: ToolScopes): ToolScopes {
   if (!isPlainRecord(t.implies)) throw fail("implies must be an object", t.implies);
   const tools: Record<string, string> = Object.fromEntries(
     Object.entries(t.tools).map(([tool, scope]) => {
-      if (!isScope(scope)) throw fail(`tools.${tool} must be a non-empty string`, scope);
+      if (!isScope(scope))
+        throw fail(`tools[${JSON.stringify(tool)}] must be a non-empty string`, scope);
       return [tool, scope];
     }),
   );
   const implies: Record<string, readonly string[]> = Object.fromEntries(
     Object.entries(t.implies).map(([scope, granted]) => {
       if (!Array.isArray(granted) || !granted.every(isScope)) {
-        throw fail(`implies.${scope} must be an array of non-empty strings`, granted);
+        throw fail(
+          `implies[${JSON.stringify(scope)}] must be an array of non-empty strings`,
+          granted,
+        );
       }
       return [scope, Object.freeze([...granted])];
     }),
   );
   for (const [scope, granted] of Object.entries(implies)) {
     if (!granted.includes(scope)) {
-      throw fail(`implies.${scope} must include ${scope} itself`, granted);
+      throw fail(
+        `implies[${JSON.stringify(scope)}] must include ${JSON.stringify(scope)} itself`,
+        granted,
+      );
     }
     for (const g of granted) {
       if (!Object.hasOwn(implies, g)) {
-        throw fail(`implies.${scope} grants ${g}, which implies does not declare`, g);
+        throw fail(
+          `implies[${JSON.stringify(scope)}] grants ${JSON.stringify(g)}, which implies does not declare`,
+          Object.keys(implies),
+        );
       }
+    }
+  }
+  // A tool's scope must be declared, or a typo leaves the tool callable by nobody, silently.
+  for (const [tool, scope] of Object.entries(tools)) {
+    if (!Object.hasOwn(implies, scope)) {
+      throw fail(
+        `tools[${JSON.stringify(tool)}] needs ${JSON.stringify(scope)}, which implies does not declare`,
+        Object.keys(implies),
+      );
     }
   }
   return Object.freeze({
@@ -236,8 +255,15 @@ export function defineToolScopes(t: ToolScopes): ToolScopes {
  * A scope `implies` does not declare is kept as given and grants nothing more.
  */
 export function expandScopes(reg: ToolScopes, scopes: Iterable<string>): ReadonlySet<string> {
-  if (typeof scopes === "string") {
-    throw configError("expandScopes", "scopes must be an iterable, not one string", scopes);
+  if (
+    typeof scopes === "string" ||
+    typeof (scopes as { [Symbol.iterator]?: unknown })?.[Symbol.iterator] !== "function"
+  ) {
+    throw configError(
+      "expandScopes",
+      "scopes must be an iterable of strings, not one string",
+      scopes,
+    );
   }
   const out = new Set<string>();
   const pending = [...scopes];

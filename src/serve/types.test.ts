@@ -71,22 +71,27 @@ describe("defineToolScopes", () => {
     [
       "an empty tool scope",
       { id: "x", tools: { echo: "" }, implies: {} },
-      'tools.echo must be a non-empty string — got ""',
+      'tools["echo"] must be a non-empty string — got ""',
     ],
     [
       "a non-array grant",
       { id: "x", tools: {}, implies: { openid: "openid" } },
-      'implies.openid must be an array of non-empty strings — got "openid"',
+      'implies["openid"] must be an array of non-empty strings — got "openid"',
     ],
     [
       "a grant without itself",
       { id: "x", tools: {}, implies: { openid: ["email"], email: ["email"] } },
-      'implies.openid must include openid itself — got ["email"]',
+      'implies["openid"] must include "openid" itself — got ["email"]',
     ],
     [
       "an undeclared implied scope",
       { id: "x", tools: {}, implies: { openid: ["openid", "email"] } },
-      'implies.openid grants email, which implies does not declare — got "email"',
+      'implies["openid"] grants "email", which implies does not declare — got ["openid"]',
+    ],
+    [
+      "a tool scope implies does not declare",
+      { id: "x", tools: { echo: "mcp:tool" }, implies: { "mcp:tools": ["mcp:tools"] } },
+      'tools["echo"] needs "mcp:tool", which implies does not declare — got ["mcp:tools"]',
     ],
   ];
   for (const [label, input, detail] of bad) {
@@ -110,7 +115,7 @@ describe("defineToolScopes", () => {
   test("keeps JSON-parsed __proto__ keys as own data properties", () => {
     const reg = defineToolScopes(
       JSON.parse(
-        '{"id":"x","tools":{"__proto__":"admin","echo":"mcp:tools"},' +
+        '{"id":"x","tools":{"__proto__":"__proto__","echo":"mcp:tools"},' +
           '"implies":{"__proto__":["__proto__","mcp:tools"],"mcp:tools":["mcp:tools"]}}',
       ),
     );
@@ -118,13 +123,13 @@ describe("defineToolScopes", () => {
     expect(Object.getPrototypeOf(reg.implies)).toBe(Object.prototype);
     expect(Object.keys(reg.tools).sort()).toEqual(["__proto__", "echo"]);
     expect(Object.keys(reg.implies).sort()).toEqual(["__proto__", "mcp:tools"]);
-    expect(Object.getOwnPropertyDescriptor(reg.tools, "__proto__")?.value).toBe("admin");
+    expect(Object.getOwnPropertyDescriptor(reg.tools, "__proto__")?.value).toBe("__proto__");
     expect(Object.isFrozen(Object.getOwnPropertyDescriptor(reg.implies, "__proto__")?.value)).toBe(
       true,
     );
     const admin: Caller = { name: "a", kind: "oauth", scopes: expandScopes(reg, ["__proto__"]) };
     expect([...admin.scopes].sort()).toEqual(["__proto__", "mcp:tools"]);
-    expect(canCallTool(reg, admin, "__proto__")).toBe(false);
+    expect(canCallTool(reg, admin, "__proto__")).toBe(true);
     expect(canCallTool(reg, admin, "echo")).toBe(true);
     const tool: Caller = { name: "a", kind: "oauth", scopes: expandScopes(reg, ["mcp:tools"]) };
     expect([...tool.scopes]).toEqual(["mcp:tools"]);
@@ -168,8 +173,13 @@ describe("expandScopes", () => {
     const err = refusal(() => expandScopes(REG, "a b"));
     expect(err.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
     expect(err.message).toBe(
-      'rootstock serve: expandScopes(): scopes must be an iterable, not one string — got "a b"',
+      'rootstock serve: expandScopes(): scopes must be an iterable of strings, not one string — got "a b"',
     );
+  });
+
+  test("refuses null instead of throwing a bare TypeError", () => {
+    const err = refusal(() => expandScopes(REG, null as unknown as string[]));
+    expect(err.code).toBe("ERR_ROOTSTOCK_SERVE_CONFIG");
   });
 
   test("an empty input expands to nothing", () => {
