@@ -29,6 +29,8 @@ test("v0.2.1 appends db.migrate, concurrency.map and config to the 24-id v0.2.0 
     "grounding.quote",
     "transport.retry",
     "transport.slack",
+    "serve.http",
+    "serve.stdio",
     "db.migrate",
     "db.lock",
     "db.queue",

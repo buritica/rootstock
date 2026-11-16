@@ -39,6 +39,9 @@ export const CAPABILITIES = [
   // Outbound transport
   "transport.retry", // retry, backoff, rate-limit and wait schedules of an outbound client
   "transport.slack", // Slack Web API request construction, cursor pagination and error mapping
+  // Serving
+  "serve.http", // an MCP server's HTTP surface: routes, auth answers, limits, tool calls, call records
+  "serve.stdio", // an MCP server over stdio: initialize, tools/list, tool calls, exit
   // Data layer, concurrency and configuration
   "db.migrate", // migration discovery, ordering, tracking and apply decisions
   "db.lock", // run locks: acquire, refuse, fence, probe, recover, release, and their events
