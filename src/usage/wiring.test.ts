@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { RUNS_INPUT } from "../runs/fixtures.test-support.ts";
 import { runsSlice } from "../runs/index.ts";
-import type { CallSink } from "../serve/types.ts";
+import type { CallSink, UsageWiring } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
 import { usageErrorCode } from "./errors.ts";
 import { callPricer, usageWiring } from "./wiring.ts";
@@ -46,7 +46,17 @@ describe("callPricer", () => {
     });
   });
 
-  test("nothing metered: no cost and no note, priced or not", () => {
+  test("unpriced models are listed sorted on both paths", () => {
+    const tokens = {
+      zeta: { input: 1, output: 0 },
+      alpha: { input: 1, output: 0 },
+      "model-a": { input: 1, output: 0 },
+    };
+    expect(callPricer(null)(tokens, false).costNote).toBe("unpriced:alpha,model-a,zeta");
+    expect(callPricer(prices)(tokens, false).costNote).toBe("unpriced:alpha,zeta");
+  });
+
+  test("nothing metered: no cost and no note, priced or not, and no throw", () => {
     expect(callPricer(prices)({}, false)).toEqual({ costUsd: null, costNote: null });
     expect(callPricer(null)({}, true)).toEqual({ costUsd: null, costNote: null });
   });
@@ -55,7 +65,7 @@ describe("callPricer", () => {
 describe("usageWiring", () => {
   test("binds pricing and classification, frozen", () => {
     const sink: CallSink = { record: () => {} };
-    const w = usageWiring({
+    const w: UsageWiring = usageWiring({
       sinks: [sink],
       keepArgs: true,
       keepOutput: false,
@@ -66,6 +76,7 @@ describe("usageWiring", () => {
     expect(w.sinks).toEqual([sink]);
     expect([w.keepArgs, w.keepOutput, w.spend, w.serverSha]).toEqual([true, false, null, "abc"]);
     expect(w.errorClassOf).toBe(errorClassOf);
+    expect(w.price({}, true)).toEqual({ costUsd: null, costNote: null });
     expect(w.price({ "model-a": { input: 10, output: 0 } }, false)).toEqual({
       costUsd: "0.000001",
       costNote: null,

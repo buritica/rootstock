@@ -26,12 +26,6 @@ export function callPricer(prices: RunsSlice | null): CallPricer {
   };
 }
 
-/** The wiring a serve call seam takes, as contract rev 3.1 shapes it. */
-export type UsageWiringV31 = Omit<UsageWiring, "prices"> & {
-  price: CallPricer;
-  errorClassOf: (err: unknown, classify?: (err: unknown) => string | undefined) => string;
-};
-
 export interface UsageWiringOptions {
   sinks: readonly CallSink[];
   keepArgs: boolean;
@@ -43,7 +37,7 @@ export interface UsageWiringOptions {
 }
 
 /** Builds the `UsageWiring` for `createMcpService`/`installSeams`: pricing and classification bound here. */
-export function usageWiring(o: UsageWiringOptions): UsageWiringV31 {
+export function usageWiring(o: UsageWiringOptions): UsageWiring {
   if (!Array.isArray(o.sinks)) throw configError("usageWiring: sinks must be an array");
   for (const key of ["keepArgs", "keepOutput"] as const) {
     if (typeof o[key] !== "boolean") throw configError(`usageWiring: ${key} must be a boolean`);
