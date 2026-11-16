@@ -23,8 +23,9 @@ export function unpricedNote(models: readonly string[]): string {
 }
 
 /**
- * The cost of `tokens` (model → counts) under the slice's prices, summed in
- * integer micro-dollars and rounded half up once. Not `metered`: "unmetered".
+ * The cost of `tokens` (model → counts) under the slice's prices: each
+ * model's tokens times its micro-dollars per million tokens, summed exactly,
+ * then divided by a million and rounded half up once to whole micro-dollars. Not `metered`: "unmetered".
  * Any model without a price: no cost and "unpriced:<models>", sorted and cut
  * at 200 characters. Otherwise the cost, noted "estimated" when `estimated`.
  */

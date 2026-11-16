@@ -4,6 +4,7 @@ import { priceTokens, type RunsSlice } from "../runs/index.ts";
 import type { Clock, LogEvent, SpendCharger, Usage } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
 import { configError } from "./errors.ts";
+import { guardedLog } from "./log.ts";
 
 export type SpendUnit = "tokens" | "usd";
 
@@ -38,11 +39,18 @@ function total(rows: readonly Record<string, unknown>[]): number {
   return v === undefined || v === null ? 0 : Number(v);
 }
 
+export interface PostgresSpendStoreOptions {
+  /** The tagged-template subset postgres.js and `Bun.SQL` share. */
+  readonly sql: Sql;
+  readonly shape: SpendStoreShape;
+}
+
 /**
  * The spend store on Postgres. Each add is one upsert that returns the new
  * total, so a process sharing the row with others learns their spend too.
+ * "Today" is the server's UTC date (`now()`), not the app's clock.
  */
-export function postgresSpendStore(o: { sql: Sql; shape: SpendStoreShape }): SpendStore {
+export function postgresSpendStore(o: PostgresSpendStoreOptions): SpendStore {
   const { sql, shape } = o;
   if (shape?.kind === "rootstock") {
     const t = quoteTable({ schema: shape.schema, name: "spend" });
@@ -75,21 +83,22 @@ export function postgresSpendStore(o: { sql: Sql; shape: SpendStoreShape }): Spe
   );
 }
 
+/** A class whose instances are the refusal, built from its text. */
+export type ErrorConstructorOf = new (message: string) => Error;
+
 export interface SpendCeilingOptions {
-  store: SpendStore;
-  unit: SpendUnit;
+  readonly store: SpendStore;
+  readonly unit: SpendUnit;
   /** Refuse once today's total reaches this. */
-  ceiling: number;
+  readonly ceiling: number;
   /** A runs slice whose prices turn tokens into dollars; required for "usd". */
-  prices: RunsSlice | null;
+  readonly prices: RunsSlice | null;
   /** The refusal's text from the total and the ceiling. */
-  refusal: (used: number, ceiling: number) => string;
+  readonly refusal: (used: number, ceiling: number) => string;
   /** The error `assertWithin` throws, built from the refusal's text. */
-  errorClass: new (
-    m: string,
-  ) => Error;
-  clock: Clock;
-  log: LogEvent;
+  readonly errorClass: ErrorConstructorOf;
+  readonly clock: Clock;
+  readonly log: LogEvent;
 }
 
 const DAY_MS = 86_400_000;
@@ -98,8 +107,10 @@ const countable = (n: unknown): boolean =>
   typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 
 interface Entry {
-  /** The store's total as last read or returned; null before either. */
+  /** The store's total from the newest-issued request answered so far; null before any, or to reload. */
   base: number | null;
+  /** The issue number of the request `base` came from; 0 before any. */
+  seq: number;
   /** Adds sent and not yet answered. */
   pending: number;
   /** Adds whose write failed: still counted here, never in the store. */
@@ -112,16 +123,33 @@ interface Entry {
  * when the total has reached the ceiling. `record(u)` adds to the cache before
  * it yields, so a check later in the same call sees it, then upserts; the
  * returned total (the store's, all processes included) replaces the cached
- * one. A failed write is logged (`usage.spend_write_failed`) and its amount
- * stays in this process's cache. Calls are charged whatever their outcome.
- * A failed read rejects `assertWithin` with the driver's error. In "usd" each
- * meter call is priced on its own (`priceTokens`, whole micro-dollars).
+ * one. Calls are charged whatever their outcome.
+ *
+ * Two clocks: the cache's day is the app's (`clock`, UTC), the store's row is
+ * the server's (`now()` in the SQL). Around midnight they can disagree, so
+ * every store request is numbered as it is issued and only an answer newer
+ * than the one applied replaces the cached total (set, not max: today's add
+ * may answer less than yesterday's load). A refusal drops the cached total,
+ * so a refused caller's next check reads the store again and is let through
+ * once the server's day has turned.
+ *
+ * Failures: a failed or non-finite read rejects `assertWithin` (fail closed)
+ * and the next check reads again. A failed write is logged
+ * (`usage.spend_write_failed`) and its amount stays in this process's cache;
+ * a write that committed but whose answer was lost is then counted twice,
+ * which errs toward refusing.
+ *
+ * "usd": each meter call is priced on its own with `priceTokens`, rounded to
+ * whole micro-dollars, so a call worth under half a micro-dollar is free. A
+ * model the price table lacks is not charged (fail open, decided) and logs
+ * `usage.spend_unpriced` on every such call.
  *
  * Not fixed: two concurrent calls of one caller can both pass the check
  * before either records, so the ceiling can be overshot by what they spend.
  */
 export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
-  const { store, unit, ceiling, prices, refusal, errorClass, clock, log } = o;
+  const { store, unit, ceiling, prices, refusal, errorClass, clock } = o;
+  const log = guardedLog(o.log);
   if (unit !== "tokens" && unit !== "usd") {
     throw configError(`createSpendCeiling: unit must be "tokens" or "usd" — got ${q(unit)}`);
   }
@@ -136,6 +164,13 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
   if (unit === "usd" && prices === null) {
     throw configError('createSpendCeiling: unit "usd" needs the runs slice\'s prices');
   }
+  if (prices !== null) {
+    try {
+      priceTokens(prices, new Map(), { metered: true, estimated: false });
+    } catch {
+      throw configError("createSpendCeiling: prices must be a runs slice built by runsSlice()");
+    }
+  }
   // Today's entries only: the first call of a new UTC day clears the map, so
   // a caller who stops calling is not kept.
   const cache = new Map<string, Entry>();
@@ -149,20 +184,33 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
     }
     let e = cache.get(caller);
     if (e === undefined) {
-      e = { base: null, pending: 0, kept: 0 };
+      e = { base: null, seq: 0, pending: 0, kept: 0 };
       cache.set(caller, e);
     }
     return e;
   };
-  // A total only grows within a day, so the larger of two answers is the
-  // newer one, whatever order they arrive in. A read that already counts an
-  // add still in flight overcounts it until that add's answer lands.
-  const settle = (e: Entry, storeTotal: number): void => {
-    e.base = Math.max(e.base ?? 0, storeTotal);
+  // Every store request gets the next number when it is issued.
+  let issued = 0;
+  // A store answer, applied only when its request was issued after the one
+  // `base` came from; an older answer arriving late is ignored. A load that
+  // already counts an add still in flight overcounts it until that add's
+  // answer lands; a load issued after an add but read before it committed
+  // undercounts it until the next add answers.
+  const settle = (e: Entry, seq: number, storeTotal: number): void => {
+    if (!Number.isFinite(storeTotal)) {
+      throw new Error(
+        "rootstock usage: the spend store answered a total that is not a finite number",
+      );
+    }
+    if (seq > e.seq) {
+      e.base = storeTotal;
+      e.seq = seq;
+    }
   };
 
   const amountOf = (u: Usage): number | string | null => {
     if (unit === "tokens") return u.input + u.output;
+    // A ceiling charges what was spent: "estimated" changes only a note.
     const cost = priceTokens(prices as RunsSlice, new Map([[u.model, u]]), {
       metered: true,
       estimated: false,
@@ -175,9 +223,15 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
       return {
         async assertWithin() {
           const e = entryFor(caller);
-          if (e.base === null) settle(e, await store.load(caller, unit));
+          if (e.base === null) {
+            const seq = ++issued;
+            settle(e, seq, await store.load(caller, unit));
+          }
           const used = (e.base ?? 0) + e.pending + e.kept;
-          if (used >= ceiling) throw new errorClass(refusal(used, ceiling));
+          if (used >= ceiling) {
+            e.base = null;
+            throw new errorClass(refusal(used, ceiling));
+          }
         },
         async record(u) {
           if (!countable(u.input) || !countable(u.output)) {
@@ -193,8 +247,9 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
           if (!(n > 0)) return;
           const e = entryFor(caller);
           e.pending += n;
+          const seq = ++issued;
           try {
-            settle(e, await store.add(caller, unit, amount));
+            settle(e, seq, await store.add(caller, unit, amount));
           } catch (err) {
             e.kept += n;
             log("usage.spend_write_failed", { unit, errorClass: errorClassOf(err) });

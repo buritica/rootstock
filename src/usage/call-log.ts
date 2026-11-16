@@ -1,8 +1,9 @@
 import type { Sql } from "../db/index.ts";
-import { INT4_MAX, intIn, q, quoteTable } from "../internal/slice.ts";
+import { cut, INT4_MAX, intIn, q, quoteTable } from "../internal/slice.ts";
 import type { CallRecord, CallSink, LogEvent } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
 import { configError } from "./errors.ts";
+import { guardedLog } from "./log.ts";
 import { MAX_BUFFERED } from "./slice.ts";
 
 /** Column → the type `jsonb_to_recordset` reads it as. Fixed names, no column map. */
@@ -39,16 +40,33 @@ export function callLogInsert(table: { schema: string; name: string }): string {
   return `insert into ${quoteTable(table)} (${cols}) select ${cols} from jsonb_to_recordset($1::text::jsonb) as x(${typed})`;
 }
 
-/** One record as its row's JSON text. `errorMessage` and `stage` are never stored. */
+/** A tool name as stored and logged: the client names it on a rejected call, so it is capped. */
+const TOOL_MAX = 200;
+const toolName = (tool: unknown): string => cut(String(tool), TOOL_MAX);
+
+/** Whole milliseconds from 0 to the int4 maximum; anything not a finite number is 0. */
+function durationMs(ms: unknown): number {
+  return typeof ms === "number" && Number.isFinite(ms)
+    ? Math.min(INT4_MAX, Math.max(0, Math.round(ms)))
+    : 0;
+}
+
+/**
+ * One record as its row's JSON text. `errorMessage` and `stage` are never
+ * stored. Every NOT NULL column is coerced so one odd record cannot fail its
+ * whole batch: `args ?? {}` and `resultIds ?? null` are deliberate (an absent
+ * value becomes the column's empty form), the duration is clamped and `ok` is
+ * a boolean.
+ */
 function rowJson(r: CallRecord): string {
   return JSON.stringify({
     caller: r.caller,
     on_behalf_of: r.onBehalfOf,
     turn_id: r.turnId,
-    tool: r.tool,
+    tool: toolName(r.tool),
     args: r.args ?? {},
-    duration_ms: Math.min(INT4_MAX, Math.max(0, Math.round(r.durationMs))),
-    ok: r.ok,
+    duration_ms: durationMs(r.durationMs),
+    ok: r.ok === true,
     error_class: r.errorClass,
     result_ids: r.resultIds ?? null,
     phases: r.phases,
@@ -79,17 +97,24 @@ export function storableJson(json: string): string {
 
 export interface PostgresCallLogOptions {
   /** The tagged-template subset postgres.js and `Bun.SQL` share. */
-  sql: Sql;
-  table: { schema: string; name: string };
-  /** Rows waiting to be written, past which new ones are dropped and counted. */
-  maxBuffered: number;
+  readonly sql: Sql;
+  readonly table: { readonly schema: string; readonly name: string };
+  /**
+   * Rows waiting to be written, past which new ones are dropped and counted.
+   * The batch in flight is not counted, so up to `maxBuffered + maxBatch`
+   * rows can be held at once.
+   */
+  readonly maxBuffered: number;
   /** Rows per INSERT. */
-  maxBatch: number;
-  log: LogEvent;
+  readonly maxBatch: number;
+  readonly log: LogEvent;
 }
 
 export type PostgresCallLog = CallSink & {
-  /** Resolves once the buffer is empty and the writer has stopped. */
+  /**
+   * Resolves once the buffer is empty and the writer has stopped. A hung
+   * insert hangs it too: shutdown bounds the wait (serve's `flushMs`).
+   */
   idle(): Promise<void>;
   /** Rows dropped on a full buffer since this sink was made. */
   dropped(): number;
@@ -104,6 +129,8 @@ export type PostgresCallLog = CallSink & {
  * `usage.call_log_recovered` with the streak's count once a row fits again).
  * A row that cannot be serialized, or a batch the server refuses, is logged
  * (`usage.call_log_failed` {stage, rows, tools, errorClass}) and lost.
+ * Neither `record` nor the writer ever throws or rejects: a throwing `log`
+ * is swallowed.
  */
 export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   if (!intIn(o.maxBuffered, 1, MAX_BUFFERED)) {
@@ -116,7 +143,8 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
       `postgresCallLog: maxBatch must be an integer from 1 to maxBuffered — got ${q(o.maxBatch)}`,
     );
   }
-  const { sql, log, maxBuffered, maxBatch } = o;
+  const { sql, maxBuffered, maxBatch } = o;
+  const log = guardedLog(o.log);
   const statement = callLogInsert(o.table);
   const buffer: { tool: string; json: string }[] = [];
   let writer: Promise<void> | null = null;
@@ -124,43 +152,49 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   let droppedTotal = 0;
 
   // Clears `writer` in the same synchronous step that sees the buffer empty,
-  // so no row is stranded between "nothing left" and "writer gone". Every
-  // insert error is caught inside, so this never rejects.
+  // so no row is stranded between "nothing left" and "writer gone"; the
+  // `finally` clears it on any other way out too, so a later record starts a
+  // fresh writer. Every insert error is caught inside.
   const drain = async (): Promise<void> => {
-    while (buffer.length > 0) {
-      const batch = buffer.splice(0, maxBatch);
-      try {
-        await sql.unsafe(statement, [`[${batch.map((r) => r.json).join(",")}]`]);
-      } catch (err) {
-        log("usage.call_log_failed", {
-          stage: "insert",
-          rows: batch.length,
-          tools: [...new Set(batch.map((r) => r.tool))],
-          errorClass: errorClassOf(err),
-        });
+    try {
+      while (buffer.length > 0) {
+        const batch = buffer.splice(0, maxBatch);
+        try {
+          await sql.unsafe(statement, [`[${batch.map((r) => r.json).join(",")}]`]);
+        } catch (err) {
+          log("usage.call_log_failed", {
+            stage: "insert",
+            rows: batch.length,
+            tools: [...new Set(batch.map((r) => r.tool))],
+            errorClass: errorClassOf(err),
+          });
+        }
       }
+    } finally {
+      writer = null;
     }
-    writer = null;
   };
 
   return {
     record(r) {
-      if (buffer.length >= maxBuffered) {
-        streak += 1;
-        droppedTotal += 1;
-        if (streak === 1 || streak % 100 === 0) {
-          log("usage.call_log_dropped", { tool: r.tool, buffered: buffer.length, dropped: streak });
-        }
-        return;
-      }
+      let tool = "";
       let json: string;
       try {
+        tool = toolName(r.tool);
+        if (buffer.length >= maxBuffered) {
+          streak += 1;
+          droppedTotal += 1;
+          if (streak === 1 || streak % 100 === 0) {
+            log("usage.call_log_dropped", { tool, buffered: buffer.length, dropped: streak });
+          }
+          return;
+        }
         json = storableJson(rowJson(r));
       } catch (err) {
         log("usage.call_log_failed", {
           stage: "build",
           rows: 1,
-          tools: [r.tool],
+          tools: [tool],
           errorClass: errorClassOf(err),
         });
         return;
@@ -169,9 +203,11 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
         log("usage.call_log_recovered", { dropped: streak });
         streak = 0;
       }
-      buffer.push({ tool: r.tool, json });
+      buffer.push({ tool, json });
       // Started on a later microtask, so calls that finish together share an INSERT.
-      writer ??= Promise.resolve().then(drain);
+      writer ??= Promise.resolve()
+        .then(drain)
+        .then(undefined, () => undefined);
     },
     async idle() {
       while (writer) await writer;

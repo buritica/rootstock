@@ -4,7 +4,6 @@ test("usage exports exactly its surface", async () => {
   expect(Object.keys(await import("@buritica/rootstock/usage")).sort()).toEqual([
     "CALL_ERROR_CLASSES",
     "RootstockUsageError",
-    "callPricer",
     "createSpendCeiling",
     "errorClassOf",
     "postgresCallLog",

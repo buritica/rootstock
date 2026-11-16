@@ -45,6 +45,19 @@ describe("errorClassOf", () => {
     expect(errorClassOf(hostile)).toBe("unreadable error");
   });
 
+  test("a name is used only when it is a non-empty string, and is cut at 200 characters", () => {
+    const numeric = Object.defineProperty(new Error("x"), "name", { value: 42 });
+    expect(errorClassOf(numeric)).toBe("Error");
+    const empty = Object.defineProperty(new Error("x"), "name", { value: "" });
+    expect(errorClassOf(new Error("wrap", { cause: empty }))).toBe("Error");
+    const long = Object.defineProperty(new Error("x"), "name", { value: "N".repeat(500) });
+    expect(errorClassOf(long)).toBe("N".repeat(200));
+  });
+
+  test("a classify answer is cut at 200 characters", () => {
+    expect(errorClassOf(new Error("x"), () => "C".repeat(300))).toBe("C".repeat(200));
+  });
+
   test("the classify hook answers first; undefined or empty falls through to the walk", () => {
     const classify = (err: unknown) => (err instanceof RefusalError ? "RefusalError" : undefined);
     expect(errorClassOf(new RefusalError("x"), classify)).toBe("RefusalError");

@@ -165,16 +165,22 @@ describe("postgresCallLog", () => {
       begin<T>(fn: (tx: Sql) => Promise<T>): Promise<T>;
     };
     let unlock = () => {};
-    const locked = new Promise<void>((held) => {
-      const done = other.begin(async (tx) => {
+    let held = () => {};
+    const locked = new Promise<void>((r) => {
+      held = r;
+    });
+    const holder = other
+      .begin(async (tx) => {
         await tx.unsafe(`LOCK TABLE "${s}".mcp_calls IN ACCESS EXCLUSIVE MODE`);
         held();
         await new Promise<void>((r) => {
           unlock = r;
         });
-      });
-      void done;
-    });
+      })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
     try {
       await locked;
       const { log } = captureLog();
@@ -185,25 +191,74 @@ describe("postgresCallLog", () => {
         maxBatch: 10,
         log,
       });
-      const t0 = performance.now();
-      for (let i = 0; i < 5; i++) sink.record(callRecord());
-      expect(performance.now() - t0).toBeLessThan(20);
+      // record returns before the writer has even started.
+      for (let i = 0; i < 5; i++) expect(sink.record(callRecord())).toBeUndefined();
+      // The insert is sent and waits on the lock: a lock request on the table not granted.
+      const waiting = async () =>
+        (
+          await main.transactor.sql.unsafe<{ n: number }>(
+            "SELECT count(*)::int AS n FROM pg_locks WHERE relation = to_regclass($1) AND NOT granted",
+            [`"${s}".mcp_calls`],
+          )
+        )[0]?.n ?? 0;
+      let n = 0;
+      for (let i = 0; i < 200 && n === 0; i++) {
+        n = await waiting();
+        if (n === 0) await Bun.sleep(10);
+      }
+      expect(n).toBe(1);
       let idle = false;
       const done = sink.idle().then(() => {
         idle = true;
       });
-      await Bun.sleep(100);
       expect(idle).toBe(false);
       unlock();
       await done;
+      expect(await holder).toBeNull();
       const [r] = await sql.unsafe<{ n: number }>(
         `SELECT count(*)::int AS n FROM "${s}".mcp_calls`,
       );
       expect(r?.n).toBe(5);
     } finally {
       unlock();
+      await holder;
       await second.close();
     }
+  });
+
+  test("odd rows inside a batch of good ones: every row lands", async () => {
+    const s = await migrated();
+    const { log, events } = captureLog();
+    const sink = postgresCallLog({
+      sql,
+      table: { schema: s, name: "mcp_calls" },
+      maxBuffered: 100,
+      maxBatch: 100,
+      log,
+    });
+    sink.record(callRecord({ tool: "good-1" }));
+    sink.record(callRecord({ tool: "nan", durationMs: Number.NaN }));
+    sink.record(callRecord({ tool: "huge", durationMs: 1e15 }));
+    sink.record(callRecord({ tool: "nul", outputText: "a\u0000b", args: { odd: "\ud800" } }));
+    sink.record(callRecord({ tool: "t".repeat(300) }));
+    sink.record(callRecord({ tool: "good-2" }));
+    await sink.idle();
+    expect(events).toEqual([]);
+    const rows = await sql.unsafe<{ tool: string; ms: number }>(
+      `SELECT left(tool, 10) AS tool, duration_ms AS ms FROM "${s}".mcp_calls ORDER BY tool`,
+    );
+    expect(rows).toEqual([
+      { tool: "good-1", ms: 12 },
+      { tool: "good-2", ms: 12 },
+      { tool: "huge", ms: 2_147_483_647 },
+      { tool: "nan", ms: 0 },
+      { tool: "nul", ms: 12 },
+      { tool: "tttttttttt", ms: 12 },
+    ]);
+    const [len] = await sql.unsafe<{ n: number }>(
+      `SELECT max(length(tool))::int AS n FROM "${s}".mcp_calls`,
+    );
+    expect(len?.n).toBe(200);
   });
 
   test("a batch the server refuses is logged by class and the writer stops cleanly", async () => {

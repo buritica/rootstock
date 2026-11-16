@@ -135,8 +135,8 @@ function parseSpend(raw: unknown, schema: string): UsageSlice["spend"] {
  * Parses the usage slice: the call log's table and buffer numbers,
  * keepArgs/keepOutput, and the spend ceiling's unit, ceiling and store shape.
  * `defaults.schema` (the schema rootstock's migrations run in; default
- * "rootstock") fills an omitted call log or rootstock-store schema. That `unit: "usd"` has prices
- * is checked by config against the runs slice.
+ * "rootstock") fills an omitted call log or rootstock-store schema. Config
+ * checks that a `unit: "usd"` ceiling has the runs slice's prices.
  */
 export function usageSlice(input: UsageSliceInput, defaults?: { schema?: string }): UsageSlice {
   const raw: Record<string, unknown> = isRecord(input) ? input : {};

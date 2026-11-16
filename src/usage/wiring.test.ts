@@ -34,6 +34,18 @@ describe("callPricer", () => {
     });
   });
 
+  test("fractional or negative estimated counts are rounded, floored at 0, and priced", () => {
+    const price = callPricer(prices);
+    expect(price({ "model-c": { input: 44.6, output: -3 } }, true)).toEqual({
+      costUsd: "0.000032",
+      costNote: "estimated",
+    });
+    expect(price({ "model-a": { input: Number.NaN, output: 0.4 } }, true)).toEqual({
+      costUsd: "0.000000",
+      costNote: "estimated",
+    });
+  });
+
   test("no prices: unpriced with the models sorted", () => {
     expect(
       callPricer(null)(

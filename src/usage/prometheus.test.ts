@@ -69,10 +69,27 @@ describe("prometheusToolMetrics", () => {
     expect(m.render()).not.toContain("made-up");
   });
 
-  test("escapes label values", () => {
+  test("escapes label values on every line", () => {
     const m = make();
     m.onRegister?.('a"b\\c\nd');
-    expect(m.render()).toContain('{tool="a\\"b\\\\c\\nd",outcome="ok"} 0');
+    const out = m.render();
+    const label = 'tool="a\\"b\\\\c\\nd"';
+    expect(out).toContain(`app_mcp_tool_calls_total{${label},outcome="ok"} 0`);
+    expect(out).toContain(`app_mcp_tool_latency_seconds_bucket{${label},le="0.01"} 0`);
+    expect(out).toContain(`app_mcp_tool_latency_seconds_bucket{${label},le="+Inf"} 0`);
+    expect(out).toContain(`app_mcp_tool_latency_seconds_sum{${label}} 0`);
+    expect(out).toContain(`app_mcp_tool_latency_seconds_count{${label}} 0`);
+  });
+
+  test("a duration exactly on a bound falls in that bucket; a negative one counts as 0", () => {
+    const m = make();
+    m.onRegister?.("echo");
+    m.record(callRecord({ tool: "echo", durationMs: 10 }));
+    m.record(callRecord({ tool: "echo", durationMs: -50 }));
+    const out = m.render();
+    expect(out).toContain('app_mcp_tool_latency_seconds_bucket{tool="echo",le="0.01"} 2');
+    expect(out).toContain('app_mcp_tool_latency_seconds_sum{tool="echo"} 0.01');
+    expect(out).toContain('app_mcp_tool_latency_seconds_count{tool="echo"} 2');
   });
 
   test("refuses a bad prefix or buckets", () => {

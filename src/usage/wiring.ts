@@ -11,18 +11,26 @@ export type CallTokens = Readonly<
 /** Prices one call's tokens: `costUsd` and `costNote` for its record. */
 export type CallPricer = (tokens: CallTokens, estimated: boolean) => TokenCost;
 
+/** A token count as priced: an estimate may be fractional or odd, so it is rounded and floored at 0. */
+const wholeTokens = (n: number): number => (Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0);
+
 /**
  * The pricer for a runs slice's price table (`priceTokens`, so a call costs
  * what a run with the same tokens costs), or, with no slice, one that prices
- * nothing: `costUsd` null, `costNote` "unpriced:<models>", sorted. No tokens:
- * no cost and no note (nothing was metered).
+ * nothing: `costUsd` null, `costNote` "unpriced:<models>", the models sorted
+ * and the list cut at 200 characters. No tokens: no cost and no note (nothing
+ * was metered). Counts are rounded to whole tokens first.
  */
 export function callPricer(prices: RunsSlice | null): CallPricer {
   return (tokens, estimated) => {
     const models = Object.keys(tokens);
     if (models.length === 0) return { costUsd: null, costNote: null };
     if (prices === null) return { costUsd: null, costNote: unpricedNote(models) };
-    return priceTokens(prices, new Map(Object.entries(tokens)), { metered: true, estimated });
+    const whole = Object.entries(tokens).map(
+      ([model, t]) =>
+        [model, { input: wholeTokens(t.input), output: wholeTokens(t.output) }] as const,
+    );
+    return priceTokens(prices, new Map(whole), { metered: true, estimated });
   };
 }
 

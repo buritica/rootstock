@@ -12,16 +12,12 @@ export { type PrometheusToolMetrics, prometheusToolMetrics } from "./prometheus.
 export { type UsageSlice, type UsageSliceInput, usageSlice } from "./slice.ts";
 export {
   createSpendCeiling,
+  type ErrorConstructorOf,
+  type PostgresSpendStoreOptions,
   postgresSpendStore,
   type SpendCeilingOptions,
   type SpendStore,
   type SpendStoreShape,
   type SpendUnit,
 } from "./spend.ts";
-export {
-  type CallPricer,
-  type CallTokens,
-  callPricer,
-  type UsageWiringOptions,
-  usageWiring,
-} from "./wiring.ts";
+export { type UsageWiringOptions, usageWiring } from "./wiring.ts";
