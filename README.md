@@ -30,6 +30,7 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 | `golden` | v0.0.1 | Golden snapshots that prove a refactor or extraction changed nothing: canonical JSON, capture/check, a recording `fetch`, seeded vectors and throwaway Postgres |
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
 | `retrieval` | v0.9.0 | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), with an optional candidate `budget` (a `set local` run first, since the index caps candidates before SQL `limit`), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable. The database needs the extension and a `lakebase_bm25` index built after the table is populated |
+| `runner` | v0.11.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record), plan mode (`planPull`) and the queue drain (`drainQueue`) |
 
 More arrive in phases. Phase 1 extractions must be byte-identical: each
 consumer adopts a module only where its goldens stay unchanged. Changes that
@@ -208,8 +209,11 @@ forward on 0.8.x only: an older line can never ship a migration there.
 - **Present the claim.** `ack`, `fail` and `extendClaim` take the `claim`
   the row came back with from `claim`; a stale holder whose row was
   reclaimed matches nothing and gets `missing`. `extendClaim` answering
-  `"changed"` means new work arrived since the claim: keep going, and the
-  ack releases the row for its next run instead of deleting it.
+  `"changed"` means new work arrived since the claim: the claim is still
+  extended (0.11.0), so keep going, and the ack releases the row for its
+  next run instead of deleting it. `queue.claim_extended` carries
+  `changed: boolean` (0.11.0). Every writer of the table must run rootstock
+  0.8.0 or later, or new work never bumps the version and is not seen.
 - **An enqueue on a dead key is parked.** When the key is dead-lettered, the
   enqueue coalesces into the dead row and reports `queue.enqueued` with
   `result: "on_dead"`. Nothing claims it until someone calls `retryDead`, so
@@ -267,6 +271,87 @@ forward on 0.8.x only: an older line can never ship a migration there.
 - **A refused run records no buckets.** `finish("refused")` writes NULL
   buckets and `reconciled` even after `account()`; counters, tokens and cost
   are still recorded.
+
+### Pull runner and drain
+
+`@buritica/rootstock/runner` (0.11.0) runs a pull source and drains a queue.
+
+- **`runPull` fetches outside any transaction.** Per batch it reads what is
+  stored (`existing`), fetches what changed at most `fetchConcurrency` at a
+  time, then opens one transaction for the batch's loads, quarantine rows,
+  resolves and cursor. A fetch can take minutes without holding a backend
+  idle in a transaction.
+- **A killed run converges.** The cursor moves with the batch that covers
+  it, so a run killed mid-batch leaves that batch uncommitted and the next
+  run lists it again. That needs `list(cursorOf(r))` to return every ref
+  after `r`: when refs can share a cursor across a batch boundary, `list`
+  must be inclusive (equal cursors come back, already-stored ones are
+  skipped as unchanged).
+- **The lock is the caller's.** Acquire it, start its keepalive, and release
+  it after `runPull` returns. The runner gates it before each batch, before
+  each fetch, after the fetch pass, before each doc's writes and as the
+  batch transaction's last step. A refusal settles `failed` (`lost-lock`)
+  with the totals committed so far; inside the transaction it also rolls
+  the batch back.
+- **A quota trip stops after the ref that tripped it.** With `quota`, a doc
+  counts one hit when its load throws what `isQuota` recognises, or when its
+  `tryRepoint` or `load` called `ctx.quotaHit()` (even if the load then threw
+  something else, or the doc turned out unchanged). A load that resolves
+  without calling it clears the count; other throws leave it. At the
+  breaker's limit the batch commits through that ref, the cursor lands on
+  it, and the run settles `failed` (`quota`), even when that ref was the
+  listing's last. Nothing already paid for is rolled back.
+- **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run
+  at once. A refusal from `runs` emits `runner.settle_refused` and never
+  fails the load. They are not undone when the batch rolls back.
+- **`quarantined` counts duplicates too.** A repeat of an id already
+  processed in the run counts as quarantined without a quarantine row, so
+  the report's `quarantined` can exceed the rows written to the table.
+- **A commit that may have landed reads as a rollback.** If the connection
+  drops after COMMIT is sent, the runner reports `runner.batch_rolled_back`
+  and leaves the batch out of the totals; the next run lists from the stored
+  cursor and skips what did land as unchanged.
+- **Fold long exclusion lists.** Each `excluded` reason becomes a key of the
+  run's `excludedReasons`, so a source with many reasons folds them before
+  returning the listing. An empty reason, or one with a NUL, fails the run
+  as a `list` failure.
+- **Events inside a batch can describe a rollback.** `runs.quarantined`,
+  `runs.resolved` and `queue.cursor_written` fire inside the batch
+  transaction; when the batch rolls back, `runner.batch_rolled_back` follows.
+- **Keep slow calls out of `load`.** `load` runs inside the batch
+  transaction, one doc at a time, so a model call there holds the backend
+  idle in the transaction for as long as the batch's loads take. Do slow
+  work in `fetch` where you can, and size `batchSize` to what the loads
+  cost. Fetch errors never count toward the quota breaker: a source's
+  `fetch` handles its own API's limits.
+- **A killed run's row has no totals.** The buckets, counters and tokens
+  reach the row only when the run settles. A run killed after some batches
+  committed reads `interrupted` with no buckets and no cost, though its
+  rows, quarantine entries (tagged with its `runId`) and paid calls landed.
+- **Check `recorded` before trusting the row.** `runner.pull_finished`
+  carries `recorded: false` (and the report `finish.written: false`) when
+  the settle could not write the run row.
+- **`planPull` writes nothing.** It lists, fetches and classifies each ref
+  as the run would, batch by batch, and stops before load. A source with
+  `planLoad` gets the docs that would load inside a READ ONLY transaction,
+  opened after the batch's fetches, that always rolls back. `maxRefs` plans
+  only the first refs (`truncated: true`); `cursor.wouldStore` is then the
+  cursor after the planned refs, not what a full run would store.
+- **`drainQueue` holds one lock per source.** It takes each source's lock
+  without waiting (a refusal `isHeld` recognises skips the source; any other
+  propagates), claims a batch, and acks or fails each row, with one archival
+  cap across the whole drain, a contention brake, an interrupt and a fatal
+  stop. Rows left after a cap, an interrupt or a fatal error are failed with
+  your `heldClass` text and an attempt charged. Rows left after a jam, and a
+  row whose ack or fail was contended, stay claimed until the claim expires
+  (`leftClaimed` counts them). A throw from `record.start` ends the source
+  as a `queue` failure, its claimed rows likewise left claimed. A lock
+  whose teardown throws emits `drain.release_failed` and pages.
+  Failing a held row charges it an attempt and its backoff, as a reclaim
+  would, so a stop near `maxAttempts` can dead-letter rows no handler saw.
+- **A killed drain's record is settled by the next drain that claims rows.**
+  `record.start` runs only after a claim returned rows, so an empty drain
+  leaves an earlier `running` row as it was.
 
 ## Rules
 

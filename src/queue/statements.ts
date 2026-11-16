@@ -28,7 +28,7 @@ export interface QueueStatements {
   readonly listDead: string;
   /** Q7, params [claimTimeoutMinutes]. */
   readonly depth: string;
-  /** Q8, params [key, worker, token]. */
+  /** Q8, params [key, worker, token, version]. */
   readonly extendClaim: string;
 }
 
@@ -167,14 +167,9 @@ LIMIT $2::int`,
 FROM ${T}
 GROUP BY source
 ORDER BY source`,
-    extendClaim: `WITH e AS (
-  UPDATE ${T} SET claimed_at = clock_timestamp()
-  WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
-    AND updated_at <= claimed_at
-  RETURNING 1
-)
-SELECT (SELECT count(*) FROM e)::text AS extended,
-       (SELECT count(*) FROM ${T} WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid)::text AS held`,
+    extendClaim: `UPDATE ${T} SET claimed_at = clock_timestamp()
+WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
+RETURNING (version = $4::text::bigint) AS same`,
   });
 }
 

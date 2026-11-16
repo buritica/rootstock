@@ -359,9 +359,12 @@ export async function fail(
 
 /**
  * Q8. Moves a held claim's `claimed_at` to now, so a long job is not
- * reclaimed. `changed` when an enqueue landed since the claim: extending
- * would let ack delete the new work, so the claim is left as it is and the
- * worker's ack will release. `missing` when this claim no longer holds it.
+ * reclaimed, whenever the claim's token still holds. `changed` when it was
+ * extended but an enqueue landed since the claim: the ack will then release
+ * the row for another pass rather than delete it (Q3 deletes only on the
+ * claim's version). `missing` when this claim no longer holds it: the
+ * UPDATE re-checks the newest row version after any wait, so a reclaim that
+ * committed meanwhile reads as missing.
  */
 export async function extendClaim(
   scope: Transactor | TxSql,
@@ -371,20 +374,20 @@ export async function extendClaim(
 ): Promise<ExtendResult> {
   const st = statementsOf("extendClaim", s);
   const emit = emitter(hooks);
-  // The whole claim is validated (§9.2), though Q8 sends only its token.
   const c = checkClaim(emit, a.key, a.claim);
   const row = await underAckLock(scope, s, emit, { ...a, operation: "extend" }, st.extendClaim, [
     a.key,
     a.worker,
     c.token,
+    c.version,
   ]);
-  if (Number(row?.extended) === 1) {
-    emit({ type: "queue.claim_extended", key: a.key, worker: a.worker });
-    return "extended";
+  if (row === undefined) {
+    emit({ type: "queue.lost", key: a.key, worker: a.worker, operation: "extend" });
+    return "missing";
   }
-  if (Number(row?.held) === 1) return "changed";
-  emit({ type: "queue.lost", key: a.key, worker: a.worker, operation: "extend" });
-  return "missing";
+  const changed = !bool(row.same);
+  emit({ type: "queue.claim_extended", key: a.key, worker: a.worker, changed });
+  return changed ? "changed" : "extended";
 }
 
 /** Q5. Puts a dead row back, due now with a clean slate. False when it was not dead. */

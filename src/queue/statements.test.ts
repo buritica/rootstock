@@ -22,7 +22,7 @@ const ALL: [string, string, number][] = [
   ["Q5", q.retryDead, 1],
   ["Q6", q.listDead, 2],
   ["Q7", q.depth, 1],
-  ["Q8", q.extendClaim, 3],
+  ["Q8", q.extendClaim, 4],
   ["K1 text", textCursor.get, 1],
   ["K2 text", textCursor.set, 2],
   ["K3 text", textCursor.touch, 2],
@@ -55,7 +55,7 @@ describe("QT1: built statements", () => {
 
   test("every table-bound statement names the table", () => {
     for (const [id, text] of ALL.slice(2)) expect(text, id).toContain('"rs_a"."wq"');
-    expect(q.extendClaim.split('"rs_a"."wq"').length).toBe(3);
+    expect(q.extendClaim.split('"rs_a"."wq"').length).toBe(2);
   });
 
   test("a text cursor binds the value as text; a jsonb one casts it through text", () => {
@@ -205,14 +205,9 @@ LIMIT $2::int`,
 FROM <T>
 GROUP BY source
 ORDER BY source`,
-  Q8: `WITH e AS (
-  UPDATE <T> SET claimed_at = clock_timestamp()
-  WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
-    AND updated_at <= claimed_at
-  RETURNING 1
-)
-SELECT (SELECT count(*) FROM e)::text AS extended,
-       (SELECT count(*) FROM <T> WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid)::text AS held`,
+  Q8: `UPDATE <T> SET claimed_at = clock_timestamp()
+WHERE key = $1 AND claimed_by = $2 AND claim_token = $3::uuid AND dead_at IS NULL
+RETURNING (version = $4::text::bigint) AS same`,
   K1: `SELECT value::text AS value FROM <C> WHERE name = $1`,
   K2: `INSERT INTO <C> (name, value, updated_at)
 VALUES ($1, <V>, clock_timestamp())
