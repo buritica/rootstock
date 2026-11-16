@@ -6,6 +6,7 @@ import {
   canCallTool,
   defineToolScopes,
   expandScopes,
+  type MethodAnswer,
   type ServeProfile,
   type ToolScopes,
   type UsageWiring,
@@ -274,11 +275,39 @@ test("the shared types admit a complete value", () => {
     sinks: [sink],
     keepArgs: true,
     keepOutput: false,
-    prices: null,
+    price: () => ({ costUsd: null, costNote: null }),
+    errorClassOf: () => "Error",
     spend: null,
     serverSha: null,
   };
   wiring.sinks[0]?.record(record);
   expect(seen).toEqual([record]);
   expect(profile.entry.kind).toBe("transport");
+});
+
+// Compile-time (typecheck only): every rev 3 member is admitted and the
+// pre-rev-3 spellings are refused, so a stale profile fails to build.
+test("ServeProfile admits the rev 3 members and refuses the old ones", () => {
+  const answers = [
+    "405-first",
+    "auth-then-405",
+    "auth-then-entry",
+  ] as const satisfies readonly MethodAnswer[];
+  const jwks = [
+    "503-retry",
+    "500-empty",
+    "jsonrpc-500",
+  ] as const satisfies readonly ServeProfile["bodies"]["jwksFailure"][];
+  // @ts-expect-error "500-json" was the rev 2 spelling
+  const staleJwks: ServeProfile["bodies"]["jwksFailure"] = "500-json";
+  // @ts-expect-error "405" is not a MethodAnswer
+  const staleGet: ServeProfile["methods"]["get"] = "405";
+  const staleMethods: ServeProfile["methods"] = {
+    get: "405-first",
+    // @ts-expect-error HEAD falls under `other`; there is no `head` key
+    head: "auth-then-entry",
+    other: "auth-then-entry",
+  };
+  expect([answers.length, jwks.length]).toEqual([3, 3]);
+  expect([staleJwks, staleGet, staleMethods.get]).toHaveLength(3);
 });

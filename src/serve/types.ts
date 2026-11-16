@@ -81,8 +81,13 @@ export interface UsageWiring {
   sinks: readonly CallSink[];
   keepArgs: boolean;
   keepOutput: boolean;
-  /** A RunsSlice, typed in `usage`; null → costNote "unpriced:<models>". */
-  prices: unknown | null;
+  /** Built by `usage` from the runs prices (serve cannot import `runs`). Called only when the call metered tokens; no prices → costUsd null, costNote "unpriced:<models>". */
+  price: (
+    tokens: Readonly<Record<string, { input: number; output: number }>>,
+    estimated: boolean,
+  ) => { costUsd: string | null; costNote: string | null };
+  /** `usage`'s errorClassOf: `classify` first (the service's classifyError hook), then the generic walk; never a message. */
+  errorClassOf: (err: unknown, classify?: (err: unknown) => string | undefined) => string;
   spend: SpendCharger | null;
   serverSha: string | null;
 }
@@ -96,7 +101,11 @@ export interface StoppableServer {
   pending(): number;
 }
 
-/** How `mcpPath` answers a method other than POST. "auth-then-entry" hands the bodiless request to the SDK entry and returns its answer untouched. */
+/**
+ * How `mcpPath` answers a method other than POST (contract §3.2 step 1).
+ * "405-first": the 405 before auth. "auth-then-405": auth (steps 5.1–5.7), then the 405.
+ * "auth-then-entry": auth, then the SDK entry with no body (5.8 and 5.9 skipped); its answer passes through untouched.
+ */
 export type MethodAnswer = "405-first" | "auth-then-405" | "auth-then-entry";
 
 /** Every field is required: a profile states each consumer's behaviour, never a default. */
@@ -104,7 +113,7 @@ export interface ServeProfile {
   id: string;
   /** "/mcp" */
   mcpPath: string;
-  /** "other" = every method but GET and POST. */
+  /** "other" = every method but GET and POST, HEAD included. */
   methods: { get: MethodAnswer; other: MethodAnswer };
   /** true: return null for paths the service does not own. */
   passUnknown: boolean;
