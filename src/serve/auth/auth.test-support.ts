@@ -62,7 +62,12 @@ export function shapeOptions(
     },
     assets: {},
     clock: deps.clock,
-    timers: { set: () => () => undefined },
+    timers: {
+      set: (ms: number, fn: () => void) => {
+        const handle = setTimeout(fn, ms);
+        return () => clearTimeout(handle);
+      },
+    },
     log: (event: string, fields: Readonly<Record<string, unknown>>) => {
       deps.logs.push({ event, fields });
     },

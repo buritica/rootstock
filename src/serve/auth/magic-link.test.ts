@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { address, harness, IP_HEADER, jsonPost, type Shape } from "./auth.test-support.ts";
+import {
+  address,
+  harness,
+  IP_HEADER,
+  jsonPost,
+  ManualClock,
+  type Shape,
+} from "./auth.test-support.ts";
+import { createMagicLinkSender } from "./magic-link.ts";
 import type { AuthLayer } from "./types.ts";
 
 async function invite(layer: AuthLayer, email: string): Promise<string> {
@@ -27,8 +35,8 @@ async function answer(res: Response) {
   return { status: res.status, body: await res.text() };
 }
 
-// Lets the deferred send start.
-const tick = () => new Promise((resolve) => setImmediate(resolve));
+// Lets the send the layer scheduled with timers.set(0, …) run.
+const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
 describe("magic-link timing", () => {
   test.each<Shape>(["owner", "invited"])(
@@ -163,5 +171,104 @@ describe("the per-address send limit", () => {
       status: 200,
       body: '{"status":true}',
     });
+  });
+});
+
+describe("review fixes", () => {
+  test("the send runs on the injected timer, after the response, even when the sender blocks", async () => {
+    const queued: (() => void)[] = [];
+    let ran = false;
+    const h = harness(
+      "invited",
+      (o) => ({
+        ...o,
+        timers: {
+          set: (_ms, fn) => {
+            queued.push(fn);
+            return () => undefined;
+          },
+        },
+      }),
+      () => {
+        ran = true; // synchronous work a sender might do before its first await
+        return Promise.resolve();
+      },
+    );
+    await invite(h.layer, address("member"));
+    expect((await signIn(h.layer, address("member"))).status).toBe(200);
+    expect(ran).toBe(false);
+    expect(queued).toHaveLength(1);
+    queued[0]?.();
+    expect(ran).toBe(true);
+  });
+
+  const runNow = {
+    set: (_ms: number, fn: () => void) => {
+      fn();
+      return () => undefined;
+    },
+  };
+  const limit = { max: 1, windowMs: 60_000, releaseOnFailure: true };
+  const known = {
+    context: { internalAdapter: { findUserByEmail: async () => ({ user: { id: "u1" } }) } },
+  };
+
+  test("a throwing logger after a failed send raises nothing", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const send = createMagicLinkSender(
+        {
+          kind: "magicLink",
+          allow: { kind: "invited" },
+          send: async () => Promise.reject(new Error("down")),
+          sendLimit: limit,
+        },
+        null,
+        {
+          clock: new ManualClock(),
+          timers: runNow,
+          log: () => {
+            throw new Error("log down");
+          },
+        },
+      );
+      await send({ email: address("member"), url: "https://app.example.test/x" }, known);
+      await tick();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
+  });
+
+  test("a missing endpoint context sends nothing and says so", async () => {
+    const logs: string[] = [];
+    let sent = false;
+    const send = createMagicLinkSender(
+      {
+        kind: "magicLink",
+        allow: { kind: "invited" },
+        send: async () => {
+          sent = true;
+        },
+        sendLimit: limit,
+      },
+      null,
+      { clock: new ManualClock(), timers: runNow, log: (_e, f) => logs.push(String(f.reason)) },
+    );
+    await send({ email: address("member"), url: "https://app.example.test/x" }, null);
+    expect(sent).toBe(false);
+    expect(logs).toEqual(["no-context"]);
+  });
+
+  // Pinned as it stands, not endorsed: during a store outage the user lookup
+  // throws, so an owner's address gets Better Auth's 500 while any other
+  // address is refused before the lookup and still gets the generic 200.
+  test("a failing user lookup: 500 for an owner, 200 for a non-owner", async () => {
+    const h = harness("owner");
+    delete h.db.user;
+    expect((await signIn(h.layer, address("owner"))).status).toBe(500);
+    expect((await signIn(h.layer, address("member"))).status).toBe(200);
   });
 });

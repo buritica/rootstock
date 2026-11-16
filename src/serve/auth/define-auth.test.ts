@@ -291,7 +291,13 @@ describe("assertStoreReady", () => {
   test("rejects when the store cannot answer", async () => {
     const { layer, db } = harness("owner");
     delete db.oauthResource;
-    await expect(layer.assertStoreReady()).rejects.toThrow();
+    const err = (await layer.assertStoreReady().catch((e: unknown) => e)) as Error & {
+      code?: string;
+    };
+    expect(err.code).toBe("ERR_ROOTSTOCK_AUTH_CONFIG");
+    expect(err.cause).toBeInstanceOf(Error);
+    // The driver's text (here the adapter's model name) stays on `cause`.
+    expect(err.message).not.toContain("oauthResource");
   });
 });
 

@@ -1,10 +1,15 @@
 // The `sendMagicLink` callback. Better Auth's `disableSignUp` stops only the
 // verify step from creating a user: it still asks for a link for any address,
 // so this callback decides who is mailed. The caller gets the same 200 either
-// way, and the send is never awaited, so neither the body nor the response
-// time says whether an address has an account.
+// way, and the send runs on a timer after the response, so the sender's own
+// work (synchronous or not) never shows in the response time.
+//
+// Known timing leak, accepted: under an owner allowlist a non-owner is
+// answered before the user lookup (the contract's order, as served today), so
+// an owner's address costs one store round trip more than any other address.
+// That says which addresses are owners; it does not say which have accounts.
 
-import type { Clock, LogEvent } from "../types.ts";
+import type { Clock, LogEvent, Timers } from "../types.ts";
 import type { MagicLinkSignIn } from "./types.ts";
 
 /** The part of Better Auth's endpoint context the callback reads. */
@@ -31,9 +36,16 @@ function userIdOf(found: unknown): string | null {
 export function createMagicLinkSender(
   signIn: MagicLinkSignIn,
   owners: ReadonlySet<string> | null,
-  deps: { clock: Clock; log: LogEvent },
+  deps: { clock: Clock; timers: Timers; log: LogEvent },
 ): (data: { email: string; url: string }, ctx?: MagicLinkContext | null) => Promise<void> {
-  // deps.log must not throw: defineAuth hands in one that swallows its own throws.
+  // The detached send path has no caller to throw to, so its log is guarded here.
+  const logDetached = (event: string, fields: Readonly<Record<string, unknown>>) => {
+    try {
+      deps.log(event, fields);
+    } catch {
+      // Dropped: nothing may escape a timer callback.
+    }
+  };
   const { max, windowMs, releaseOnFailure } = signIn.sendLimit;
   // Send times per address, oldest first. Only known addresses enter, so the
   // map is bounded by the account count; a sweep still runs past SWEEP_AT.
@@ -64,7 +76,12 @@ export function createMagicLinkSender(
       deps.log("auth.magic_link_refused", { reason: owners.size === 0 ? "no-owner" : "not-owner" });
       return;
     }
-    const found = await ctx?.context.internalAdapter.findUserByEmail(email);
+    if (!ctx) {
+      // Better Auth always passes its endpoint context; without it no address can be checked.
+      deps.log("auth.magic_link_refused", { reason: "no-context" });
+      return;
+    }
+    const found = await ctx.context.internalAdapter.findUserByEmail(email);
     if (!found) return;
     const t = deps.clock.now();
     if (sends.size > SWEEP_AT) sweep(t);
@@ -75,12 +92,16 @@ export function createMagicLinkSender(
     }
     times.push(t);
     sends.set(key, times);
-    // Deferred to a microtask so a send that throws synchronously still takes the catch below.
-    Promise.resolve()
-      .then(() => signIn.send(email, url))
-      .catch((err: unknown) => {
-        if (releaseOnFailure) release(key, t);
-        deps.log("auth.magic_link_send_failed", { errorClass: errorClassOf(err) });
-      });
+    const failed = (err: unknown) => {
+      if (releaseOnFailure) release(key, t);
+      logDetached("auth.magic_link_send_failed", { errorClass: errorClassOf(err) });
+    };
+    deps.timers.set(0, () => {
+      try {
+        signIn.send(email, url).then(undefined, failed);
+      } catch (err) {
+        failed(err);
+      }
+    });
   };
 }

@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { toNodeHandler } from "better-auth/node";
@@ -78,4 +79,18 @@ test("a 429 written by Better Auth is logged once, with the path and client give
       },
     },
   ]);
+});
+
+test("a 429 response cut short logs on close, and finish plus close log once", () => {
+  const fresh = harness("owner");
+  const response = () =>
+    Object.assign(new EventEmitter(), { statusCode: 429, setHeader: () => undefined });
+  const aborted = response();
+  fresh.layer.wrapNodeAuthResponse(aborted, "/api/auth/a", "203.0.113.20");
+  aborted.emit("close");
+  const written = response();
+  fresh.layer.wrapNodeAuthResponse(written, "/api/auth/b", "203.0.113.20");
+  written.emit("finish");
+  written.emit("close");
+  expect(fresh.logs.map((l) => l.fields.path)).toEqual(["/api/auth/a", "/api/auth/b"]);
 });

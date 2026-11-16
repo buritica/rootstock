@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { harness, SECRET, type Shape } from "./auth.test-support.ts";
-import { checkAuthSecret, resolveBase } from "./config.ts";
+import { checkAuthSecret, resolveBase, ruleMatches } from "./config.ts";
 import { isAllowedRedirectUri } from "./redirects.ts";
 import type { AuthOptions } from "./types.ts";
 
@@ -234,5 +234,135 @@ describe("defineAuth refuses at build", () => {
   test("a social client secret is never echoed", () => {
     const err = build("social", (o) => ({ ...o, signIn: { ...o.signIn, clientId: "" } }));
     expect(err.message).not.toContain("client-secret-value");
+  });
+});
+
+describe("review fixes", () => {
+  const build = (shape: Shape, change: (o: AuthOptions) => Record<string, unknown>) =>
+    refusal(() => harness(shape, (o) => change(o) as unknown as AuthOptions));
+
+  test("a secret with leading or trailing whitespace is refused", () => {
+    for (const raw of [` ${SECRET}`, `${SECRET}\n`]) {
+      expect(refusal(() => checkAuthSecret(raw)).message).toContain("whitespace");
+    }
+  });
+
+  test.each(["origin-only", "strip-trailing-slash", "as-is"])(
+    "%s: non-https, credentials, a query and a fragment are refused without echoing the URL",
+    (rule) => {
+      for (const raw of [
+        "http://app.example.test",
+        `https://${["user:hunter2-secret", "app.example.test"].join("@")}`,
+        "https://app.example.test/?hunter2-secret=1",
+        "https://app.example.test/#hunter2-secret",
+        "https://app.example.test?",
+      ]) {
+        const err = refusal(() => resolveBase(raw, rule));
+        expect(err.code).toBe(CODE);
+        expect(err.message).not.toContain("hunter2");
+        expect(err.message).not.toContain(raw);
+      }
+      expect(resolveBase("http://127.0.0.1:8080", rule).resource).toBe("http://127.0.0.1:8080/mcp");
+    },
+  );
+
+  test("hd may not be a wildcard", () => {
+    const err = build("social", (o) => ({ ...o, signIn: { ...o.signIn, hd: "*" } }));
+    expect(err.message).toContain("wildcard");
+  });
+
+  test.each([
+    "client.example.test.",
+    "client.example.test:443",
+    "client.example.test/cb",
+    "bücher.example.test",
+    "::1",
+    ["user", "client.example.test"].join("@"),
+  ])("redirect host %p is refused", (host) => {
+    const err = build("owner", (o) => ({
+      ...o,
+      redirects: { kind: "listed", hosts: [host], loopback: "if-listed" },
+    }));
+    expect(err.code).toBe(CODE);
+    expect(err.message).toContain("bare hostname");
+  });
+
+  test("redirect hosts are lowercased; bracketed IPv6 is accepted", () => {
+    const { layer } = harness("owner", (o) => ({
+      ...o,
+      redirects: { kind: "listed", hosts: ["Client.Example.TEST", "[::1]"], loopback: "if-listed" },
+    }));
+    expect(layer.resource).toBe("https://app.example.test/mcp");
+  });
+
+  test("an inherited option does not count as given", () => {
+    const err = build("owner", (o) => {
+      const { log, ...rest } = o;
+      return Object.assign(Object.create({ log }), rest);
+    });
+    expect(err.message).toContain("log must be a function");
+  });
+
+  test("isAllowedRedirectUri is not exported", async () => {
+    const mod: Record<string, unknown> = await import("./index.ts");
+    expect(Object.keys(mod).sort()).toEqual(["checkAuthSecret", "defineAuth"]);
+  });
+});
+
+describe("/jwks stays unmetered", () => {
+  test("the exemption is the first custom rule Better Auth sees", () => {
+    const { layer } = harness("owner");
+    expect(Object.keys(layer.instance.options.rateLimit?.customRules ?? {})[0]).toBe("/jwks");
+  });
+
+  test.each(["/*", "/j*", "/*ks", "/**", "/jw?s*"])(
+    "a rule key %p that matches /jwks is refused",
+    (key) => {
+      const err = refusal(() =>
+        harness("owner", (o) => ({
+          ...o,
+          rateLimit: { ...o.rateLimit, rules: { [key]: { window: 60, max: 1 } } },
+        })),
+      );
+      expect(err.code).toBe(CODE);
+      expect(err.message).toContain('matches "/jwks"');
+    },
+  );
+
+  test.each(["/oauth2/*", "/sign-in/*", "/jwk", "/j\\*"])("%p is accepted", (key) => {
+    expect(() =>
+      harness("owner", (o) => ({
+        ...o,
+        rateLimit: { ...o.rateLimit, rules: { [key]: { window: 60, max: 1 } } },
+      })),
+    ).not.toThrow();
+  });
+
+  // ruleMatches restates Better Auth's matcher; hold it to the real limiter.
+  let source = 0;
+  test.each<[string, string]>([
+    ["/ok*", "/ok-1"],
+    ["/a?c*", "/abc"],
+    ["/a?c*", "/ac"],
+    ["/x\\*y*", "/x*y1"],
+    ["/x\\*y*", "/xzy1"],
+    ["/p.q*", "/pzq"],
+    ["/exact", "/exact"],
+    ["/exact", "/exactly"],
+  ])("ruleMatches(%p, %p) agrees with Better Auth 1.7.17", async (pattern, path) => {
+    const { layer } = harness("owner", (o) => ({
+      ...o,
+      rateLimit: { ...o.rateLimit, rules: { [pattern]: { window: 60, max: 1 } } },
+    }));
+    const ip = `203.0.113.${++source}`;
+    const hit = () =>
+      layer.handle(
+        new Request(`https://app.example.test/api/auth${path}`, {
+          headers: { "cf-connecting-ip": ip },
+        }),
+      );
+    await hit();
+    const limited = (await hit()).status === 429;
+    expect(ruleMatches(pattern, `${path}`)).toBe(limited);
   });
 });

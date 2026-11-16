@@ -1,6 +1,6 @@
 // The `serve/auth` contract: what `defineAuth` takes and the layer it returns.
 // `serve` declares the structural subset it uses on its own side (it may not
-// import this subpath), so this shape is the one it is checked against.
+// import this subpath); this `AuthLayer` must stay assignable to that subset.
 
 import type { Auth } from "better-auth";
 import type { Clock, LogEvent, Timers } from "../types.ts";
@@ -66,6 +66,7 @@ export interface AuthOptions {
   /** Unmetered static files by exact path. */
   assets: Readonly<Record<string, { body: () => Blob; headers: Readonly<Record<string, string>> }>>;
   clock: Clock;
+  /** Schedules the magic-link send after the response (`set(0, …)`). */
   timers: Timers;
   log: LogEvent;
 }
@@ -73,7 +74,7 @@ export interface AuthOptions {
 /** The response surface `wrapNodeAuthResponse` touches: a node `ServerResponse` fits. */
 export interface NodeAuthResponse {
   setHeader(n: string, v: string): void;
-  on(e: "finish", f: () => void): void;
+  on(e: "finish" | "close", f: () => void): void;
   statusCode: number;
 }
 

@@ -82,7 +82,11 @@ export function defineAuth(o: AuthOptions): AuthLayer {
     cimd({ fetchClientMetadataResource, metadataProfile: CIMD_PROFILE }),
   ];
   if (o.signIn.kind === "magicLink") {
-    const send = createMagicLinkSender(o.signIn, checked.owners, { clock: o.clock, log: emit });
+    const send = createMagicLinkSender(o.signIn, checked.owners, {
+      clock: o.clock,
+      timers: o.timers,
+      log: emit,
+    });
     plugins.push(magicLink({ disableSignUp: true, sendMagicLink: send }));
   }
 
@@ -189,13 +193,22 @@ export function defineAuth(o: AuthOptions): AuthLayer {
 
     async assertStoreReady(): Promise<void> {
       // `$context` resolves even when the provider's startup seed failed, so
-      // read the resource row back: a down or unmigrated store throws here,
-      // and one that answers without the row is refused.
-      const ctx = await instance.$context;
-      const row = await ctx.adapter.findOne({
-        model: "oauthResource",
-        where: [{ field: "identifier", value: base.resource }],
-      });
+      // read the resource row back: a down or unmigrated store is refused,
+      // and so is one that answers without the row. A driver error can carry
+      // connection details, so it rides as `cause`, never in the message.
+      let row: unknown;
+      try {
+        const ctx = await instance.$context;
+        row = await ctx.adapter.findOne({
+          model: "oauthResource",
+          where: [{ field: "identifier", value: base.resource }],
+        });
+      } catch (err) {
+        throw Object.assign(
+          authConfigError("assertStoreReady", "the auth store could not be read; see cause"),
+          { cause: err },
+        );
+      }
       if (!row) {
         throw authConfigError(
           "assertStoreReady",
@@ -210,7 +223,15 @@ export function defineAuth(o: AuthOptions): AuthLayer {
         () => false,
         (n, v) => res.setHeader(n, v),
       );
-      res.on("finish", () => logIf429(res.statusCode, path, client, null));
+      // `finish` when the response is written, `close` when it is cut short; log once.
+      let logged = false;
+      const once = () => {
+        if (logged) return;
+        logged = true;
+        logIf429(res.statusCode, path, client, null);
+      };
+      res.on("finish", once);
+      res.on("close", once);
     },
   } satisfies AuthLayer);
 }
