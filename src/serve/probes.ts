@@ -3,7 +3,8 @@
 
 import type { Sql } from "../db/index.ts";
 import type { MigrationStatus } from "../migrate/index.ts";
-import { className, configError } from "./errors.ts";
+import { raceDeadline } from "./deadline.ts";
+import { className, configError, isNonNegativeNumber } from "./errors.ts";
 import type { Clock, LogEvent, Timers } from "./types.ts";
 
 /** A JSON body serialized once; every call answers 200 with it. */
@@ -28,7 +29,7 @@ export interface ProbeTiming {
 function assertTiming(fn: string, t: ProbeTiming): void {
   for (const k of ["timeoutMs", "cacheTtlMs", "pendingMaxMs"] as const) {
     const v = t?.[k];
-    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    if (!isNonNegativeNumber(v)) {
       throw configError(fn, `timing.${k} must be a finite number >= 0`, v);
     }
   }
@@ -66,17 +67,12 @@ export function cachedProbe<T>(
     const settle = () => {
       if (pendingSince === startedAt) pendingSince = undefined;
     };
-    const query = (async () => compute())();
+    // Through .then, so a compute that throws synchronously rejects instead.
+    const query = Promise.resolve().then(compute);
     void query.then(settle, settle);
-    let cancel: (() => void) | undefined;
     try {
-      const outcome = await Promise.race([
-        query.then((value) => ({ kind: "ok" as const, value })),
-        new Promise<{ kind: "timeout" }>((resolve) => {
-          cancel = timers.set(timing.timeoutMs, () => resolve({ kind: "timeout" }));
-        }),
-      ]);
-      if (outcome.kind === "timeout") {
+      const outcome = await raceDeadline(timers, timing.timeoutMs, query);
+      if (outcome === "timeout") {
         log("serve.probe_timeout", { probe: label, timeoutMs: timing.timeoutMs });
         return undefined;
       }
@@ -85,13 +81,13 @@ export function cachedProbe<T>(
       // The message is for the operator's log only; the unauthenticated route never carries it.
       log("serve.probe_failed", { probe: label, errorClass: className(err), error: err });
       return undefined;
-    } finally {
-      cancel?.();
     }
   };
 
   return () => {
     if (verdict && clock.monotonic() < verdict.expiresAt) return Promise.resolve(verdict.state);
+    // probeOnce catches its own failures, but a throwing `log` would still
+    // reject it; the probe answers undefined then, and inFlight is cleared.
     inFlight ??= probeOnce()
       .catch((): T | undefined => undefined)
       .then((state) => {

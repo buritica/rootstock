@@ -77,6 +77,29 @@ describe("createRateLimiter", () => {
     expect(rl.allow("a")).toBe(true);
   });
 
+  test("allowN spends n at once; a refusal spends the whole tokens, as n single charges would", () => {
+    const clock = fakeClock();
+    const rl = createRateLimiter({ capacity: 3, refillPerSecond: 1, maxKeys: 10, clock });
+    expect(rl.allowN("a", 0)).toBe(true);
+    expect(rl.allowN("a", 2)).toBe(true); // 1 left
+    clock.advance(500); // 1.5
+    expect(rl.allowN("a", 2)).toBe(false); // spends the 1, keeps the 0.5
+    expect(rl.peek("a")).toBe(false);
+    clock.advance(500);
+    expect(rl.allow("a")).toBe(true);
+  });
+
+  test("prunes from the least recently touched end, stopping at the first bucket not yet full", () => {
+    const clock = fakeClock();
+    const rl = createRateLimiter({ capacity: 1, refillPerSecond: 1, maxKeys: 2, clock });
+    rl.allow("a");
+    clock.advance(1_000);
+    rl.allow("b"); // a is full again, b is empty; order a, b
+    rl.allow("c"); // prunes a, stops at b
+    expect(rl.allow("b")).toBe(false);
+    expect(rl.allow("a")).toBe(true);
+  });
+
   for (const [field, bad] of [
     ["capacity", 0],
     ["refillPerSecond", Number.NaN],

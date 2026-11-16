@@ -13,6 +13,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type McpServer, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import { isRecord, safeHook } from "../internal/slice.ts";
 import { className, configError } from "./errors.ts";
 import {
   type BucketLimits,
@@ -176,13 +177,9 @@ function makeHandle(state: CallState, usage: UsageWiring | null, caller: Caller)
       state.tokens[u.model] = t;
       state.metered = true;
       if (u.estimated) state.estimated = true;
-      // The charger logs its own write failures; this keeps the rejection
+      // The charger logs its own write failures; safeHook keeps the rejection
       // handled, and a charger that throws synchronously never fails the call.
-      try {
-        Promise.resolve(spend()?.record(u)).catch(() => {});
-      } catch {
-        // As above.
-      }
+      safeHook((x: Usage) => spend()?.record(x), u);
     },
     async assertWithinSpend() {
       await spend()?.assertWithin();
@@ -192,12 +189,15 @@ function makeHandle(state: CallState, usage: UsageWiring | null, caller: Caller)
 
 // ---------------------------------------------------------- shared runtime
 
+/** A tool's concurrency group: the shared limiter and the group's busy text. */
+interface ToolGroup {
+  tryAcquire(k: string): (() => void) | undefined;
+  busy: (t: string) => string;
+}
+
 interface Runtime {
   perTool: ReadonlyMap<string, RateLimiter>;
-  groups: ReadonlyMap<
-    string,
-    { tryAcquire(k: string): (() => void) | undefined; busy: (t: string) => string }
-  >;
+  groups: ReadonlyMap<string, ToolGroup>;
   turn: { budget: TurnBudget; limits: TurnBudgetLimits } | null;
   rateLimited: (bucket: string, fields: Readonly<Record<string, unknown>>) => void;
 }
@@ -238,10 +238,7 @@ export function seamRuntime(
     declared("limits.perTool", tool);
     perTool.set(tool, createRateLimiter({ ...b, clock }));
   }
-  const groups = new Map<
-    string,
-    { tryAcquire(k: string): (() => void) | undefined; busy: (t: string) => string }
-  >();
+  const groups = new Map<string, ToolGroup>();
   for (const [name, g] of Object.entries(limits.concurrency)) {
     if (typeof g?.busy !== "function") {
       throw configError("createMcpService", `limits.concurrency.${name}.busy must be a function`);
@@ -306,8 +303,9 @@ function firstText(result: unknown): string | undefined {
   }
 }
 
-function isPlainArgs(v: unknown): v is Readonly<Record<string, unknown>> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
+/** The class of a refusal the SDK made before any handler, by its text. */
+function rejectionClass(text: string, tool: string): "UnknownTool" | "RejectedBeforeHandler" {
+  return text === `Tool ${tool} not found` ? "UnknownTool" : "RejectedBeforeHandler";
 }
 
 function errorMessage(err: unknown): string | null {
@@ -318,16 +316,14 @@ function errorMessage(err: unknown): string | null {
   }
 }
 
-/** Installs both seams. Call it before the first `registerTool`. */
-export function installSeams(server: McpServer, o: InstallSeamsOptions): void {
-  installSeamsWith(server, o, { timedOut: () => false });
-}
-
-/** installSeams plus the per-request deadline flag the service owns. */
-export function installSeamsWith(
+/**
+ * Installs both seams. Call it before the first `registerTool`. `extra` is
+ * the per-request deadline flag the service owns; a stdio server leaves it out.
+ */
+export function installSeams(
   server: McpServer,
   o: InstallSeamsOptions,
-  extra: { timedOut: () => boolean },
+  extra: { timedOut: () => boolean } = { timedOut: () => false },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock, log } = o;
   const rt = seamRuntime(o.limits, toolScopes, clock, log);
@@ -419,7 +415,7 @@ export function installSeamsWith(
     const started = clock.monotonic();
     const params = (request as { params?: { name?: unknown; arguments?: unknown } }).params;
     const tool = typeof params?.name === "string" ? params.name : "";
-    const rawArgs = isPlainArgs(params?.arguments) ? params.arguments : undefined;
+    const rawArgs = isRecord(params?.arguments) ? params.arguments : undefined;
     const state: CallState = {
       tool,
       ctx,
@@ -447,7 +443,7 @@ export function installSeamsWith(
           log("serve.turn_budget_exhausted", { tool, used: charge.used });
           const text = JSON.stringify(exhaustedResult(charge, rt.turn.limits.exhausted));
           const result = { content: [{ type: "text", text }] };
-          record(state, "refused", result, started, rawArgs, "TurnBudgetExhausted");
+          record("refused", result, "TurnBudgetExhausted");
           return result;
         }
       }
@@ -461,122 +457,114 @@ export function installSeamsWith(
           err instanceof ProtocolError &&
           err.code === ProtocolErrorCode.InvalidParams
         ) {
-          const errorClass =
-            err.message === `Tool ${tool} not found` ? "UnknownTool" : "RejectedBeforeHandler";
+          const errorClass = rejectionClass(err.message, tool);
           if (o.profile.unknownTool === "isError") {
             result = { isError: true, content: [{ type: "text", text: err.message }] };
-            record(state, "rejected", result, started, rawArgs, errorClass);
+            record("rejected", result, errorClass);
             return result;
           }
-          record(state, "rejected", undefined, started, rawArgs, errorClass);
+          record("rejected", undefined, errorClass);
           throw err;
         }
         state.thrown ??= { err };
-        record(state, state.ran ? "handler" : "rejected", undefined, started, rawArgs);
+        record(state.ran ? "handler" : "rejected", undefined);
         throw err;
       }
       if (state.refused !== undefined) {
-        record(state, "refused", result, started, rawArgs, state.refused);
+        record("refused", result, state.refused);
       } else if (!state.ran) {
         const text = firstText(result) ?? "";
         const errorClass = text.startsWith(INPUT_VALIDATION_PREFIX)
           ? "InvalidParams"
-          : text === `Tool ${tool} not found`
-            ? "UnknownTool"
-            : "RejectedBeforeHandler";
-        record(state, "rejected", result, started, rawArgs, errorClass);
+          : rejectionClass(text, tool);
+        record("rejected", result, errorClass);
       } else {
-        record(state, "handler", result, started, rawArgs);
+        record("handler", result);
       }
       return result;
     });
-  }
 
-  function record(
-    state: CallState,
-    stage: CallStage,
-    result: unknown,
-    started: number,
-    rawArgs: Readonly<Record<string, unknown>> | undefined,
-    fixedClass?: string,
-  ): void {
-    if (sinks.length === 0 || usage === null) return;
-    let r: CallRecord;
-    try {
-      r = buildRecord(state, stage, result, started, rawArgs, fixedClass, usage);
-    } catch (err) {
-      log("usage.sink_failed", { tool: state.tool, stage: "build", errorClass: className(err) });
-      return;
-    }
-    for (const sink of sinks) {
+    // The row this call hands every sink; closes over the call's state.
+    function record(stage: CallStage, result: unknown, fixedClass?: string): void {
+      if (sinks.length === 0 || usage === null) return;
+      let r: CallRecord;
       try {
-        sink.record(r);
+        r = buildRecord(stage, result, fixedClass, usage);
       } catch (err) {
-        log("usage.sink_failed", { tool: state.tool, stage: "record", errorClass: className(err) });
+        log("usage.sink_failed", { tool: state.tool, stage: "build", errorClass: className(err) });
+        return;
+      }
+      for (const sink of sinks) {
+        try {
+          sink.record(r);
+        } catch (err) {
+          log("usage.sink_failed", {
+            tool: state.tool,
+            stage: "record",
+            errorClass: className(err),
+          });
+        }
       }
     }
-  }
 
-  function buildRecord(
-    state: CallState,
-    stage: CallStage,
-    result: unknown,
-    started: number,
-    rawArgs: Readonly<Record<string, unknown>> | undefined,
-    fixedClass: string | undefined,
-    wiring: UsageWiring,
-  ): CallRecord {
-    const isError = (result as { isError?: unknown } | undefined)?.isError === true;
-    const err = state.failed ?? state.thrown;
-    let ok = result !== undefined && !isError && err === undefined && fixedClass === undefined;
-    let errorClass: string | null = fixedClass ?? (err !== undefined ? classOf(err.err) : null);
-    const message = stage === "handler" && err !== undefined ? errorMessage(err.err) : null;
-    let resultIds: unknown = state.resultIds ?? null;
-    let outputText: string | null = wiring.keepOutput
-      ? (state.outputText ?? (result === undefined ? null : (firstText(result) ?? null)))
-      : null;
-    if (extra.timedOut()) {
-      ok = false;
-      errorClass = "DeadlineExceeded";
-      resultIds = null;
-      outputText = null;
-    }
-    let costUsd: string | null = null;
-    let costNote: string | null = null;
-    if (state.metered) {
-      try {
-        ({ costUsd, costNote } = wiring.price(state.tokens, state.estimated));
-      } catch (e) {
-        costUsd = null;
-        costNote = "price_failed";
-        log("usage.price_failed", { tool: state.tool, errorClass: classOf(e) });
+    function buildRecord(
+      stage: CallStage,
+      result: unknown,
+      fixedClass: string | undefined,
+      wiring: UsageWiring,
+    ): CallRecord {
+      const isError = (result as { isError?: unknown } | undefined)?.isError === true;
+      const err = state.failed ?? state.thrown;
+      let ok = result !== undefined && !isError && err === undefined && fixedClass === undefined;
+      let errorClass: string | null = fixedClass ?? (err !== undefined ? classOf(err.err) : null);
+      const message = stage === "handler" && err !== undefined ? errorMessage(err.err) : null;
+      let resultIds: unknown = state.resultIds ?? null;
+      let outputText: string | null = wiring.keepOutput
+        ? (state.outputText ?? (result === undefined ? null : (firstText(result) ?? null)))
+        : null;
+      if (extra.timedOut()) {
+        ok = false;
+        errorClass = "DeadlineExceeded";
+        resultIds = null;
+        outputText = null;
       }
+      let costUsd: string | null = null;
+      let costNote: string | null = null;
+      if (state.metered) {
+        try {
+          ({ costUsd, costNote } = wiring.price(state.tokens, state.estimated));
+        } catch (e) {
+          costUsd = null;
+          costNote = "price_failed";
+          log("usage.price_failed", { tool: state.tool, errorClass: classOf(e) });
+        }
+      }
+      const phases = Object.entries(state.phases);
+      return {
+        stage,
+        caller: caller.name,
+        onBehalfOf: ctx.delegated.onBehalfOf,
+        turnId: ctx.delegated.turnId,
+        tool: state.tool,
+        args: wiring.keepArgs ? (state.args ?? rawArgs ?? {}) : {},
+        durationMs: Math.round(clock.monotonic() - started),
+        ok,
+        errorClass,
+        errorMessage: message,
+        resultIds,
+        phases:
+          phases.length === 0
+            ? null
+            : Object.fromEntries(phases.map(([k, ms]) => [k, Math.round(ms)])),
+        tokens: state.metered ? structuredClone(state.tokens) : null,
+        costUsd,
+        costNote,
+        outputText,
+        extra: state.extra ?? null,
+        serverSha: wiring.serverSha,
+        clientUa: ctx.client.ua,
+        mcpProtocol: ctx.client.mcpProtocol,
+      };
     }
-    const phases = Object.entries(state.phases);
-    return {
-      stage,
-      caller: caller.name,
-      onBehalfOf: ctx.delegated.onBehalfOf,
-      turnId: ctx.delegated.turnId,
-      tool: state.tool,
-      args: wiring.keepArgs ? (state.args ?? rawArgs ?? {}) : {},
-      durationMs: Math.round(clock.monotonic() - started),
-      ok,
-      errorClass,
-      errorMessage: message,
-      resultIds,
-      phases:
-        phases.length === 0
-          ? null
-          : Object.fromEntries(phases.map(([k, ms]) => [k, Math.round(ms)])),
-      tokens: state.metered ? structuredClone(state.tokens) : null,
-      costUsd,
-      costNote,
-      outputText,
-      extra: state.extra ?? null,
-      serverSha: wiring.serverSha,
-      clientUa: ctx.client.ua,
-      mcpProtocol: ctx.client.mcpProtocol,
-    };
   }
 }

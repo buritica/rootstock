@@ -2,6 +2,7 @@
 // per-caller concurrency groups, and the per-turn call budget. In memory and
 // per process, so a count is per instance, never shared across them.
 
+import { isRecord } from "../internal/slice.ts";
 import { refillTokens } from "../retry/token-bucket-math.ts";
 import { configError, isPositiveInteger, isPositiveNumber } from "./errors.ts";
 import type { Clock, LogEvent } from "./types.ts";
@@ -9,6 +10,11 @@ import type { Clock, LogEvent } from "./types.ts";
 export interface RateLimiter {
   /** Spends one token for `key`; false means refuse. */
   allow(key: string): boolean;
+  /**
+   * Spends `n` tokens for `key` in one charge; false means refuse. A refusal
+   * spends the whole tokens the bucket held, as `n` single charges would.
+   */
+  allowN(key: string, n: number): boolean;
   /** True when `key` holds a whole token, spending nothing. */
   peek(key: string): boolean;
 }
@@ -58,8 +64,10 @@ export interface Limits {
  * Token bucket per key. Refill comes from `clock.now()` elapsed, through the
  * shared bucket math, which clamps a backwards clock step at no refill; a
  * key's last-refill time is set to `now` on every refill, forward or back.
- * Past `maxKeys` keys, buckets idle long enough to be full again are pruned
- * (a prune trigger, not a hard cap: a spray of fresh keys still inserts).
+ * The map is kept in last-touch order; past `maxKeys` keys, buckets idle long
+ * enough to be full again are pruned from the least recently touched end,
+ * stopping at the first that is not (a prune trigger, not a hard cap: a spray
+ * of fresh keys still inserts).
  */
 export function createRateLimiter(o: BucketLimits & { clock: Clock }): RateLimiter {
   for (const field of ["capacity", "refillPerSecond", "maxKeys"] as const) {
@@ -72,21 +80,35 @@ export function createRateLimiter(o: BucketLimits & { clock: Clock }): RateLimit
   const fullAfterMs = (capacity / refillPerSecond) * 1000;
   const refilled = (b: { tokens: number; at: number }, t: number) =>
     refillTokens(b.tokens, t - b.at, refillPerSecond, capacity);
+  /** Prunes, then refills `key`'s bucket to now and moves it to the touched end. */
+  const touch = (key: string): { tokens: number; at: number } => {
+    const t = clock.now();
+    if (buckets.size >= maxKeys) {
+      for (const [k, b] of buckets) {
+        if (t - b.at < fullAfterMs) break;
+        buckets.delete(k);
+      }
+    }
+    const b = buckets.get(key) ?? { tokens: capacity, at: t };
+    b.tokens = refilled(b, t);
+    b.at = t;
+    buckets.delete(key);
+    buckets.set(key, b);
+    return b;
+  };
+  const spend = (key: string, n: number): boolean => {
+    const b = touch(key);
+    if (b.tokens < n) {
+      b.tokens -= Math.floor(b.tokens);
+      return false;
+    }
+    b.tokens -= n;
+    return true;
+  };
 
   return Object.freeze({
-    allow(key: string): boolean {
-      const t = clock.now();
-      if (buckets.size >= maxKeys) {
-        for (const [k, b] of buckets) if (t - b.at >= fullAfterMs) buckets.delete(k);
-      }
-      const b = buckets.get(key) ?? { tokens: capacity, at: t };
-      b.tokens = refilled(b, t);
-      b.at = t;
-      buckets.set(key, b);
-      if (b.tokens < 1) return false;
-      b.tokens -= 1;
-      return true;
-    },
+    allow: (key: string): boolean => spend(key, 1),
+    allowN: spend,
     peek(key: string): boolean {
       const b = buckets.get(key);
       return b === undefined ? capacity >= 1 : refilled(b, clock.now()) >= 1;
@@ -176,11 +198,12 @@ export function exhaustedResult(
 
 /**
  * A result that ran, with `turnBudget: { remaining }` beside its own fields
- * once `remaining < warnAt`. Only a plain-object result carries it.
+ * once `remaining < warnAt`. Only a plain-object result carries it. Consumers
+ * apply it to their own tool results; the seams never do.
  */
 export function withCountdown(result: unknown, charge: TurnCharge, warnAt: number): unknown {
   if (charge.remaining >= warnAt) return result;
-  if (typeof result !== "object" || result === null || Array.isArray(result)) return result;
+  if (!isRecord(result)) return result;
   return { ...result, turnBudget: { remaining: charge.remaining } };
 }
 

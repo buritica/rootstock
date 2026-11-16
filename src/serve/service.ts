@@ -14,16 +14,17 @@ import {
 } from "@modelcontextprotocol/server";
 import * as bodies from "./bodies.ts";
 import {
-  installSeamsWith,
+  installSeams,
   LOCAL_CALLER,
   type RequestContext,
   type ServeHooks,
   seamRuntime,
 } from "./call.ts";
-import { className, configError, isPositiveInteger } from "./errors.ts";
+import { raceDeadline } from "./deadline.ts";
+import { className, configError, isNonNegativeNumber, isPositiveInteger } from "./errors.ts";
 import { sourceKeyFor } from "./hardening.ts";
-import { type HostGuard, hostGuard } from "./host-check.ts";
-import { createRateLimiter, type Limits, type RateLimiter, rateLimitedLog } from "./limits.ts";
+import { hostGuard } from "./host-check.ts";
+import { createRateLimiter, type Limits, type RateLimiter } from "./limits.ts";
 import {
   type Caller,
   type Clock,
@@ -104,8 +105,17 @@ const POLL_MS = 50;
 const UA_MAX = 200;
 const MCP_PROTOCOL_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
 
+type Faces = { bearer: boolean; oauth: boolean };
+const ALL_FACES: Faces = Object.freeze({ bearer: true, oauth: true });
+
+/** A body that is empty or that JSON.parse refused. */
+const UNPARSABLE: unique symbol = Symbol("unparsable");
+
+/** For `finish` on a body serve built itself: the rejection is known, so nothing is read. */
+const NO_REJECTION = Object.freeze({ rejection: undefined });
+
 /** `requireMcpAuth`'s JWKS failure texts (@better-auth/core oauth2/verify). */
-export function isJwksFailure(err: unknown): boolean {
+function isJwksFailure(err: unknown): boolean {
   try {
     return (
       err instanceof Error &&
@@ -126,7 +136,7 @@ function clientOf(headers: Headers): RequestContext["client"] {
   };
 }
 
-/** The JSON-RPC message of an SDK 4xx, read from a clone; never throws. */
+/** The JSON-RPC message of a 4xx the SDK produced, read from a clone; never throws. */
 async function rejectionOf(res: Response): Promise<string | undefined> {
   if (res.status < 400 || res.status >= 500) return undefined;
   try {
@@ -136,6 +146,21 @@ async function rejectionOf(res: Response): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+function parseBody(text: string | undefined): unknown {
+  if (text === undefined || text.length === 0) return UNPARSABLE;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return UNPARSABLE;
+  }
+}
+
+/** The streamable transport's Accept rule. */
+function acceptOk(r: Request): boolean {
+  const accept = r.headers.get("accept");
+  return accept?.includes("application/json") === true && accept.includes("text/event-stream");
 }
 
 function validate(o: McpServiceOptions): void {
@@ -160,7 +185,7 @@ function validate(o: McpServiceOptions): void {
     );
   }
   for (const [k, v] of Object.entries(p.shutdown)) {
-    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    if (!isNonNegativeNumber(v)) {
       throw configError(
         "createMcpService",
         `profile.shutdown.${k} must be a finite number >= 0`,
@@ -180,6 +205,30 @@ function validate(o: McpServiceOptions): void {
   }
 }
 
+/** The per-request state the handler entry's factory reads. */
+interface Exchange {
+  ctx: RequestContext;
+  timedOut: () => boolean;
+}
+
+/** A refusal the entry would make itself, with the JSON-RPC message its log line carries. */
+interface EntryRefusal {
+  res: Response;
+  rejection: string;
+}
+
+/** What differs between the two entries, chosen once when the service is built. */
+interface Entry {
+  run(req: Request, x: Exchange, parsedBody: unknown, authInfo: AuthInfo): Promise<Response>;
+  /** 5.8 before the body is read, in the entry's order. */
+  preBody(r: Request): EntryRefusal | undefined;
+  /** 5.8 after the parse (the handler's legacy leg checks Accept only now). */
+  afterParse(r: Request, parsed: unknown): Promise<EntryRefusal | undefined>;
+  tooLarge(limit: number): EntryRefusal;
+  /** null: nothing to close at shutdown. */
+  close: (() => Promise<unknown>) | null;
+}
+
 export function createMcpService(o: McpServiceOptions): McpService {
   validate(o);
   const { profile, clock, timers, toolScopes, hooks } = o;
@@ -192,23 +241,42 @@ export function createMcpService(o: McpServiceOptions): McpService {
     b === null ? null : createRateLimiter({ ...b, clock });
   const refusal = limiter(o.limits.refusal);
   const serving = limiter(o.limits.serving);
-  const rateLimited = rateLimitedLog(log, clock, o.limits.logIntervalMs);
-  // Built now so a limits tool toolScopes lacks is refused at build.
-  seamRuntime(o.limits, toolScopes, clock, log);
-  const guard: HostGuard | null = profile.hostCheck === false ? null : hostGuard(profile.hostCheck);
+  // Built now so a limits tool toolScopes lacks is refused at build; its
+  // throttled serve.rate_limited log is shared with the tool buckets.
+  const { rateLimited } = seamRuntime(o.limits, toolScopes, clock, log);
   const allScopes = expandScopes(toolScopes, Object.keys(toolScopes.implies));
-  const entryKind = profile.entry.kind;
+  const baseScopes = expandScopes(toolScopes, profile.oauthScopes);
+  // The JWKS route is unmetered (F2): the server fetches its own JWKS.
+  const jwksPaths = new Set(profile.authPrefixes.api.map((p) => `${p.replace(/\/$/, "")}/jwks`));
+  const delegated =
+    profile.delegated === false
+      ? null
+      : { ...profile.delegated, clients: new Set(profile.delegated.clients) };
+  const hc = profile.hostCheck;
+  const host =
+    hc === false
+      ? null
+      : { guard: hostGuard(hc), privateFirst: hc.appliesTo === "all-but-public-auth" };
 
-  /** The per-request state the handler entry's factory reads. */
-  interface Exchange {
-    ctx: RequestContext;
-    timedOut: () => boolean;
-  }
+  /**
+   * The Host/Origin refusal at `step`, or undefined. Under
+   * "all-but-public-auth" the private face is checked at step 2, before any
+   * route; every other MCP request is checked at 5.1.
+   */
+  const hostRefusal = (req: Request, faces: Faces, step: 2 | 5): Response | undefined => {
+    if (host === null) return undefined;
+    const atStep2 = host.privateFirst && faces.bearer;
+    return atStep2 === (step === 2) ? host.guard(req) : undefined;
+  };
+
+  const methodAnswer = (method: string): MethodAnswer | null =>
+    method === "POST" ? null : method === "GET" ? profile.methods.get : profile.methods.other;
+
   const exchange = new AsyncLocalStorage<Exchange>();
 
   const buildServer = async (x: Exchange): Promise<McpServer> => {
     const server = new McpServer(o.serverInfo);
-    installSeamsWith(
+    installSeams(
       server,
       {
         profile,
@@ -227,47 +295,79 @@ export function createMcpService(o: McpServiceOptions): McpService {
     return server;
   };
 
-  const limitsList = Object.values(profile.bodyLimit).filter((v): v is number => v !== null);
-  const handler =
-    profile.entry.kind === "handler"
-      ? createMcpHandler(
-          async () => {
-            const x = exchange.getStore();
-            if (x === undefined)
-              throw new Error("rootstock serve: the MCP handler ran outside a request");
-            return buildServer(x);
-          },
-          {
-            legacy: "stateless",
-            ...(limitsList.length > 0 ? { maxRequestBodySize: Math.max(...limitsList) } : {}),
-          },
-        )
-      : null;
+  const entry = buildEntry();
 
-  async function runEntry(
-    req: Request,
-    x: Exchange,
-    parsedBody: unknown,
-    authInfo: AuthInfo,
-  ): Promise<Response> {
-    const opts = { ...(parsedBody === undefined ? {} : { parsedBody }), authInfo };
-    if (handler !== null) return exchange.run(x, () => handler.fetch(req, opts));
-    let server: McpServer | undefined;
-    try {
-      server = await buildServer(x);
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-      await server.connect(transport);
-      return await transport.handleRequest(req, opts);
-    } finally {
-      try {
-        server?.close().catch(() => {});
-      } catch {
-        // A close failure never eats the response.
-      }
+  function buildEntry(): Entry {
+    const kind = profile.entry.kind;
+    const notAcceptable = (): EntryRefusal => ({
+      res: bodies.notAcceptable(),
+      rejection: bodies.ACCEPT_TEXT,
+    });
+    const contentType = (r: Request): EntryRefusal | undefined =>
+      isJsonContentType(r.headers.get("content-type"))
+        ? undefined
+        : { res: bodies.unsupportedMediaType(kind), rejection: bodies.CONTENT_TYPE_TEXT };
+    const tooLarge = (limit: number): EntryRefusal => ({
+      res: bodies.tooLarge(kind, limit),
+      rejection: bodies.tooLargeText(limit),
+    });
+    const optsOf = (parsedBody: unknown, authInfo: AuthInfo) => ({
+      ...(parsedBody === undefined ? {} : { parsedBody }),
+      authInfo,
+    });
+
+    if (kind === "handler") {
+      const limits = Object.values(profile.bodyLimit).filter((v): v is number => v !== null);
+      const handler = createMcpHandler(
+        async () => {
+          const x = exchange.getStore();
+          if (x === undefined)
+            throw new Error("rootstock serve: the MCP handler ran outside a request");
+          return buildServer(x);
+        },
+        {
+          legacy: "stateless",
+          ...(limits.length > 0 ? { maxRequestBodySize: Math.max(...limits) } : {}),
+        },
+      );
+      return {
+        run: (req, x, parsedBody, authInfo) =>
+          exchange.run(x, () => handler.fetch(req, optsOf(parsedBody, authInfo))),
+        preBody: contentType,
+        // An unparsable or 2025-era body goes to the legacy leg, whose
+        // transport checks Accept before anything else.
+        afterParse: async (r, parsed) =>
+          !acceptOk(r) && (parsed === UNPARSABLE || (await isLegacyRequest(r, parsed)))
+            ? notAcceptable()
+            : undefined,
+        tooLarge,
+        close: () => handler.close(),
+      };
     }
+    return {
+      async run(req, x, parsedBody, authInfo) {
+        let server: McpServer | undefined;
+        try {
+          server = await buildServer(x);
+          const transport = new WebStandardStreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true,
+          });
+          await server.connect(transport);
+          return await transport.handleRequest(req, optsOf(parsedBody, authInfo));
+        } finally {
+          try {
+            server?.close().catch(() => {});
+          } catch {
+            // A close failure never eats the response.
+          }
+        }
+      },
+      preBody: (r) => (acceptOk(r) ? contentType(r) : notAcceptable()),
+      afterParse: async () => undefined,
+      tooLarge,
+      close: null,
+    };
   }
 
   const refused = (method: string, sourceKey: string): Response | undefined => {
@@ -299,12 +399,9 @@ export function createMcpService(o: McpServiceOptions): McpService {
     if (profile.authPrefixes.wellKnown.some((p) => pathname.startsWith(p))) {
       return authRequest(req, sourceKey, pathname, auth);
     }
-    const api = profile.authPrefixes.api.find((p) => pathname.startsWith(p));
-    if (api !== undefined) {
-      // The JWKS route is unmetered (F2): the server fetches its own JWKS.
-      const jwks = pathname === `${api.replace(/\/$/, "")}/jwks`;
+    if (profile.authPrefixes.api.some((p) => pathname.startsWith(p))) {
       return (
-        (jwks ? undefined : refused(req.method, sourceKey)) ??
+        (jwksPaths.has(pathname) ? undefined : refused(req.method, sourceKey)) ??
         authRequest(req, sourceKey, pathname, auth)
       );
     }
@@ -316,12 +413,12 @@ export function createMcpService(o: McpServiceOptions): McpService {
   }
 
   function delegatedOf(req: Request, caller: Caller): RequestContext["delegated"] {
-    const d = profile.delegated;
-    if (d === false) return { onBehalfOf: null, turnId: null };
+    const d = delegated;
+    if (d === null) return { onBehalfOf: null, turnId: null };
     const read = (spec: { header: string; shape: RegExp }): string | null => {
       const value = req.headers.get(spec.header);
       if (value === null) return null;
-      const reason = !d.clients.includes(caller.name)
+      const reason = !d.clients.has(caller.name)
         ? "not-delegating-client"
         : !spec.shape.test(value)
           ? "malformed"
@@ -338,61 +435,79 @@ export function createMcpService(o: McpServiceOptions): McpService {
     req: Request,
     url: URL,
     sourceKey: string,
-    faces: { bearer: boolean; oauth: boolean },
-    publicFace: boolean,
+    faces: Faces,
+    answer: MethodAnswer | null,
   ): Promise<Response> {
     const method = req.method;
     const started = clock.monotonic();
-    const answer: MethodAnswer | null =
-      method === "POST" ? null : method === "GET" ? profile.methods.get : profile.methods.other;
     let callerName: string | undefined;
-    // Set once a serve.request (or request_failed) line for this exchange is written.
-    let loggedByEntry = false;
-    const logRequest = async (res: Response, extra: Readonly<Record<string, unknown>> = {}) => {
-      const rejection = await rejectionOf(res);
+    // Set by the first serve.request or serve.request_failed line; one per exchange.
+    let logged = false;
+    const common = (status: number) => ({
+      method,
+      sourceKey,
+      ...(callerName === undefined ? {} : { caller: callerName }),
+      status,
+      ms: Math.round(clock.monotonic() - started),
+    });
+    /** Logs serve.request once; `known` skips reading the rejection from the body. */
+    const finish = async (
+      res: Response,
+      extra: Readonly<Record<string, unknown>> = {},
+      known?: { rejection: string | undefined },
+    ): Promise<Response> => {
+      if (logged) return res;
+      logged = true;
+      const rejection = known === undefined ? await rejectionOf(res) : known.rejection;
       log("serve.request", {
-        method,
-        sourceKey,
-        ...(callerName === undefined ? {} : { caller: callerName }),
-        status: res.status,
-        ms: Math.round(clock.monotonic() - started),
+        ...common(res.status),
         ...extra,
         ...(rejection === undefined ? {} : { rejection }),
       });
-    };
-    if (answer === "405-first") {
-      const res = bodies.methodNotAllowed();
-      await logRequest(res);
       return res;
-    }
+    };
+    /** Logs serve.request_failed once and answers bodies.internal. */
+    const fail = (
+      reason: "threw" | "deadline",
+      extra: Readonly<Record<string, unknown>>,
+      detail: Readonly<Record<string, unknown>> = {},
+    ): Response => {
+      if (!logged) {
+        logged = true;
+        log("serve.request_failed", { ...common(500), ...extra, reason, ...detail });
+      }
+      return bodies.internal(profile.bodies.internal);
+    };
+    /** An auth refusal: one refusal token spent, and its line. */
+    const chargeRefusal = (event: string, fields: Readonly<Record<string, unknown>>) => {
+      refusal?.allow(sourceKey);
+      log(event, { method, sourceKey, ...fields });
+    };
+    /** 429 when the source holds no refusal token, spending none. */
+    const peekRefusal = (): Response | undefined => {
+      if (refusal === null || refusal.peek(sourceKey)) return undefined;
+      rateLimited("refusal", { method, sourceKey });
+      return bodies.tooManyRequests();
+    };
+
+    if (answer === "405-first") return finish(bodies.methodNotAllowed(), {}, NO_REJECTION);
     const res = await authenticated();
     // rev 3.1: every non-POST exit logs serve.request.
-    if (answer !== null && !loggedByEntry) await logRequest(res);
-    return res;
+    return answer === null ? res : finish(res);
 
     async function authenticated(): Promise<Response> {
-      // 5.1
-      if (guard !== null && profile.hostCheck !== false) {
-        const applies = profile.hostCheck.appliesTo === "mcp" || publicFace;
-        const refusedHost = applies ? guard(req) : undefined;
-        if (refusedHost) return refusedHost;
-      }
-      // 5.2
-      if (refusal !== null && !refusal.peek(sourceKey)) {
-        rateLimited("refusal", { method, sourceKey });
-        return bodies.tooManyRequests();
-      }
+      // 5.1, 5.2
+      const early = hostRefusal(req, faces, 5) ?? peekRefusal();
+      if (early) return early;
       // 5.3
-      const accepts = faces;
-      if (o.credentials !== undefined && accepts.bearer) {
+      if (o.credentials !== undefined && faces.bearer) {
         const c = o.credentials(req);
         if (c instanceof Response) return c;
         if (c !== undefined) return proceed(req, c);
       }
-      if (o.auth !== undefined && accepts.oauth) return viaOAuth(o.auth);
+      if (o.auth !== undefined && faces.oauth) return viaOAuth(o.auth);
       if (o.credentials !== undefined || o.auth !== undefined) {
-        refusal?.allow(sourceKey);
-        log("serve.unauthorized", { method, sourceKey, status: 401 });
+        chargeRefusal("serve.unauthorized", { status: 401 });
         return bodies.bearerUnauthorized();
       }
       // 5.6: nobody to authenticate against.
@@ -421,15 +536,15 @@ export function createMcpService(o: McpServiceOptions): McpService {
               log("serve.scope_resolve_failed", { caller: sub, errorClass: className(err) });
             }
           }
-          const scopes = expandScopes(toolScopes, [...profile.oauthScopes, ...extra]);
+          const scopes =
+            extra.length === 0
+              ? baseScopes
+              : expandScopes(toolScopes, [...profile.oauthScopes, ...extra]);
           return proceed(verified, { name: sub, kind: "oauth", scopes, claims });
         });
       } catch (err) {
-        refusal?.allow(sourceKey);
         const jwks = isJwksFailure(err);
-        log("serve.auth_threw", {
-          method,
-          sourceKey,
+        chargeRefusal("serve.auth_threw", {
           errorClass: className(err),
           ...(jwks ? { jwks: true } : {}),
           error: err,
@@ -439,8 +554,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
           : bodies.internal(profile.bodies.internal);
       }
       if (res.status === 401 || res.status === 403) {
-        refusal?.allow(sourceKey);
-        log("serve.unauthorized", { method, sourceKey, status: res.status });
+        chargeRefusal("serve.unauthorized", { status: res.status });
       }
       return res;
     }
@@ -470,18 +584,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
       try {
         return await (hooks.aroundRequest ? hooks.aroundRequest(r, run) : run());
       } catch (err) {
-        log("serve.request_failed", {
-          method,
-          sourceKey,
-          caller: caller.name,
-          status: 500,
-          ms: Math.round(clock.monotonic() - started),
-          reason: "threw",
-          errorClass: className(err),
-          error: err,
-        });
-        loggedByEntry = true;
-        return bodies.internal(profile.bodies.internal);
+        return fail("threw", {}, { errorClass: className(err), error: err });
       }
     }
 
@@ -494,111 +597,55 @@ export function createMcpService(o: McpServiceOptions): McpService {
       const authInfo: AuthInfo = { token: "", clientId: caller.name, scopes: [...caller.scopes] };
       let timedOut = false;
       const x: Exchange = { ctx, timedOut: () => timedOut };
-      if (answer === "auth-then-405") return bodies.methodNotAllowed();
+      if (answer === "auth-then-405") return finish(bodies.methodNotAllowed(), {}, NO_REJECTION);
       if (answer === "auth-then-entry") {
-        const res = await runEntry(r, x, undefined, authInfo);
-        await logRequest(res, fields());
-        loggedByEntry = true;
-        return res;
+        return finish(await entry.run(r, x, undefined, authInfo), fields());
       }
       // 5.8: the entry's own pre-body checks, in its order and with its bytes.
-      const sdkRefusal = async (res: Response) => {
-        await logRequest(res, fields());
-        loggedByEntry = true;
-        return res;
-      };
-      const acceptOk = () => {
-        const accept = r.headers.get("accept");
-        return (
-          accept?.includes("application/json") === true && accept.includes("text/event-stream")
-        );
-      };
-      if (entryKind === "transport" && !acceptOk()) return sdkRefusal(bodies.notAcceptable());
-      if (!isJsonContentType(r.headers.get("content-type"))) {
-        return sdkRefusal(bodies.unsupportedMediaType(entryKind));
-      }
+      const refuse = (e: EntryRefusal) => finish(e.res, fields(), { rejection: e.rejection });
+      const pre = entry.preBody(r);
+      if (pre) return refuse(pre);
       const limit = profile.bodyLimit[caller.kind];
       let text: string | undefined;
       try {
         const read = await readRequestBody(r, limit ?? Number.POSITIVE_INFINITY);
-        if (read.tooLarge) return sdkRefusal(bodies.tooLarge(entryKind, limit ?? 0));
+        if (read.tooLarge) return refuse(entry.tooLarge(limit ?? 0));
         text = read.text;
       } catch {
         text = undefined;
       }
-      let parsed: unknown;
-      let parseOk = false;
-      if (text !== undefined && text.length > 0) {
-        try {
-          parsed = JSON.parse(text);
-          parseOk = true;
-        } catch {
-          parseOk = false;
-        }
-      }
-      // The handler entry routes an unparsable or 2025-era body to its legacy
-      // leg, whose transport checks Accept before anything else.
-      if (
-        entryKind === "handler" &&
-        !acceptOk() &&
-        (!parseOk || (await isLegacyRequest(r, parsed)))
-      ) {
-        return sdkRefusal(bodies.notAcceptable());
-      }
-      if (!parseOk) {
+      const parsed = parseBody(text);
+      const late = await entry.afterParse(r, parsed);
+      if (late) return refuse(late);
+      if (parsed === UNPARSABLE) {
         log("serve.bad_request", { method, sourceKey, caller: caller.name, status: 400 });
         return bodies.parseError(profile.bodies.parseError);
       }
-      if (Array.isArray(parsed) && serving !== null) {
-        for (let i = 1; i < parsed.length; i++) {
-          if (!serving.allow(caller.name)) {
-            rateLimited("serving", {
-              method,
-              sourceKey,
-              caller: caller.name,
-              batch: parsed.length,
-            });
-            return bodies.tooManyRequests();
-          }
-        }
+      // One more serving token per message after the first.
+      if (
+        Array.isArray(parsed) &&
+        parsed.length > 1 &&
+        serving !== null &&
+        !serving.allowN(caller.name, parsed.length - 1)
+      ) {
+        rateLimited("serving", { method, sourceKey, caller: caller.name, batch: parsed.length });
+        return bodies.tooManyRequests();
       }
-      // 5.9–5.10
-      const dispatch = runEntry(r, x, parsed, authInfo);
+      // 5.9–5.10. A dispatch that loses the race runs on; raceDeadline keeps
+      // its rejection handled.
+      const dispatch = entry.run(r, x, parsed, authInfo);
       let res: Response;
       if (profile.deadlineMs === null) res = await dispatch;
       else {
-        let cancel: (() => void) | undefined;
-        const deadline = profile.deadlineMs;
-        const expired = new Promise<"deadline">((resolve) => {
-          cancel = timers.set(deadline, () => resolve("deadline"));
-        });
-        // The losing dispatch runs on; its rejection stays handled.
-        dispatch.catch(() => {});
-        try {
-          const won = await Promise.race([dispatch, expired]);
-          if (won === "deadline") {
-            timedOut = true;
-            log("serve.request_failed", {
-              method,
-              sourceKey,
-              caller: caller.name,
-              status: 500,
-              ms: Math.round(clock.monotonic() - started),
-              ...fields(),
-              reason: "deadline",
-            });
-            loggedByEntry = true;
-            return bodies.internal(profile.bodies.internal);
-          }
-          res = won;
-        } finally {
-          cancel?.();
+        const won = await raceDeadline(timers, profile.deadlineMs, dispatch);
+        if (won === "timeout") {
+          timedOut = true;
+          return fail("deadline", fields());
         }
+        res = won.value;
       }
       // 5.11
-      await logRequest(res, fields());
-      loggedByEntry = true;
-      return res;
+      return finish(res, fields());
     }
   }
 
@@ -608,34 +655,18 @@ export function createMcpService(o: McpServiceOptions): McpService {
       try {
         sourceKey = sourceKeyFor(req, info, profile.clientIpHeader);
         const url = new URL(req.url);
-        const hc = profile.hostCheck;
         // acceptCredentials decides the face: no static bearer is the public one.
-        const accepts = o.acceptCredentials?.(req, info);
-        const publicFace = accepts !== undefined && !accepts.bearer;
-        const early405 =
-          url.pathname === profile.mcpPath &&
-          req.method !== "POST" &&
-          (req.method === "GET" ? profile.methods.get : profile.methods.other) === "405-first";
-        // 2: the private face checks Host/Origin before anything else.
-        if (
-          !early405 &&
-          guard !== null &&
-          hc !== false &&
-          hc.appliesTo === "all-but-public-auth" &&
-          !publicFace
-        ) {
-          const r = guard(req);
+        const faces = o.acceptCredentials?.(req, info) ?? ALL_FACES;
+        const answer = methodAnswer(req.method);
+        const onMcp = url.pathname === profile.mcpPath;
+        // 2: the private face checks Host/Origin before anything else, a
+        // 405-first answer excepted.
+        if (!(onMcp && answer === "405-first")) {
+          const r = hostRefusal(req, faces, 2);
           if (r) return r;
         }
         // 1 and 5
-        if (url.pathname === profile.mcpPath)
-          return await mcp(
-            req,
-            url,
-            sourceKey,
-            accepts ?? { bearer: true, oauth: true },
-            publicFace,
-          );
+        if (onMcp) return await mcp(req, url, sourceKey, faces, answer);
         // 3
         const auth = await authRoute(req, url, sourceKey);
         if (auth !== undefined) return auth;
@@ -662,7 +693,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
       const sleep = (ms: number) => new Promise<void>((resolve) => timers.set(ms, resolve));
       const bounded = async (work: () => Promise<unknown>, ms: number): Promise<boolean> => {
         try {
-          return await Promise.race([work().then(() => true), sleep(ms).then(() => false)]);
+          return (await raceDeadline(timers, ms, work())) !== "timeout";
         } catch {
           return false;
         }
@@ -678,7 +709,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         // drained stays false.
       }
       await bounded(async () => server.stop(true), s.forceMs);
-      if (handler !== null) await bounded(() => handler.close(), s.forceMs);
+      if (entry.close !== null) await bounded(entry.close, s.forceMs);
       const flushed = await bounded(
         () => Promise.all([...(o.usage?.sinks ?? []).map((sink) => sink.idle?.()), o.auth?.idle()]),
         s.flushMs,

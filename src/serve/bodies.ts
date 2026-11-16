@@ -12,6 +12,9 @@ const JSON_UTF8_CT = { "content-type": "application/json;charset=utf-8" };
 const TEXT_CT = { "content-type": "text/plain; charset=utf-8" };
 const NO_STORE = { "cache-control": "no-store" };
 
+/** The JSON content type of `entry`'s own 415 and 413. */
+const jsonCt = (entry: Entry) => (entry === "transport" ? JSON_CT : JSON_UTF8_CT);
+
 const jsonRpc = (code: number, message: string) =>
   JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null });
 
@@ -34,13 +37,13 @@ export const notAcceptable = (): Response =>
 export const unsupportedMediaType = (entry: Entry): Response =>
   new Response(jsonRpc(-32000, CONTENT_TYPE_TEXT), {
     status: 415,
-    headers: entry === "transport" ? JSON_CT : JSON_UTF8_CT,
+    headers: jsonCt(entry),
   });
 
 export const tooLarge = (entry: Entry, limit: number): Response =>
   new Response(jsonRpc(-32000, tooLargeText(limit)), {
     status: 413,
-    headers: entry === "transport" ? JSON_CT : JSON_UTF8_CT,
+    headers: jsonCt(entry),
   });
 
 export function parseError(kind: Bodies["parseError"]): Response {

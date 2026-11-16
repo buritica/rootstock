@@ -24,40 +24,40 @@ export function hostGuard(hc: HostCheck): HostGuard {
     );
   }
   const loopback = localhostAllowedHostnames();
-  // null: no host check at all.
-  const hosts: readonly string[] | null =
+  // null: no host check at all. Built once; the SDK validators take a mutable array.
+  const hosts: string[] | null =
     hc.hosts.list.length === 0
       ? hc.hosts.whenEmpty === "allow-all"
         ? null
-        : loopback
+        : [...loopback]
       : hc.hosts.loopback === "union"
         ? [...new Set([...loopback, ...hc.hosts.list])]
-        : hc.hosts.list;
-  const origins: readonly string[] | null =
+        : [...hc.hosts.list];
+  const origins: string[] | null =
     hc.origins.list.length > 0
-      ? hc.origins.list
+      ? [...hc.origins.list]
       : hc.origins.whenEmpty === "allow-all"
         ? null
         : hosts;
 
-  const refuse = (sdk: Response): Response =>
-    hc.refusal === "sdk-403" ? sdk : notFound("text-not-found");
-
   if (hc.hosts.match === "hostname") {
+    const refuse = (sdk: Response): Response =>
+      hc.refusal === "sdk-403" ? sdk : notFound("text-not-found");
     return (req) => {
-      const h = hosts === null ? undefined : hostHeaderValidationResponse(req, [...hosts]);
+      const h = hosts === null ? undefined : hostHeaderValidationResponse(req, hosts);
       if (h) return refuse(h);
-      const o = origins === null ? undefined : originValidationResponse(req, [...origins]);
+      const o = origins === null ? undefined : originValidationResponse(req, origins);
       return o ? refuse(o) : undefined;
     };
   }
+  // Exact matching always refuses with "404-text" (sdk-403 is refused above).
   return (req) => {
     const host = req.headers.get("host");
     if (hosts !== null && (host === null || !hosts.includes(host)))
-      return refuse(notFound("text-not-found"));
+      return notFound("text-not-found");
     const origin = req.headers.get("origin");
     if (origin !== null && origins !== null && !origins.includes(origin)) {
-      return refuse(notFound("text-not-found"));
+      return notFound("text-not-found");
     }
     return undefined;
   };
