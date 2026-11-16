@@ -241,6 +241,8 @@ describe("postgresCallLog", () => {
     sink.record(callRecord({ tool: "huge", durationMs: 1e15 }));
     sink.record(callRecord({ tool: "nul", outputText: "a\u0000b", args: { odd: "\ud800" } }));
     sink.record(callRecord({ tool: "t".repeat(300) }));
+    sink.record(callRecord({ tool: "null-caller", caller: null as never, args: "x" as never }));
+    sink.record(callRecord({ tool: "num-caller", caller: 7 as never, ok: undefined as never }));
     sink.record(callRecord({ tool: "good-2" }));
     await sink.idle();
     expect(events).toEqual([]);
@@ -253,7 +255,16 @@ describe("postgresCallLog", () => {
       { tool: "huge", ms: 2_147_483_647 },
       { tool: "nan", ms: 0 },
       { tool: "nul", ms: 12 },
+      { tool: "null-calle", ms: 12 },
+      { tool: "num-caller", ms: 12 },
       { tool: "tttttttttt", ms: 12 },
+    ]);
+    const coerced = await sql.unsafe<{ caller: string; args: string; ok: boolean }>(
+      `SELECT caller, args::text AS args, ok FROM "${s}".mcp_calls WHERE tool IN ('null-caller', 'num-caller') ORDER BY tool`,
+    );
+    expect(coerced).toEqual([
+      { caller: "", args: "{}", ok: true },
+      { caller: "7", args: '{"text": "hi"}', ok: false },
     ]);
     const [len] = await sql.unsafe<{ n: number }>(
       `SELECT max(length(tool))::int AS n FROM "${s}".mcp_calls`,
@@ -276,7 +287,13 @@ describe("postgresCallLog", () => {
     expect(events).toEqual([
       {
         event: "usage.call_log_failed",
-        fields: { stage: "insert", rows: 1, tools: ["boom"], errorClass: "42P01" },
+        fields: {
+          stage: "insert",
+          rows: 1,
+          tools: ["boom"],
+          errorClass: "42P01",
+          failedBatches: 1,
+        },
       },
     ]);
   });

@@ -42,7 +42,12 @@ export function callLogInsert(table: { schema: string; name: string }): string {
 
 /** A tool name as stored and logged: the client names it on a rejected call, so it is capped. */
 const TOOL_MAX = 200;
-const toolName = (tool: unknown): string => cut(String(tool), TOOL_MAX);
+const toolName = (tool: unknown): string => cut(notNullText(tool), TOOL_MAX);
+
+/** A NOT NULL text column: absent is "", anything else its string. */
+function notNullText(v: unknown): string {
+  return v === null || v === undefined ? "" : String(v);
+}
 
 /** Whole milliseconds from 0 to the int4 maximum; anything not a finite number is 0. */
 function durationMs(ms: unknown): number {
@@ -54,17 +59,17 @@ function durationMs(ms: unknown): number {
 /**
  * One record as its row's JSON text. `errorMessage` and `stage` are never
  * stored. Every NOT NULL column is coerced so one odd record cannot fail its
- * whole batch: `args ?? {}` and `resultIds ?? null` are deliberate (an absent
- * value becomes the column's empty form), the duration is clamped and `ok` is
- * a boolean.
+ * whole batch: `caller` and `tool` are text ("" when absent), `args` is an
+ * object or array (`{}` otherwise), the duration is clamped and `ok` is a
+ * boolean. `resultIds ?? null` is deliberate too: absent reads as not extracted.
  */
 function rowJson(r: CallRecord): string {
   return JSON.stringify({
-    caller: r.caller,
+    caller: notNullText(r.caller),
     on_behalf_of: r.onBehalfOf,
     turn_id: r.turnId,
     tool: toolName(r.tool),
-    args: r.args ?? {},
+    args: typeof r.args === "object" && r.args !== null ? r.args : {},
     duration_ms: durationMs(r.durationMs),
     ok: r.ok === true,
     error_class: r.errorClass,
@@ -112,12 +117,15 @@ export interface PostgresCallLogOptions {
 
 export type PostgresCallLog = CallSink & {
   /**
-   * Resolves once the buffer is empty and the writer has stopped. A hung
-   * insert hangs it too: shutdown bounds the wait (serve's `flushMs`).
+   * Resolves once the buffer is empty and the writer has stopped, so only
+   * once intake has stopped: rows recorded meanwhile are written first. A
+   * hung insert hangs it too: shutdown bounds the wait (serve's `flushMs`).
    */
   idle(): Promise<void>;
   /** Rows dropped on a full buffer since this sink was made. */
   dropped(): number;
+  /** Batches the server refused since this sink was made. */
+  failedBatches(): number;
 };
 
 /**
@@ -127,10 +135,17 @@ export type PostgresCallLog = CallSink & {
  * one connection however many calls land at once. A full buffer drops the
  * row (`usage.call_log_dropped` when a streak starts and every 100th after;
  * `usage.call_log_recovered` with the streak's count once a row fits again).
- * A row that cannot be serialized, or a batch the server refuses, is logged
- * (`usage.call_log_failed` {stage, rows, tools, errorClass}) and lost.
- * Neither `record` nor the writer ever throws or rejects: a throwing `log`
- * is swallowed.
+ * A row that cannot be serialized is logged (`usage.call_log_failed`
+ * {stage: "build", rows, tools, errorClass}) and lost. A batch the server
+ * refuses is lost too and logged the same way (stage "insert", with
+ * `failedBatches`, the streak's count) when a streak of refused batches
+ * starts and every 100th after; the first batch written after a streak logs
+ * `usage.call_log_recovered_insert` {failedBatches, rows}. Neither `record`
+ * nor the writer ever throws or rejects: a throwing `log` is swallowed.
+ *
+ * The sink sets no timeout on an insert (the driver's or the server's
+ * statement timeout applies); serve's `flushMs` bounds the wait at shutdown.
+ * The table keeps every row: pruning old ones is the consumer's job.
  */
 export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   if (!intIn(o.maxBuffered, 1, MAX_BUFFERED)) {
@@ -150,6 +165,10 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   let writer: Promise<void> | null = null;
   let streak = 0;
   let droppedTotal = 0;
+  // The current streak of refused batches, the rows they held, and the total.
+  let failStreak = 0;
+  let failStreakRows = 0;
+  let failedTotal = 0;
 
   // Clears `writer` in the same synchronous step that sees the buffer empty,
   // so no row is stranded between "nothing left" and "writer gone"; the
@@ -161,13 +180,27 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
         const batch = buffer.splice(0, maxBatch);
         try {
           await sql.unsafe(statement, [`[${batch.map((r) => r.json).join(",")}]`]);
+          if (failStreak > 0) {
+            log("usage.call_log_recovered_insert", {
+              failedBatches: failStreak,
+              rows: failStreakRows,
+            });
+            failStreak = 0;
+            failStreakRows = 0;
+          }
         } catch (err) {
-          log("usage.call_log_failed", {
-            stage: "insert",
-            rows: batch.length,
-            tools: [...new Set(batch.map((r) => r.tool))],
-            errorClass: errorClassOf(err),
-          });
+          failStreak += 1;
+          failStreakRows += batch.length;
+          failedTotal += 1;
+          if (failStreak === 1 || failStreak % 100 === 0) {
+            log("usage.call_log_failed", {
+              stage: "insert",
+              rows: batch.length,
+              tools: [...new Set(batch.map((r) => r.tool))],
+              errorClass: errorClassOf(err),
+              failedBatches: failStreak,
+            });
+          }
         }
       }
     } finally {
@@ -185,7 +218,7 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
           streak += 1;
           droppedTotal += 1;
           if (streak === 1 || streak % 100 === 0) {
-            log("usage.call_log_dropped", { tool, buffered: buffer.length, dropped: streak });
+            log("usage.call_log_dropped", { tool, dropped: streak, droppedTotal });
           }
           return;
         }
@@ -213,5 +246,6 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
       while (writer) await writer;
     },
     dropped: () => droppedTotal,
+    failedBatches: () => failedTotal,
   };
 }

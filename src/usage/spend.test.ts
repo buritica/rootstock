@@ -173,11 +173,15 @@ describe("createSpendCeiling", () => {
     expect(events).toEqual([
       {
         event: "usage.spend_write_failed",
-        fields: { unit: "tokens", errorClass: "CONNECTION_ENDED" },
+        fields: { caller: "user-1", unit: "tokens", amount: 70, errorClass: "CONNECTION_ENDED" },
       },
     ]);
     await c.record(usage(30)); // the store holds 30, the cache 100
     expect(m.totals.get("user-1|tokens")).toBe(30);
+    expect(events.at(-1)).toEqual({
+      event: "usage.spend_write_recovered",
+      fields: { caller: "user-1" },
+    });
     await expect(c.assertWithin()).rejects.toThrow("budget reached (100/100)");
   });
 
@@ -204,7 +208,9 @@ describe("createSpendCeiling", () => {
     await c.record(usage(1_000_000, 1_000_000)); // 0.1 + 0.4
     expect(m.totals.get("user-1|usd")).toBe(0.5);
     await c.record(usage(5, 5, "model-x"));
-    expect(events).toEqual([{ event: "usage.spend_unpriced", fields: { model: "model-x" } }]);
+    expect(events).toEqual([
+      { event: "usage.spend_unpriced", fields: { caller: "user-1", model: "model-x" } },
+    ]);
     await c.record(usage(5_000_000));
     await expect(c.assertWithin()).rejects.toThrow("budget reached (1/1)");
   });
@@ -228,34 +234,168 @@ describe("createSpendCeiling", () => {
     clock.set(DAY * 20_001); // the app's midnight; the server has not turned yet
     await expect(c.assertWithin()).rejects.toThrow("budget reached (150/100)");
     s.setDay(1); // the server's midnight
+    // Inside the second after a refusal: refused from the cache, no read.
+    clock.set(DAY * 20_001 + 999);
+    await expect(c.assertWithin()).rejects.toThrow("budget reached (150/100)");
+    // A second later the refused caller reads again, and today's total sets the cache.
+    clock.set(DAY * 20_001 + 1000);
     await c.assertWithin();
   });
 
-  test("a later-issued answer replaces yesterday's loaded total even when it is smaller", async () => {
-    const s = serverDayStore();
-    const { charger, clock } = ceiling(s.store);
-    const c = charger.forCaller("user-1");
-    s.seed("user-1", 80);
-    clock.set(DAY * 20_001);
-    await c.assertWithin(); // loads yesterday's 80
-    s.setDay(1);
-    await c.record(usage(10)); // today's add answers 10
-    await c.record(usage(50)); // 60, not 140
-    await c.assertWithin();
-  });
-
-  test("an answer from an earlier-issued request arriving late is ignored", async () => {
-    const s = serverDayStore();
-    const { charger } = ceiling(s.store, { ceiling: 71 });
-    const c = charger.forCaller("user-1");
-    s.holdAdds(true);
-    const first = c.record(usage(30)); // commits first: answers 30
-    const second = c.record(usage(40)); // commits second: answers 70
-    s.holdAdds(false);
-    s.releaseAdds(true); // 70 arrives, then the stale 30
-    await Promise.all([first, second]);
-    await c.record(usage(1)); // 71
+  test("two adds answering out of order: the larger total stays, whichever arrives last", async () => {
+    const m = memoryStore();
+    const answers: ((n: number) => void)[] = [];
+    const store: SpendStore = {
+      ...m.store,
+      add: () => new Promise<number>((resolve) => answers.push(resolve)),
+    };
+    const c = ceiling(store, { ceiling: 71 }).charger.forCaller("user-1");
+    await c.assertWithin(); // loads 0
+    const first = c.record(usage(40)); // issued first, commits second: answers 70
+    const second = c.record(usage(30)); // issued second, commits first: answers 30
+    answers[1]?.(30);
+    await second;
+    answers[0]?.(70);
+    await first;
+    await c.assertWithin(); // 70 < 71
+    m.totals.set("user-1|tokens", 70);
+    const third = c.record(usage(1));
+    answers[2]?.(71);
+    await third;
     await expect(c.assertWithin()).rejects.toThrow("budget reached (71/71)");
+    // And the reverse arrival: a smaller answer landing last never lowers the cache.
+    const c2 = ceiling(store, { ceiling: 71 }).charger.forCaller("user-2");
+    await c2.assertWithin();
+    const p1 = c2.record(usage(40));
+    const p2 = c2.record(usage(31));
+    answers[3]?.(71);
+    await p1;
+    answers[4]?.(31);
+    await p2;
+    await expect(c2.assertWithin()).rejects.toThrow("budget reached (71/71)");
+  });
+
+  test("a read issued before an add but answered after it never lowers the cache", async () => {
+    const m = memoryStore();
+    let answerLoad: (n: number) => void = () => {};
+    const store: SpendStore = {
+      ...m.store,
+      load: () =>
+        new Promise<number>((resolve) => {
+          answerLoad = resolve;
+        }),
+      add: async () => 60,
+    };
+    const c = ceiling(store).charger.forCaller("user-1");
+    const check = c.assertWithin(); // the read is issued
+    await c.record(usage(60)); // an add issued after it answers 60 first
+    answerLoad(10); // the read's older snapshot
+    await check;
+    await c.record(usage(0));
+    // 60 from the add stands: a 40-token add takes it to 100 locally.
+    let answerAdd: (n: number) => void = () => {};
+    (store as { add: SpendStore["add"] }).add = () =>
+      new Promise<number>((resolve) => {
+        answerAdd = resolve;
+      });
+    const pending = c.record(usage(40));
+    await expect(c.assertWithin()).rejects.toThrow("budget reached (100/100)");
+    answerAdd(100);
+    await pending;
+  });
+
+  test("a read issued after an add was applied sets the cache, even lower", async () => {
+    const m = memoryStore();
+    const { charger, clock } = ceiling(m.store);
+    const c = charger.forCaller("user-1");
+    await c.record(usage(100)); // the cache holds 100
+    await expect(c.assertWithin()).rejects.toThrow(CeilingReached);
+    m.totals.set("user-1|tokens", 20); // the store now says less (yesterday's row was read)
+    clock.set(clock.now() + 1000);
+    await c.assertWithin(); // the reload sets 20
+  });
+
+  test("concurrent checks of one caller share one read", async () => {
+    const m = memoryStore();
+    let answer: (n: number) => void = () => {};
+    let loads = 0;
+    const store: SpendStore = {
+      ...m.store,
+      load: () => {
+        loads++;
+        return new Promise<number>((resolve) => {
+          answer = resolve;
+        });
+      },
+    };
+    const c = ceiling(store).charger.forCaller("user-1");
+    const checks = [c.assertWithin(), c.assertWithin(), c.assertWithin()];
+    answer(5);
+    await Promise.all(checks);
+    expect(loads).toBe(1);
+    await c.assertWithin();
+    expect(loads).toBe(1);
+  });
+
+  test("a refused caller is read again at most once a second, and refused from the cache in between", async () => {
+    const m = memoryStore();
+    const { charger, clock, events } = ceiling(m.store);
+    const c = charger.forCaller("user-1");
+    m.totals.set("user-1|tokens", 100);
+    const t0 = clock.now();
+    for (let i = 0; i < 5; i++) await expect(c.assertWithin()).rejects.toThrow(CeilingReached);
+    expect(m.calls.load).toBe(1);
+    clock.set(t0 + 1000);
+    await expect(c.assertWithin()).rejects.toThrow(CeilingReached);
+    expect(m.calls.load).toBe(2);
+    clock.set(t0 + 1500);
+    await expect(c.assertWithin()).rejects.toThrow(CeilingReached);
+    expect(m.calls.load).toBe(2);
+    // Logged once per caller per cache day.
+    expect(events.filter((e) => e.event === "usage.spend_refused")).toEqual([
+      {
+        event: "usage.spend_refused",
+        fields: { caller: "user-1", used: 100, ceiling: 100, unit: "tokens" },
+      },
+    ]);
+  });
+
+  test("record never rejects: a throwing clock or a malformed usage is logged", async () => {
+    const m = memoryStore();
+    const { log, events } = captureLog();
+    const broken = createSpendCeiling({
+      store: m.store,
+      unit: "tokens",
+      ceiling: 100,
+      prices: null,
+      refusal,
+      errorClass: CeilingReached,
+      clock: {
+        now: () => {
+          throw new Error("clock down");
+        },
+        monotonic: () => 0,
+      },
+      log,
+    });
+    await broken.forCaller("user-1").record(usage(5));
+    expect(events).toEqual([
+      { event: "usage.spend_record_failed", fields: { caller: "user-1", errorClass: "Error" } },
+    ]);
+    const { charger, events: ev2 } = ceiling(m.store);
+    await charger.forCaller("user-1").record(null as never);
+    await charger.forCaller("user-1").record({ model: "m", input: "1", output: 0 } as never);
+    const hostile = Object.defineProperty({}, "input", {
+      get() {
+        throw new Error("gotcha");
+      },
+    });
+    await charger.forCaller("user-1").record(hostile as never);
+    expect(ev2.map((e) => e.event)).toEqual([
+      "usage.spend_bad_usage",
+      "usage.spend_bad_usage",
+      "usage.spend_record_failed",
+    ]);
   });
 
   test("the day boundary: a millisecond before midnight is still today, midnight starts a new cache", async () => {
@@ -319,9 +459,9 @@ describe("createSpendCeiling", () => {
     await c.assertWithin();
   });
 
-  test("usd: an unpriced model is never charged and is logged on every call (fail open, decided)", async () => {
+  test("usd: an unpriced model is never charged and is logged once per model per day (fail open, decided)", async () => {
     const m = memoryStore();
-    const { charger, events } = ceiling(m.store, {
+    const { charger, events, clock } = ceiling(m.store, {
       unit: "usd",
       ceiling: 1,
       prices: runsSlice(RUNS_INPUT),
@@ -329,11 +469,15 @@ describe("createSpendCeiling", () => {
     const c = charger.forCaller("user-1");
     for (let i = 0; i < 3; i++) await c.record(usage(10_000_000, 10_000_000, "model-x"));
     expect(m.calls.add).toBe(0);
-    expect(events.map((e) => e.event)).toEqual([
-      "usage.spend_unpriced",
-      "usage.spend_unpriced",
-      "usage.spend_unpriced",
+    await c.record(usage(1, 1, "model-y"));
+    await charger.forCaller("user-2").record(usage(1, 1, "model-x"));
+    expect(events.map((e) => [e.event, e.fields.model])).toEqual([
+      ["usage.spend_unpriced", "model-x"],
+      ["usage.spend_unpriced", "model-y"],
     ]);
+    clock.set(clock.now() + DAY);
+    await c.record(usage(1, 1, "model-x"));
+    expect(events).toHaveLength(3);
     await c.assertWithin();
   });
 

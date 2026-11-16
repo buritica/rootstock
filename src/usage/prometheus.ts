@@ -79,7 +79,9 @@ export function prometheusToolMetrics(o: {
       if (r.stage !== "handler") return;
       const s = series.get(r.tool);
       if (s === undefined) return;
-      const seconds = Math.max(0, r.durationMs) / 1000;
+      // Not a finite number: counted as 0, as the call log stores it.
+      const ms = Number.isFinite(r.durationMs) ? Math.max(0, r.durationMs) : 0;
+      const seconds = ms / 1000;
       s[r.ok ? "ok" : "error"] += 1;
       s.sumSeconds += seconds;
       buckets.forEach((bound, i) => {

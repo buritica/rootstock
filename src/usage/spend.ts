@@ -102,15 +102,23 @@ export interface SpendCeilingOptions {
 }
 
 const DAY_MS = 86_400_000;
+/** After a refusal, the store is read again at most this often per caller. */
+const REFUSED_RELOAD_MS = 1_000;
 
 const countable = (n: unknown): boolean =>
   typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 
 interface Entry {
-  /** The store's total from the newest-issued request answered so far; null before any, or to reload. */
+  /** The cached store total: null before the first answer. */
   base: number | null;
-  /** The issue number of the request `base` came from; 0 before any. */
-  seq: number;
+  /** The highest issue number of an add whose answer was applied; 0 before any. */
+  addSeq: number;
+  /** The load in flight, shared by every check that waits on it. */
+  loading: Promise<void> | null;
+  /** After a refusal: the monotonic time from which the next check reads the store again. */
+  reloadAt: number | null;
+  /** `usage.spend_refused` was logged for this caller today. */
+  refusalLogged: boolean;
   /** Adds sent and not yet answered. */
   pending: number;
   /** Adds whose write failed: still counted here, never in the store. */
@@ -120,29 +128,45 @@ interface Entry {
 /**
  * A daily per-caller ceiling. `assertWithin()` reads the caller's total once
  * per UTC day and then works from a cache: it throws `errorClass(refusal(…))`
- * when the total has reached the ceiling. `record(u)` adds to the cache before
- * it yields, so a check later in the same call sees it, then upserts; the
- * returned total (the store's, all processes included) replaces the cached
- * one. Calls are charged whatever their outcome.
+ * when the total has reached the ceiling. Concurrent checks of one caller
+ * share one read. `record(u)` adds to the cache before it yields, so a check
+ * later in the same call sees it, then upserts; the store's answer (all
+ * processes included) updates the cache. Calls are charged whatever their
+ * outcome. `record` never rejects: anything that goes wrong in it is logged
+ * (`usage.spend_record_failed` {caller, errorClass}).
+ *
+ * Settling: within one row a total only grows, so an add's answer raises the
+ * cache to it (max), whatever order two adds on two connections commit and
+ * answer in. A read's answer sets the cache, unless an add issued after that
+ * read has already been applied (the add's answer is then the newer one).
  *
  * Two clocks: the cache's day is the app's (`clock`, UTC), the store's row is
- * the server's (`now()` in the SQL). Around midnight they can disagree, so
- * every store request is numbered as it is issued and only an answer newer
- * than the one applied replaces the cached total (set, not max: today's add
- * may answer less than yesterday's load). A refusal drops the cached total,
- * so a refused caller's next check reads the store again and is let through
- * once the server's day has turned.
+ * the server's (`now()` in the SQL), and around midnight they can disagree:
+ * the first read of the app's new day can still return yesterday's total. A
+ * refusal therefore marks the cache stale: a later check, at most once a
+ * second per caller (`clock.monotonic()`), reads the store again, and that
+ * read sets the total, so a caller refused on yesterday's total is let
+ * through once the server's day has turned. Inside that second a refused
+ * caller is refused from the cache, with no read. The first refusal of a
+ * caller per cache day logs `usage.spend_refused` {caller, used, ceiling,
+ * unit}; later ones are silent (the failed call is logged by serve).
  *
  * Failures: a failed or non-finite read rejects `assertWithin` (fail closed)
- * and the next check reads again. A failed write is logged
- * (`usage.spend_write_failed`) and its amount stays in this process's cache;
- * a write that committed but whose answer was lost is then counted twice,
- * which errs toward refusing.
+ * and the next check reads again. A failed write, or one answered with a
+ * non-finite total, is logged (`usage.spend_write_failed` {caller, unit,
+ * amount, errorClass}) and its amount stays in this process's cache
+ * (`kept`); the next good write logs `usage.spend_write_recovered` {caller}.
+ * A write that committed but whose answer was lost is counted twice, which
+ * errs toward refusing; `kept` lives in memory only, so a restart forgets it,
+ * which errs toward letting through. An add still in flight when a new day
+ * clears the cache settles into the old day's entry, never the new one.
  *
  * "usd": each meter call is priced on its own with `priceTokens`, rounded to
- * whole micro-dollars, so a call worth under half a micro-dollar is free. A
- * model the price table lacks is not charged (fail open, decided) and logs
- * `usage.spend_unpriced` on every such call.
+ * whole micro-dollars, so a call worth under half a micro-dollar is free, and
+ * `spend.used` can differ from the sum of the call log's `cost_usd`, which
+ * prices each call's tokens together. A model the price table lacks is not
+ * charged (fail open, decided); `usage.spend_unpriced` {caller, model} is
+ * logged once per model per cache day.
  *
  * Not fixed: two concurrent calls of one caller can both pass the check
  * before either records, so the ceiling can be overshot by what they spend.
@@ -171,41 +195,60 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
       throw configError("createSpendCeiling: prices must be a runs slice built by runsSlice()");
     }
   }
-  // Today's entries only: the first call of a new UTC day clears the map, so
-  // a caller who stops calling is not kept.
+  // Today's entries only: the first call of a new UTC day clears the map (and
+  // the unpriced models seen), so a caller who stops calling is not kept.
   const cache = new Map<string, Entry>();
+  const unpricedSeen = new Set<string>();
   let currentDay: number | null = null;
+  // Callers whose last write failed, for `usage.spend_write_recovered`.
+  const failing = new Set<string>();
 
   const entryFor = (caller: string): Entry => {
     const day = Math.floor(clock.now() / DAY_MS);
     if (day !== currentDay) {
       cache.clear();
+      unpricedSeen.clear();
       currentDay = day;
     }
     let e = cache.get(caller);
     if (e === undefined) {
-      e = { base: null, seq: 0, pending: 0, kept: 0 };
+      e = {
+        base: null,
+        addSeq: 0,
+        loading: null,
+        reloadAt: null,
+        refusalLogged: false,
+        pending: 0,
+        kept: 0,
+      };
       cache.set(caller, e);
     }
     return e;
   };
+
   // Every store request gets the next number when it is issued.
   let issued = 0;
-  // A store answer, applied only when its request was issued after the one
-  // `base` came from; an older answer arriving late is ignored. A load that
-  // already counts an add still in flight overcounts it until that add's
-  // answer lands; a load issued after an add but read before it committed
-  // undercounts it until the next add answers.
-  const settle = (e: Entry, seq: number, storeTotal: number): void => {
+  const finite = (storeTotal: number): number => {
     if (!Number.isFinite(storeTotal)) {
       throw new Error(
         "rootstock usage: the spend store answered a total that is not a finite number",
       );
     }
-    if (seq > e.seq) {
-      e.base = storeTotal;
-      e.seq = seq;
-    }
+    return storeTotal;
+  };
+
+  const load = (caller: string, e: Entry): Promise<void> => {
+    e.loading ??= (async () => {
+      const seq = ++issued;
+      try {
+        const total = finite(await store.load(caller, unit));
+        e.base = e.addSeq > seq ? Math.max(e.base ?? 0, total) : total;
+        e.reloadAt = null;
+      } finally {
+        e.loading = null;
+      }
+    })();
+    return e.loading;
   };
 
   const amountOf = (u: Usage): number | string | null => {
@@ -218,43 +261,61 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
     return cost.costUsd;
   };
 
+  const charge = async (caller: string, u: Usage): Promise<void> => {
+    if (typeof u !== "object" || u === null || !countable(u.input) || !countable(u.output)) {
+      log("usage.spend_bad_usage", { caller, model: (u as { model?: unknown } | null)?.model });
+      return;
+    }
+    const amount = amountOf(u);
+    if (amount === null) {
+      entryFor(caller); // rolls the day over first, so "once per day" is the cache's day
+      if (!unpricedSeen.has(u.model)) {
+        unpricedSeen.add(u.model);
+        log("usage.spend_unpriced", { caller, model: u.model });
+      }
+      return;
+    }
+    const n = Number(amount);
+    if (!(n > 0)) return;
+    const e = entryFor(caller);
+    e.pending += n;
+    const seq = ++issued;
+    try {
+      const total = finite(await store.add(caller, unit, amount));
+      e.base = Math.max(e.base ?? 0, total);
+      e.addSeq = Math.max(e.addSeq, seq);
+      if (failing.delete(caller)) log("usage.spend_write_recovered", { caller });
+    } catch (err) {
+      e.kept += n;
+      failing.add(caller);
+      log("usage.spend_write_failed", { caller, unit, amount, errorClass: errorClassOf(err) });
+    } finally {
+      e.pending -= n;
+    }
+  };
+
   return {
     forCaller(caller) {
       return {
         async assertWithin() {
           const e = entryFor(caller);
-          if (e.base === null) {
-            const seq = ++issued;
-            settle(e, seq, await store.load(caller, unit));
-          }
+          const stale = e.reloadAt !== null && clock.monotonic() >= e.reloadAt;
+          if (e.base === null || stale) await load(caller, e);
           const used = (e.base ?? 0) + e.pending + e.kept;
           if (used >= ceiling) {
-            e.base = null;
+            if (e.reloadAt === null || stale) e.reloadAt = clock.monotonic() + REFUSED_RELOAD_MS;
+            if (!e.refusalLogged) {
+              e.refusalLogged = true;
+              log("usage.spend_refused", { caller, used, ceiling, unit });
+            }
             throw new errorClass(refusal(used, ceiling));
           }
         },
         async record(u) {
-          if (!countable(u.input) || !countable(u.output)) {
-            log("usage.spend_bad_usage", { model: u.model });
-            return;
-          }
-          const amount = amountOf(u);
-          if (amount === null) {
-            log("usage.spend_unpriced", { model: u.model });
-            return;
-          }
-          const n = Number(amount);
-          if (!(n > 0)) return;
-          const e = entryFor(caller);
-          e.pending += n;
-          const seq = ++issued;
           try {
-            settle(e, seq, await store.add(caller, unit, amount));
+            await charge(caller, u);
           } catch (err) {
-            e.kept += n;
-            log("usage.spend_write_failed", { unit, errorClass: errorClassOf(err) });
-          } finally {
-            e.pending -= n;
+            log("usage.spend_record_failed", { caller, errorClass: errorClassOf(err) });
           }
         },
       };

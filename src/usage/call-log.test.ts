@@ -114,7 +114,7 @@ describe("postgresCallLog", () => {
       ["usage.call_log_dropped", 1],
       ["usage.call_log_dropped", 100],
     ]);
-    expect(events[0]?.fields).toEqual({ tool: "boom", buffered: 2, dropped: 1 });
+    expect(events[0]?.fields).toEqual({ tool: "boom", dropped: 1, droppedTotal: 1 });
     db.release();
     await until(() => db.sent.length === 2); // the writer took the buffered rows
     sink.record(callRecord());
@@ -195,24 +195,48 @@ describe("postgresCallLog", () => {
     });
   });
 
-  test("a failed batch is logged with its rows and tools and the writer goes on", async () => {
+  test("refused batches: logged when a streak starts and every 100th, counted, and the recovery logged", async () => {
     const db = gatedSql();
     const { log, events } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 10, maxBatch: 2, log });
-    for (const tool of ["echo", "slow", "echo"]) sink.record(callRecord({ tool }));
+    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 300, maxBatch: 1, log });
     db.failWith(Object.assign(new Error("relation does not exist: SECRET"), { code: "42P01" }));
+    sink.record(callRecord({ tool: "echo" }));
+    sink.record(callRecord({ tool: "slow" }));
+    for (let i = 0; i < 98; i++) sink.record(callRecord({ tool: "echo" }));
     await drained(db, sink);
-    expect(db.sent).toHaveLength(2);
+    expect(sink.failedBatches()).toBe(100);
     expect(events).toEqual([
       {
         event: "usage.call_log_failed",
-        fields: { stage: "insert", rows: 2, tools: ["echo", "slow"], errorClass: "42P01" },
+        fields: {
+          stage: "insert",
+          rows: 1,
+          tools: ["echo"],
+          errorClass: "42P01",
+          failedBatches: 1,
+        },
       },
       {
         event: "usage.call_log_failed",
-        fields: { stage: "insert", rows: 1, tools: ["echo"], errorClass: "42P01" },
+        fields: {
+          stage: "insert",
+          rows: 1,
+          tools: ["echo"],
+          errorClass: "42P01",
+          failedBatches: 100,
+        },
       },
     ]);
+    expect(JSON.stringify(events)).not.toContain("SECRET");
+    db.failWith(null);
+    sink.record(callRecord());
+    sink.record(callRecord());
+    await drained(db, sink);
+    expect(events.slice(2)).toEqual([
+      { event: "usage.call_log_recovered_insert", fields: { failedBatches: 100, rows: 100 } },
+    ]);
+    expect(sink.failedBatches()).toBe(100);
+    expect(db.sent).toHaveLength(102);
   });
 
   test("a row that cannot serialize is logged and dropped alone", async () => {
@@ -244,10 +268,18 @@ describe("postgresCallLog", () => {
       sink.record(callRecord({ durationMs: durationMs as number }));
     }
     sink.record(callRecord({ ok: "yes" as never }));
+    sink.record(
+      callRecord({ caller: null as never, tool: undefined as never, args: "x" as never }),
+    );
+    sink.record(callRecord({ caller: 42 as never, args: [1, 2] as never }));
     await drained(db, sink);
     const rows = db.sent.flatMap((x) => x.rows);
-    expect(rows.map((r) => r.duration_ms)).toEqual([0, 0, 0, 2_147_483_647, 8, 12]);
-    expect(rows.map((r) => r.ok)).toEqual([true, true, true, true, true, false]);
+    expect(rows.map((r) => r.duration_ms)).toEqual([0, 0, 0, 2_147_483_647, 8, 12, 12, 12]);
+    expect(rows.map((r) => r.ok)).toEqual([true, true, true, true, true, false, true, true]);
+    expect(rows.slice(6).map((r) => [r.caller, r.tool, r.args])).toEqual([
+      ["", "", {}],
+      ["42", "echo", [1, 2]],
+    ]);
   });
 
   test("a throwing logger changes nothing: record does not throw and later rows still drain", async () => {
