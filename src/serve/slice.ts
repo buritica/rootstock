@@ -5,7 +5,11 @@
 // slice against the service it describes. Its value imports are the shared
 // slice pieces and serve's `errors.ts` (whose number rules the service
 // applies too), neither of which loads a package, so `config` composes it
-// without the MCP SDK peer.
+// without the MCP SDK peer. Some rules are stricter than the runtime's (a
+// bucket's capacity and maxKeys are whole, its refill reaches full in finite
+// time, a probe timeout is at least 1 ms): a value the runtime would take
+// but that never admits a call, never prunes or never reads ready is refused
+// here.
 
 import {
   type Brand,
@@ -117,6 +121,7 @@ const nonNeg = (path: string, v: unknown) =>
   num(path, v, isNonNegativeNumber, "a finite number >= 0");
 const isNonNegativeInteger = (v: unknown): v is number =>
   isNonNegativeNumber(v) && Number.isInteger(v);
+const isAtLeastOne = (v: unknown): v is number => isNonNegativeNumber(v) && v >= 1;
 
 function orNull<T>(v: unknown, parse: (v: unknown) => T): T | null {
   return v === null ? null : parse(v);
@@ -135,8 +140,26 @@ function numbers<K extends string, T>(
   return Object.freeze(out);
 }
 
-/** The bucket numbers createRateLimiter accepts. */
-const bucket = (path: string, raw: unknown): BucketLimits => numbers(path, raw, BUCKET, posNum);
+/**
+ * The bucket numbers createRateLimiter accepts, held stricter: a capacity
+ * below 1 (or a fraction of one) would refuse or round down every burst, a
+ * fractional maxKeys means nothing, and a refill so slow that a bucket never
+ * reads full would stop the prune.
+ */
+function bucket(path: string, raw: unknown): BucketLimits {
+  const b = exact(path, raw, BUCKET);
+  const capacity = posInt(`${path}.capacity`, own(b, "capacity"));
+  const refillPerSecond = posNum(`${path}.refillPerSecond`, own(b, "refillPerSecond"));
+  const maxKeys = posInt(`${path}.maxKeys`, own(b, "maxKeys"));
+  if (!Number.isFinite((capacity / refillPerSecond) * 1000)) {
+    throw refuse.invalid(
+      `${path}.refillPerSecond`,
+      "large enough that a bucket refills in a finite time (capacity / refillPerSecond × 1000)",
+      refillPerSecond,
+    );
+  }
+  return Object.freeze({ capacity, refillPerSecond, maxKeys });
+}
 
 /** A map keyed by tool or group name, each entry through `entry`. */
 function named<T>(path: string, raw: unknown, entry: (p: string, v: unknown) => T) {
@@ -238,7 +261,10 @@ export function serveSlice(input: ServeSliceInput): ServeSlice {
     ),
     shutdown: numbers("shutdown", own(raw, "shutdown"), SHUTDOWN, nonNeg),
     limits: limits(own(raw, "limits")),
-    probes: numbers("probes", own(raw, "probes"), PROBES, nonNeg),
+    probes: numbers("probes", own(raw, "probes"), PROBES, (p, v) =>
+      // A 0 ms bound answers every probe "timed out": /ready would never be 200.
+      p === "probes.timeoutMs" ? num(p, v, isAtLeastOne, "a finite number >= 1") : nonNeg(p, v),
+    ),
   }) as ServeSlice;
   return brand.mark(slice);
 }

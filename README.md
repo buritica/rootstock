@@ -19,7 +19,9 @@ The office-document extractor needs its optional peers (`jszip`, `mammoth`,
 (`@modelcontextprotocol/server >=2.4.0 <3`) and `zod ^4.5.4`; `serve/auth`
 also needs `better-auth`, `@better-auth/mcp` and `@better-auth/cimd`, each
 `>=1.7.17 <1.8`. All are optional peers, so the app's own copies are the ones
-that load; `serve` itself never loads Better Auth. `@better-auth/mcp` depends
+that load; `serve` itself never loads Better Auth. An optional peer that is
+installed must still satisfy its range, even in an app that never imports
+`serve`: a `better-auth` below 1.7.17 makes the package manager warn. `@better-auth/mcp` depends
 on `@better-auth/oauth-provider ^1.7.17`, so that package and
 `@better-auth/core` float with each lockfile: pin them in yours and name the
 resolved versions when you bump.
@@ -379,6 +381,8 @@ import {
   readiness,
   SERVE_HARDENING,
   type ServeProfile,
+  type Limits,
+  type ServeSlice,
 } from "@buritica/rootstock/serve";
 import { checkAuthSecret, defineAuth } from "@buritica/rootstock/serve/auth";
 import { postgresCallLog, usageWiring } from "@buritica/rootstock/usage";
@@ -386,7 +390,10 @@ import * as z from "zod/v4";
 
 declare const sql: SQL; // the app's own client
 declare const authPool: unknown; // the pg Pool (or drizzleAdapter) Better Auth reads
-declare const profile: ServeProfile; // every request-handling choice, spelled out
+declare const PROFILE: ServeProfile; // every request-handling choice, spelled out
+declare const s: ServeSlice; // config.serve: the numbers the config golden prints
+declare const withBusyText: (g: ServeSlice["limits"]["concurrency"]) => Limits["concurrency"];
+declare const withExhaustedText: (t: ServeSlice["limits"]["turnBudget"]) => Limits["turnBudget"];
 declare const sendMail: (to: string, url: string) => Promise<void>;
 declare const loginPage: () => string;
 declare const consentPage: (query: string) => string;
@@ -434,6 +441,22 @@ const auth = defineAuth({
 });
 await auth.assertStoreReady();
 
+// The numbers come from the slice (see "Config prints the numbers" below);
+// the wording (`busy`, `exhausted`) stays here. Build `limits` once per
+// process: limiter state is keyed on this object.
+const profile: ServeProfile = {
+  ...PROFILE,
+  id: s.id,
+  bodyLimit: s.bodyLimit,
+  deadlineMs: s.deadlineMs,
+  shutdown: s.shutdown,
+};
+const limits = {
+  ...s.limits,
+  concurrency: withBusyText(s.limits.concurrency),
+  turnBudget: withExhaustedText(s.limits.turnBudget),
+};
+
 const callLog = postgresCallLog({
   sql,
   table: { schema: "rootstock", name: "mcp_calls" },
@@ -454,14 +477,7 @@ const service = createMcpService({
   },
   auth,
   toolScopes,
-  limits: {
-    refusal: { capacity: 20, refillPerSecond: 2, maxKeys: 4096 },
-    serving: null,
-    perTool: {},
-    concurrency: {},
-    turnBudget: null,
-    logIntervalMs: 1000,
-  },
+  limits,
   usage: usageWiring({
     sinks: [callLog],
     keepArgs: true,
@@ -477,14 +493,13 @@ const service = createMcpService({
   log,
 });
 
-const timing = { timeoutMs: 2000, cacheTtlMs: 5000, pendingMaxMs: 10_000 };
 const health = liveness({ fields: { status: "ok" }, headers: {} });
 const ready = readiness({
   sha: process.env.GIT_SHA ?? null,
   db: dbProbe(sql),
   probes: {},
   headers: { "content-type": "application/json" },
-  timing,
+  timing: s.probes,
   clock,
   timers,
   log,
@@ -492,6 +507,7 @@ const ready = readiness({
 
 const server = Bun.serve({
   ...SERVE_HARDENING,
+  idleTimeout: s.idleTimeout ?? SERVE_HARDENING.idleTimeout,
   async fetch(req, srv) {
     const { pathname } = new URL(req.url);
     if (pathname === "/health") return health();
@@ -516,6 +532,19 @@ process.on("SIGTERM", async () => {
   stateless handler), which non-POST methods authenticate first, body
   limits per caller kind, the deadline, Host/Origin rules and each refusal's
   exact bytes. Every field is required; nothing defaults.
+- **Limits are per process.** Buckets, concurrency groups and turn budgets
+  live in memory: N instances allow N times the rate. Build the `Limits`
+  object once; a fresh object per request starts every bucket full.
+- **Body limits sit under the listener's.** A `bodyLimit` above the
+  listener's `maxRequestBodySize` is never reached (Bun refuses first), and
+  null means the listener's cap is the only one.
+- **A deadline needs the JSON transport.** `deadlineMs` with
+  `entry.kind: "handler"` is refused at `createMcpService`; set it to null
+  there.
+- **No `serve.started` line, no request id.** The service logs no start
+  line and `serve.request` carries no request id, because either would move
+  a consumer's existing log goldens. `hooks.requestFields` adds fields of
+  your own.
 - **`handle` answers `null` for a path it does not own** when the profile
   sets `passUnknown`; otherwise it answers the profile's 404. Mount
   `liveness` and `readiness` on your own routes, before `handle`.
@@ -546,8 +575,8 @@ process.on("SIGTERM", async () => {
 - **Shutdown drains, forces, then flushes.** `shutdown` stops the listener
   and waits up to `drainMs` for requests, then force-closes what is left
   (`server.stop(true)` and the SDK entry, each within `forceMs`), then waits
-  up to `flushMs` for every sink's `idle()` and the auth layer's pending
-  sends, then closes the pool within `poolEndTimeoutS`.
+  up to `flushMs` for every sink's `idle()`, the spend charger's `idle()`
+  (its writes in flight) and the auth layer's pending sends, then closes the pool within `poolEndTimeoutS`.
 - **Config prints the numbers.** `defineRootstockConfig` takes `serve`
   (`serveSlice`: body limits, deadline, idle timeout, shutdown, limits and
   probe timing) and `usage` (`usageSlice`). They print in the config golden
@@ -560,11 +589,15 @@ process.on("SIGTERM", async () => {
 
   ```ts
   const s = config.serve!; // the slice your config golden prints
-  const profile = { ...PROFILE, bodyLimit: s.bodyLimit, deadlineMs: s.deadlineMs, shutdown: s.shutdown };
+  const profile = { ...PROFILE, id: s.id, bodyLimit: s.bodyLimit, deadlineMs: s.deadlineMs, shutdown: s.shutdown };
   const limits = { ...s.limits, concurrency: withBusyText(s.limits.concurrency), turnBudget: withExhaustedText(s.limits.turnBudget) };
+  Bun.serve({ ...SERVE_HARDENING, idleTimeout: s.idleTimeout ?? SERVE_HARDENING.idleTimeout, fetch });
+  readiness({ ...rest, timing: s.probes });
   ```
   `withBusyText` and `withExhaustedText` stand for your own wording (`busy`,
-  `exhausted`), which the slice does not hold.
+  `exhausted`), which the slice does not hold. The slice refuses
+  some values the runtime would take but that never work (a fractional
+  bucket capacity, a probe timeout under 1 ms).
 
 ## Rules
 

@@ -178,13 +178,13 @@ describe("serveSlice", () => {
       "serveSlice: shutdown.flushMs must be a finite number >= 0 — got -1",
     );
     expect(refusal({ ...SERVE_INPUT, probes: { ...SERVE_INPUT.probes, timeoutMs: "1" } })).toBe(
-      'serveSlice: probes.timeoutMs must be a finite number >= 0 — got "1"',
+      'serveSlice: probes.timeoutMs must be a finite number >= 1 — got "1"',
     );
   });
 
   test("refuses the limits' numbers the limiters would refuse", () => {
     expect(refusal(withLimits({ refusal: { ...BUCKET, capacity: 0 } }))).toBe(
-      "serveSlice: limits.refusal.capacity must be a finite number > 0 — got 0",
+      "serveSlice: limits.refusal.capacity must be an integer > 0 — got 0",
     );
     expect(refusal(withLimits({ perTool: { echo: { ...BUCKET, refillPerSecond: 0 } } }))).toBe(
       "serveSlice: limits.perTool.echo.refillPerSecond must be a finite number > 0 — got 0",
@@ -217,6 +217,32 @@ describe("serveSlice", () => {
     expect(refusal(withLimits({ logIntervalMs: Number.POSITIVE_INFINITY }))).toBe(
       "serveSlice: limits.logIntervalMs must be a finite number >= 0 — got Infinity",
     );
+  });
+
+  test("refuses buckets and probe timings the runtime takes but that never work", () => {
+    expect(refusal(withLimits({ refusal: { ...BUCKET, capacity: 0.5 } }))).toBe(
+      "serveSlice: limits.refusal.capacity must be an integer > 0 — got 0.5",
+    );
+    expect(refusal(withLimits({ serving: { ...BUCKET, capacity: 2.5 } }))).toBe(
+      "serveSlice: limits.serving.capacity must be an integer > 0 — got 2.5",
+    );
+    expect(refusal(withLimits({ perTool: { echo: { ...BUCKET, maxKeys: 1.5 } } }))).toBe(
+      "serveSlice: limits.perTool.echo.maxKeys must be an integer > 0 — got 1.5",
+    );
+    expect(
+      refusal(withLimits({ refusal: { capacity: 10, refillPerSecond: 5e-324, maxKeys: 1 } })),
+    ).toBe(
+      "serveSlice: limits.refusal.refillPerSecond must be large enough that a bucket refills in a finite time (capacity / refillPerSecond × 1000) — got 5e-324",
+    );
+    for (const timeoutMs of [0, 0.5]) {
+      expect(refusal({ ...SERVE_INPUT, probes: { ...SERVE_INPUT.probes, timeoutMs } })).toBe(
+        `serveSlice: probes.timeoutMs must be a finite number >= 1 — got ${timeoutMs}`,
+      );
+    }
+    expect(
+      serveSlice({ ...SERVE_INPUT, probes: { timeoutMs: 1, cacheTtlMs: 0, pendingMaxMs: 0 } })
+        .probes.cacheTtlMs,
+    ).toBe(0);
   });
 
   test("refuses a tool listed twice in a group, or in two groups", () => {

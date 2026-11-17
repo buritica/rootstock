@@ -100,6 +100,35 @@ function serverDayStore() {
 }
 
 describe("createSpendCeiling", () => {
+  test("idle() resolves once every write issued so far has settled, a failed one included", async () => {
+    const m = memoryStore();
+    const gates: (() => void)[] = [];
+    const slow: SpendStore = {
+      ...m.store,
+      add: (caller, unit, amount) =>
+        new Promise<void>((r) => gates.push(r)).then(() => m.store.add(caller, unit, amount)),
+    };
+    const { charger } = ceiling(slow);
+    await charger.idle?.(); // nothing in flight
+    const c = charger.forCaller("user-1");
+    void c.record(usage(10));
+    void c.record(usage(5));
+    let idled = false;
+    const idle = charger.idle?.().then(() => {
+      idled = true;
+    });
+    await Bun.sleep(1);
+    expect(idled).toBe(false);
+    gates[0]?.();
+    await Bun.sleep(1);
+    expect(idled).toBe(false);
+    m.failNextAdd();
+    gates[1]?.();
+    await idle;
+    expect(idled).toBe(true);
+    expect(m.totals.get("user-1|tokens")).toBe(10);
+  });
+
   test("refuses once the total reaches the ceiling, with the consumer's error and text", async () => {
     const m = memoryStore();
     const c = ceiling(m.store).charger.forCaller("user-1");

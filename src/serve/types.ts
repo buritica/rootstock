@@ -102,6 +102,12 @@ export interface UsageWiring {
 
 export interface SpendCharger {
   forCaller(key: string): { assertWithin(): Promise<void>; record(u: Usage): Promise<void> };
+  /**
+   * Resolves once every write issued so far has settled (rev 3.4, optional).
+   * Shutdown waits for it within `flushMs`, before the pool ends, so a call
+   * metered just before SIGTERM still reaches the store.
+   */
+  idle?(): Promise<void>;
 }
 
 export interface StoppableServer {
