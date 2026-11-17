@@ -9,6 +9,7 @@ import {
   openPooledClient,
   openSecondClient,
   openTestClient,
+  openTestClientAt,
   type TestClient,
 } from "./test-client.pg-support.ts";
 
@@ -34,6 +35,11 @@ function wrap(c: TestClient): TestTransactor {
 
 export function openTestTransactor(): TestTransactor {
   return wrap(openTestClient());
+}
+
+/** A transactor of the kind under test on another database (`openTestClientAt`). */
+export function openTestTransactorAt(url: string): TestTransactor {
+  return wrap(openTestClientAt(url));
 }
 
 export function openSecond(): TestTransactor {

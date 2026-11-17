@@ -1035,6 +1035,49 @@ describe("shutdown", () => {
     expect(time.pending()).toBe(0);
   });
 
+  test("a spend write still in flight settles before the pool ends (rev 3.4)", async () => {
+    const order: string[] = [];
+    const gate = signal();
+    let idleCalled = false;
+    const spend = {
+      forCaller: () => ({ assertWithin: async () => {}, record: async () => {} }),
+      idle: () => {
+        idleCalled = true;
+        return gate.promise.then(() => {
+          order.push("spend settled");
+        });
+      },
+    };
+    const { service, time, log } = makeService({ usage: { ...usageWith([]), spend } });
+    const done = service.shutdown({
+      signal: "SIGTERM",
+      server: { stop: () => {}, pending: () => 0 },
+      endPool: async () => {
+        order.push("pool ended");
+      },
+    });
+    await until(() => idleCalled);
+    expect(order).toEqual([]);
+    gate.resolve();
+    expect(await settle(done, time)).toEqual({ drained: true, flushed: true, poolClosed: true });
+    expect(order).toEqual(["spend settled", "pool ended"]);
+    expect(log.lines.at(-1)?.[1]).toMatchObject({ flushFailed: [] });
+  });
+
+  test("a spend write that outlasts the flush is named in flushFailed", async () => {
+    const spend = {
+      forCaller: () => ({ assertWithin: async () => {}, record: async () => {} }),
+      idle: () => new Promise<void>(() => {}),
+    };
+    const { service, time, log } = makeService({ usage: { ...usageWith([]), spend } });
+    const done = service.shutdown({
+      signal: "SIGTERM",
+      server: { stop: () => {}, pending: () => 0 },
+    });
+    expect(await settle(done, time)).toMatchObject({ flushed: false });
+    expect(log.lines.at(-1)?.[1]).toMatchObject({ flushFailed: ["spend:timeout"] });
+  });
+
   test("a hanging sink and a rejecting one: the flush waits its window, auth idles, the pool still ends", async () => {
     const auth = fakeAuth();
     const { service, time, log } = makeService({

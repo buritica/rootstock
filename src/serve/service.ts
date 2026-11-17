@@ -878,6 +878,8 @@ export function createMcpService(o: McpServiceOptions): McpService {
         name: `sink[${i}]`,
         work: () => sink.idle?.(),
       })),
+      // The spend writes meter() queued, before the pool they write through ends.
+      ...(o.usage?.spend == null ? [] : [{ name: "spend", work: () => o.usage?.spend?.idle?.() }]),
       ...(o.auth === undefined ? [] : [{ name: "auth", work: () => o.auth?.idle() }]),
     ].map(({ name, work }) => {
       const w = { name, state: "timeout", done: Promise.resolve() };

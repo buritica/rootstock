@@ -5,6 +5,7 @@ import * as lock from "../lock/index.ts";
 import * as migrate from "../migrate/index.ts";
 import * as queue from "../queue/index.ts";
 import * as runs from "../runs/index.ts";
+import * as serve from "../serve/slice.ts";
 import * as usage from "../usage/index.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import { composeRootstockConfig, type RootstockConfigInput } from "./define.ts";
@@ -37,6 +38,7 @@ const parsers: SliceParsers = {
   queueSlice: queue.queueSlice,
   runsSlice: runs.runsSlice,
   usageSlice: usage.usageSlice,
+  serveSlice: serve.serveSlice,
 };
 
 describe("defineRootstockConfig", () => {

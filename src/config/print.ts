@@ -137,6 +137,27 @@ function usageView(usage: NonNullable<RootstockConfig["usage"]>): unknown {
   };
 }
 
+function serveView(serve: NonNullable<RootstockConfig["serve"]>): unknown {
+  const { limits } = serve;
+  const turn = limits.turnBudget;
+  return {
+    bodyLimit: { ...serve.bodyLimit },
+    deadlineMs: serve.deadlineMs,
+    id: serve.id,
+    idleTimeout: serve.idleTimeout,
+    limits: {
+      concurrency: mapView(limits.concurrency, (g) => ({ max: g.max, tools: [...g.tools] })),
+      logIntervalMs: limits.logIntervalMs,
+      perTool: mapView(limits.perTool, (b) => ({ ...b })),
+      refusal: limits.refusal === null ? null : { ...limits.refusal },
+      serving: limits.serving === null ? null : { ...limits.serving },
+      turnBudget: turn === null ? null : { ...turn },
+    },
+    probes: { ...serve.probes },
+    shutdown: { ...serve.shutdown },
+  };
+}
+
 /**
  * The config as canonical JSON, every field spelled out, for a repo to pin
  * as its config golden. No version field: a patch release must not move it.
@@ -181,6 +202,8 @@ export function printRootstockConfig(config: RootstockConfig): string {
   if (config.runs !== null) view.runs = runsView(config.runs);
   // Likewise: a config without a usage slice prints as before.
   if (config.usage !== null) view.usage = usageView(config.usage);
+  // And a config without a serve slice prints as before too.
+  if (config.serve !== null) view.serve = serveView(config.serve);
   for (const name of ABSENT) view[name] = "absent";
   return `${canonicalJson(view, 2)}\n`;
 }

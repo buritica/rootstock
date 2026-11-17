@@ -294,7 +294,13 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
     }
   };
 
+  // Every record() still running, so idle() can wait for the writes issued so far.
+  const inFlight = new Set<Promise<void>>();
+
   return {
+    async idle() {
+      await Promise.allSettled([...inFlight]);
+    },
     forCaller(caller) {
       return {
         async assertWithin() {
@@ -311,12 +317,17 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
             throw new errorClass(refusal(used, ceiling));
           }
         },
-        async record(u) {
-          try {
-            await charge(caller, u);
-          } catch (err) {
-            log("usage.spend_record_failed", { caller, errorClass: errorClassOf(err) });
-          }
+        record(u) {
+          const write = (async () => {
+            try {
+              await charge(caller, u);
+            } catch (err) {
+              log("usage.spend_record_failed", { caller, errorClass: errorClassOf(err) });
+            }
+          })();
+          inFlight.add(write);
+          void write.finally(() => inFlight.delete(write));
+          return write;
         },
       };
     },

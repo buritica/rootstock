@@ -164,3 +164,35 @@ export const usageSpendPrices: Invariant = Object.freeze({
     return 'usage.spend.unit "usd" needs the runs slice\'s prices: declare a runs slice with prices, or count "tokens"';
   },
 });
+
+/**
+ * Built in, never exported (W5 contract §8): a call's deadline must end
+ * before the listener's idle timeout closes the socket, or the client sees a
+ * dropped connection instead of the deadline's answer. Runs only when the
+ * serve slice sets both numbers.
+ */
+export const serveDeadlineIdle: Invariant = Object.freeze({
+  id: "serve-deadline-idle",
+  check(config: RootstockConfig): string | null {
+    const deadlineMs = config.serve?.deadlineMs ?? null;
+    const idle = config.serve?.idleTimeout ?? null;
+    if (deadlineMs === null || idle === null || deadlineMs < idle * 1000) return null;
+    return `serve.deadlineMs ${deadlineMs} must be below serve.idleTimeout ${idle} × 1000: the listener would close the connection before the deadline answers`;
+  },
+});
+
+/**
+ * Built in, never exported (W5 contract §8): a probe's answer is bounded by
+ * `timeoutMs`, and no new computation starts while one younger than
+ * `pendingMaxMs` runs. A timeout at or past `pendingMaxMs` would let a second
+ * computation start while the first may still answer, so a wedged database is
+ * hit again on every poll. Runs whenever there is a serve slice.
+ */
+export const serveProbeTimeout: Invariant = Object.freeze({
+  id: "serve-probe-timeout",
+  check(config: RootstockConfig): string | null {
+    const probes = config.serve?.probes;
+    if (probes === undefined || probes.timeoutMs < probes.pendingMaxMs) return null;
+    return `serve.probes.timeoutMs ${probes.timeoutMs} must be below serve.probes.pendingMaxMs ${probes.pendingMaxMs}: a second probe would start while the first may still answer`;
+  },
+});

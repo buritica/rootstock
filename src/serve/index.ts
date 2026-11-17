@@ -44,6 +44,7 @@ export {
   type McpService,
   type McpServiceOptions,
 } from "./service.ts";
+export { type ServeSlice, type ServeSliceInput, serveSlice } from "./slice.ts";
 export {
   type Caller,
   type CallRecord,

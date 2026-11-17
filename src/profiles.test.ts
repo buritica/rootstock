@@ -349,6 +349,8 @@ const IMPORT_ALLOWLIST: Record<string, readonly string[]> = {
     "../queue/index.ts",
     "../runs/index.ts",
     "../usage/index.ts",
+    // The slice file only: serve's index loads the MCP SDK, an optional peer.
+    "../serve/slice.ts",
     "../internal/slice.ts",
     "../golden/canonical.ts",
   ],
@@ -427,6 +429,8 @@ interface ImportRule {
   readonly own: string | null;
   readonly notOwn?: string;
   readonly targets: readonly string[];
+  /** Repo paths admitted through `import type` / `export type` only. */
+  readonly typeTargets?: readonly string[];
   readonly packages: readonly string[];
 }
 const W5_RULES: readonly ImportRule[] = [
@@ -437,6 +441,24 @@ const W5_RULES: readonly ImportRule[] = [
     own: "src/serve/auth/",
     targets: ["src/serve/types.ts", "src/internal/"],
     packages: ["better-auth", "@better-auth/mcp", "@better-auth/cimd"],
+  },
+  // serve's refusal and number helpers: the slice below loads them, so they
+  // load no package either, keeping config's load path SDK-free transitively.
+  {
+    prefix: "src/serve/errors.ts",
+    own: null,
+    targets: ["src/internal/slice.ts"],
+    typeTargets: ["src/serve/types.ts"],
+    packages: [],
+  },
+  // The serve config slice: `config` loads it, so a value import here may
+  // never reach the MCP SDK (an optional peer); the runtime types are types only.
+  {
+    prefix: "src/serve/slice.ts",
+    own: null,
+    targets: ["src/internal/slice.ts", "src/serve/errors.ts"],
+    typeTargets: ["src/serve/limits.ts", "src/serve/probes.ts", "src/serve/types.ts"],
+    packages: [],
   },
   // Never Better Auth, never serve/auth: `serve` loads without the auth peers.
   {
@@ -476,18 +498,24 @@ const W5_AUTH_GLOBALS = w5Globals(
 // string's quotes stay and its text is blank.
 const NON_LITERAL_IMPORT = /(?<![.\w$])\bimport\s*\((?!\s*(["'])[^"'\n]*\1\s*\))/g;
 
+const TYPE_ONLY_IMPORT = /\b(?:import|export)\s+type\s[^;]*?from\s*["'][^"']+["']/g;
+
 function w5Offenders(path: string, source: string): string[] {
   const rule = W5_RULES.find((r) => allowed(path, [r.prefix]));
   if (rule === undefined || TEST_FILE.test(path)) return [];
   const offenders: string[] = [];
-  for (const spec of specifiers(stripComments(source, true))) {
+  const stripped = stripComments(source, true);
+  // What a value import loads; `import type` and `export type` load nothing.
+  const valueSpecs = new Set(specifiers(stripped.replace(TYPE_ONLY_IMPORT, "")));
+  for (const spec of specifiers(stripped)) {
     if (spec.startsWith(".")) {
       const target = join(dirname(path), spec);
       const inOwn =
         rule.own !== null &&
         target.startsWith(rule.own) &&
         !(rule.notOwn !== undefined && target.startsWith(rule.notOwn));
-      if (!inOwn && !allowed(target, rule.targets)) {
+      const typeOnly = allowed(target, rule.typeTargets ?? []) && !valueSpecs.has(spec);
+      if (!inOwn && !typeOnly && !allowed(target, rule.targets)) {
         offenders.push(`${path} imports ${spec}`);
       }
     } else if (!rule.packages.some((p) => spec === p || spec.startsWith(`${p}/`))) {
@@ -543,7 +571,17 @@ describe("serve, serve/auth and usage", () => {
       ["src/usage/index.ts", "../db/index.ts"],
       ["src/usage/index.ts", "../runs/index.ts"],
       ["src/usage/index.ts", "../internal/slice.ts"],
+      ["src/serve/slice.ts", "../internal/slice.ts"],
+      ["src/serve/slice.ts", "./errors.ts"],
+      ["src/serve/errors.ts", "../internal/slice.ts"],
     ];
+    const typeOnly: [string, string][] = [
+      ["src/serve/slice.ts", 'import type { Limits } from "./limits.ts";'],
+      ["src/serve/slice.ts", 'import type { ProbeTiming } from "./probes.ts";'],
+      ["src/serve/slice.ts", 'import type { Caller } from "./types.ts";'],
+      ["src/serve/errors.ts", 'import type { LogEvent } from "./types.ts";'],
+    ];
+    expect(typeOnly.filter(([path, src]) => w5Offenders(path, src).length)).toEqual([]);
     const wrong = admitted.filter(([path, spec]) => w5Offenders(path, `import "${spec}";`).length);
     expect(wrong).toEqual([]);
   });
@@ -562,6 +600,13 @@ describe("serve, serve/auth and usage", () => {
       ["src/serve/index.ts", 'import { sql } from "postgres";'],
       ["src/serve/index.ts", 'import { McpServer } from "@modelcontextprotocol/node";'],
       ["src/serve/index.ts", 'import { x } from "../usage/index.ts";'],
+      // serve's config slice loads no runtime module, so never the MCP SDK.
+      ["src/serve/slice.ts", 'import { createRateLimiter } from "./limits.ts";'],
+      ["src/serve/slice.ts", 'import { type Limits } from "./limits.ts";'],
+      ["src/serve/slice.ts", 'import { createMcpService } from "./service.ts";'],
+      ["src/serve/slice.ts", 'import { McpServer } from "@modelcontextprotocol/server";'],
+      ["src/serve/errors.ts", 'import { ProtocolError } from "@modelcontextprotocol/server";'],
+      ["src/serve/errors.ts", 'import { raceDeadline } from "./deadline.ts";'],
       // serve/auth sees the shared types only.
       ["src/serve/auth/index.ts", 'import { createMcpService } from "../index.ts";'],
       ["src/serve/auth/index.ts", 'import { McpServer } from "@modelcontextprotocol/server";'],

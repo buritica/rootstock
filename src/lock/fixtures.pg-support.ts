@@ -1,7 +1,7 @@
 import { SQL } from "bun";
 import postgres from "postgres";
 import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/index.ts";
-import { required, testTransactorKind } from "../db/test-client.pg-support.ts";
+import { required, testDatabaseUrlFor, testTransactorKind } from "../db/test-client.pg-support.ts";
 
 /**
  * Lock-session fixtures for the lock DB suites. Under kind `bun-sql` the lock
@@ -115,7 +115,5 @@ export function openRaw(max = 1): { sql: Sql; end: () => Promise<void> } {
 
 /** The test database's URL with another database name. */
 export function otherDatabaseUrl(database: string): string {
-  const u = new URL(testUrl());
-  u.pathname = `/${database}`;
-  return u.toString();
+  return testDatabaseUrlFor(database);
 }
