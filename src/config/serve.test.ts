@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SERVE_HARDENING } from "../serve/hardening.ts";
-import type { ServeSliceInput } from "../serve/slice.ts";
+import { SERVE_INPUT } from "../serve/fixtures.test-support.ts";
 import { defineRootstockConfig } from "./compose.ts";
 import type { RootstockConfigInput } from "./define.ts";
 import { printRootstockConfig } from "./print.ts";
@@ -27,22 +26,7 @@ const BASE: RootstockConfigInput = {
   concurrency: { widths: { fetch: { default: 1, max: 2 } } },
 };
 
-const SERVE: ServeSliceInput = {
-  id: "app.http",
-  bodyLimit: { oauth: 4_194_304, bearer: 4_194_304, local: 4_194_304, none: 4_194_304 },
-  deadlineMs: 30_000,
-  idleTimeout: SERVE_HARDENING.idleTimeout,
-  shutdown: { drainMs: 10_000, forceMs: 2_000, poolEndTimeoutS: 5, flushMs: 2_000 },
-  limits: {
-    refusal: { capacity: 20, refillPerSecond: 2, maxKeys: 4096 },
-    serving: { capacity: 120, refillPerSecond: 20, maxKeys: 4096 },
-    perTool: { echo: { capacity: 60, refillPerSecond: 1, maxKeys: 4096 } },
-    concurrency: { slow: { tools: ["slow"], max: 1 } },
-    turnBudget: { cap: 30, warnAt: 5, maxTurns: 2000 },
-    logIntervalMs: 1000,
-  },
-  probes: { timeoutMs: 2000, cacheTtlMs: 5000, pendingMaxMs: 10_000 },
-};
+const SERVE = SERVE_INPUT;
 
 describe("the serve slice in a config", () => {
   test("omitted: null, no serve invariant, and the print has no serve key", () => {
@@ -58,14 +42,14 @@ describe("the serve slice in a config", () => {
     expect(Object.isFrozen(c.serve?.limits.perTool)).toBe(true);
     const printed = JSON.parse(printRootstockConfig(c));
     expect(printed.serve).toEqual({
-      bodyLimit: { bearer: 4_194_304, local: 4_194_304, none: 4_194_304, oauth: 4_194_304 },
+      bodyLimit: { bearer: 9_437_184, local: 9_437_184, none: null, oauth: 4_194_304 },
       deadlineMs: 30_000,
       id: "app.http",
       idleTimeout: 45,
       limits: {
-        concurrency: { slow: { max: 1, tools: ["slow"] } },
+        concurrency: { dedup: { max: 1, tools: ["slow", "boom"] } },
         logIntervalMs: 1000,
-        perTool: { echo: { capacity: 60, maxKeys: 4096, refillPerSecond: 1 } },
+        perTool: { search: { capacity: 10, maxKeys: 4096, refillPerSecond: 10 / 60 } },
         refusal: { capacity: 20, maxKeys: 4096, refillPerSecond: 2 },
         serving: { capacity: 120, maxKeys: 4096, refillPerSecond: 20 },
         turnBudget: { cap: 30, maxTurns: 2000, warnAt: 5 },

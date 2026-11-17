@@ -5,8 +5,9 @@
 // nothing beyond the shared slice pieces, so `config` composes it without
 // the MCP SDK peer.
 
-import { type Brand, intIn, isRecord, own, sliceBrand, sliceRefusals } from "../internal/slice.ts";
-import type { BucketLimits, TurnBudgetLimits } from "./limits.ts";
+import { type Brand, isRecord, own, sliceBrand, sliceRefusals } from "../internal/slice.ts";
+import { isNonNegativeNumber, isPositiveInteger, isPositiveNumber } from "./errors.ts";
+import type { BucketLimits, ConcurrencyGroup, TurnBudgetLimits } from "./limits.ts";
 import type { ProbeTiming } from "./probes.ts";
 import type { Caller, ServeProfile } from "./types.ts";
 
@@ -32,7 +33,7 @@ export interface ServeSliceInput {
     refusal: BucketLimits | null;
     serving: BucketLimits | null;
     perTool: Readonly<Record<string, BucketLimits>>;
-    concurrency: Readonly<Record<string, { tools: readonly string[]; max: number }>>;
+    concurrency: Readonly<Record<string, Omit<ConcurrencyGroup, "busy">>>;
     turnBudget: Omit<TurnBudgetLimits, "exhausted"> | null;
     logIntervalMs: number;
   };
@@ -73,50 +74,59 @@ const TURN = ["cap", "warnAt", "maxTurns"] as const;
 const PROBES = ["timeoutMs", "cacheTtlMs", "pendingMaxMs"] as const;
 const ID = /^[a-z0-9][a-z0-9.-]*$/;
 
+/** Each key list above as a Set, for the unknown-key check. */
+const KEY_SETS: ReadonlyMap<readonly string[], ReadonlySet<string>> = new Map(
+  [REQUIRED, KINDS, SHUTDOWN, LIMITS, BUCKET, GROUP, TURN, PROBES].map((keys) => [
+    keys,
+    new Set(keys),
+  ]),
+);
+
 const refuse = sliceRefusals(PARSER);
 const brand: Brand<ServeSlice> = sliceBrand("ServeSlice", PARSER);
 
+/** `path.` for a nested object, nothing at the top level. */
+const at = (path: string): string => (path === "" ? "" : `${path}.`);
+
 /** `raw` as an object holding exactly `keys`, each present, or the refusal. */
 function exact(path: string, raw: unknown, keys: readonly string[]): Record<string, unknown> {
-  const r = refuse.record(path, raw);
-  refuse.refuseUnknownKeys(r, new Set(keys), `${path}.`);
-  for (const k of keys) if (own(r, k) === undefined) throw refuse.required(`${path}.${k}`);
+  const r = path === "" && !isRecord(raw) ? {} : refuse.record(path, raw);
+  refuse.refuseUnknownKeys(r, KEY_SETS.get(keys) ?? new Set(keys), at(path));
+  for (const k of keys) if (own(r, k) === undefined) throw refuse.required(`${at(path)}${k}`);
   return r;
 }
 
-const E_POS_INT = "an integer > 0";
-const E_POS_NUM = "a finite number > 0";
-const E_NON_NEG = "a finite number >= 0";
+/** `v` when `test` holds (the rule serve applies at runtime), else the refusal. */
+function num(path: string, v: unknown, test: (v: unknown) => v is number, expected: string) {
+  if (!test(v)) throw refuse.invalid(path, expected, v);
+  return v;
+}
+const posInt = (path: string, v: unknown) => num(path, v, isPositiveInteger, "an integer > 0");
+const posNum = (path: string, v: unknown) => num(path, v, isPositiveNumber, "a finite number > 0");
+const nonNeg = (path: string, v: unknown) =>
+  num(path, v, isNonNegativeNumber, "a finite number >= 0");
+const isNonNegativeInteger = (v: unknown): v is number =>
+  isNonNegativeNumber(v) && Number.isInteger(v);
 
-function posInt(path: string, v: unknown): number {
-  if (!intIn(v, 1, Number.MAX_SAFE_INTEGER)) throw refuse.invalid(path, E_POS_INT, v);
-  return v;
-}
-function posNum(path: string, v: unknown): number {
-  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
-    throw refuse.invalid(path, E_POS_NUM, v);
-  }
-  return v;
-}
-function nonNeg(path: string, v: unknown): number {
-  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
-    throw refuse.invalid(path, E_NON_NEG, v);
-  }
-  return v;
-}
 function orNull<T>(v: unknown, parse: (v: unknown) => T): T | null {
   return v === null ? null : parse(v);
 }
 
-/** The bucket numbers createRateLimiter accepts. */
-function bucket(path: string, raw: unknown): BucketLimits {
-  const b = exact(path, raw, BUCKET);
-  return Object.freeze({
-    capacity: posNum(`${path}.capacity`, own(b, "capacity")),
-    refillPerSecond: posNum(`${path}.refillPerSecond`, own(b, "refillPerSecond")),
-    maxKeys: posNum(`${path}.maxKeys`, own(b, "maxKeys")),
-  });
+/** An object of exactly `keys`, each value through `parse`, frozen. */
+function numbers<K extends string, T>(
+  path: string,
+  raw: unknown,
+  keys: readonly K[],
+  parse: (path: string, v: unknown) => T,
+): Readonly<Record<K, T>> {
+  const r = exact(path, raw, keys);
+  const out = {} as Record<K, T>;
+  for (const k of keys) out[k] = parse(`${path}.${k}`, own(r, k));
+  return Object.freeze(out);
 }
+
+/** The bucket numbers createRateLimiter accepts. */
+const bucket = (path: string, raw: unknown): BucketLimits => numbers(path, raw, BUCKET, posNum);
 
 /** A map keyed by tool or group name, each entry through `entry`. */
 function named<T>(path: string, raw: unknown, entry: (p: string, v: unknown) => T) {
@@ -129,7 +139,7 @@ function named<T>(path: string, raw: unknown, entry: (p: string, v: unknown) => 
   return Object.freeze(out);
 }
 
-function group(path: string, raw: unknown) {
+function group(path: string, raw: unknown): Omit<ConcurrencyGroup, "busy"> {
   const g = exact(path, raw, GROUP);
   const tools = own(g, "tools");
   if (
@@ -147,13 +157,14 @@ function group(path: string, raw: unknown) {
 
 function turnBudget(raw: unknown): Omit<TurnBudgetLimits, "exhausted"> {
   const t = exact("limits.turnBudget", raw, TURN);
-  const warnAt = own(t, "warnAt");
-  if (!intIn(warnAt, 0, Number.MAX_SAFE_INTEGER)) {
-    throw refuse.invalid("limits.turnBudget.warnAt", "an integer >= 0", warnAt);
-  }
   return Object.freeze({
     cap: posInt("limits.turnBudget.cap", own(t, "cap")),
-    warnAt,
+    warnAt: num(
+      "limits.turnBudget.warnAt",
+      own(t, "warnAt"),
+      isNonNegativeInteger,
+      "an integer >= 0",
+    ),
     maxTurns: posInt("limits.turnBudget.maxTurns", own(t, "maxTurns")),
   });
 }
@@ -180,41 +191,21 @@ function limits(raw: unknown): ServeSlice["limits"] {
  * `concurrency` tool exists is checked when the service is built.
  */
 export function serveSlice(input: ServeSliceInput): ServeSlice {
-  const raw: Record<string, unknown> = isRecord(input) ? input : {};
-  refuse.refuseUnknownKeys(raw, new Set(REQUIRED), "");
-  for (const k of REQUIRED) if (own(raw, k) === undefined) throw refuse.required(k);
+  const raw = exact("", input, REQUIRED);
   const id = own(raw, "id");
   if (typeof id !== "string" || !ID.test(id)) {
     throw refuse.invalid("id", "a string matching [a-z0-9][a-z0-9.-]*", id);
   }
-  const b = exact("bodyLimit", own(raw, "bodyLimit"), KINDS);
-  const bodyLimit = Object.freeze(
-    Object.fromEntries(
-      KINDS.map((k) => [k, orNull(own(b, k), (v) => posInt(`bodyLimit.${k}`, v))]),
-    ) as Record<Kind, number | null>,
-  );
-  const s = exact("shutdown", own(raw, "shutdown"), SHUTDOWN);
-  const shutdown = Object.freeze(
-    Object.fromEntries(SHUTDOWN.map((k) => [k, nonNeg(`shutdown.${k}`, own(s, k))])) as Record<
-      (typeof SHUTDOWN)[number],
-      number
-    >,
-  );
-  const p = exact("probes", own(raw, "probes"), PROBES);
-  const probes = Object.freeze(
-    Object.fromEntries(PROBES.map((k) => [k, nonNeg(`probes.${k}`, own(p, k))])) as Record<
-      (typeof PROBES)[number],
-      number
-    >,
-  );
   const slice = Object.freeze({
     id,
-    bodyLimit,
+    bodyLimit: numbers("bodyLimit", own(raw, "bodyLimit"), KINDS, (p, v) =>
+      orNull(v, (n) => posInt(p, n)),
+    ),
     deadlineMs: orNull(own(raw, "deadlineMs"), (v) => posInt("deadlineMs", v)),
     idleTimeout: orNull(own(raw, "idleTimeout"), (v) => posNum("idleTimeout", v)),
-    shutdown,
+    shutdown: numbers("shutdown", own(raw, "shutdown"), SHUTDOWN, nonNeg),
     limits: limits(own(raw, "limits")),
-    probes,
+    probes: numbers("probes", own(raw, "probes"), PROBES, nonNeg),
   }) as ServeSlice;
   return brand.mark(slice);
 }

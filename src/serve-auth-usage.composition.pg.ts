@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { McpServer } from "@modelcontextprotocol/server";
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { getAuthTables } from "better-auth/db";
 import { getMigrations } from "better-auth/db/migration";
 import * as z from "zod/v4";
 import { defineRootstockConfig } from "./config/index.ts";
-import type { Sql } from "./db/index.ts";
+import { quoteIdentifier, type Sql } from "./db/index.ts";
 import {
   openTestClientAt,
   type TestClient,
@@ -16,6 +18,8 @@ import {
 } from "./db/transactor.pg-support.ts";
 import { applyRootstockMigrations, migrationStatus, rootstockSource } from "./migrate/index.ts";
 import { type AuthLayer, type AuthOptions, defineAuth } from "./serve/auth/index.ts";
+import { captureLog, realTimers, signal } from "./serve/fakes.test-support.ts";
+import { SERVE_INPUT } from "./serve/fixtures.test-support.ts";
 import {
   type Caller,
   type Clock,
@@ -25,15 +29,13 @@ import {
   defineToolScopes,
   expandScopes,
   type Limits,
-  type LogEvent,
   liveness,
   migrationsProbe,
   readiness,
-  SERVE_HARDENING,
   type ServeProfile,
   type ServeSlice,
-  type Timers,
 } from "./serve/index.ts";
+import { CALL_HEADERS, call } from "./serve/service.test-support.ts";
 import {
   createSpendCeiling,
   postgresCallLog,
@@ -63,20 +65,12 @@ let authClient: TestClient;
 let unlock = () => {};
 
 const clock: Clock = { now: () => Date.now(), monotonic: () => performance.now() };
-const timers: Timers = {
-  set(ms, fn) {
-    const handle = setTimeout(fn, ms);
-    return () => clearTimeout(handle);
-  },
-};
-const events: { event: string; fields: Readonly<Record<string, unknown>> }[] = [];
-const log: LogEvent = (event, fields) => {
-  events.push({ event, fields });
-};
+const timers = realTimers;
+const log = captureLog();
 
 beforeAll(async () => {
   admin = openTestTransactor();
-  await admin.transactor.sql.unsafe(`CREATE DATABASE "${DATABASE}"`);
+  await admin.transactor.sql.unsafe(`CREATE DATABASE ${quoteIdentifier(DATABASE)}`);
   const url = testDatabaseUrlFor(DATABASE);
   main = openTestTransactorAt(url);
   locker = openTestTransactorAt(url);
@@ -85,8 +79,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   unlock();
-  for (const c of [main, locker, authClient]) await c?.close();
-  await admin.transactor.sql.unsafe(`DROP DATABASE IF EXISTS "${DATABASE}" WITH (FORCE)`);
+  await Promise.all([main, locker, authClient].map((c) => c?.close()));
+  await admin.transactor.sql.unsafe(
+    `DROP DATABASE IF EXISTS ${quoteIdentifier(DATABASE)} WITH (FORCE)`,
+  );
   await admin.close();
 });
 
@@ -126,12 +122,6 @@ function poolOver(sql: Sql) {
     async end() {},
   };
 }
-
-/** A pool whose checkout never completes: a Better Auth built on it waits at startup. */
-const poolNeverAnswering = () => ({
-  connect: () => new Promise<never>(() => {}),
-  async end() {},
-});
 
 const TOOL_SCOPES = defineToolScopes({
   id: "composition",
@@ -173,25 +163,13 @@ function profileFrom(serve: ServeSlice): ServeProfile {
   };
 }
 
-/** The serve slice's limit numbers, with the wording only the consumer owns. */
+/** The serve slice's limits; this server declares no concurrency group or turn budget. */
 function limitsFrom(serve: ServeSlice): Limits {
-  const { limits } = serve;
-  return {
-    refusal: limits.refusal,
-    serving: limits.serving,
-    perTool: limits.perTool,
-    concurrency: Object.fromEntries(
-      Object.entries(limits.concurrency).map(([name, g]) => [
-        name,
-        { ...g, busy: (tool: string) => `${tool} is busy` },
-      ]),
-    ),
-    turnBudget:
-      limits.turnBudget === null
-        ? null
-        : { ...limits.turnBudget, exhausted: (spent: number) => `budget spent (${spent})` },
-    logIntervalMs: limits.logIntervalMs,
-  };
+  const { concurrency, turnBudget, ...buckets } = serve.limits;
+  if (Object.keys(concurrency).length > 0 || turnBudget !== null) {
+    throw new Error("limitsFrom: this test's slice has no group or budget wording");
+  }
+  return { ...buckets, concurrency: {}, turnBudget: null };
 }
 
 function registerTools(server: McpServer): void {
@@ -211,28 +189,20 @@ function registerTools(server: McpServer): void {
   });
 }
 
-const callBody = (id: number, name: string, args?: Record<string, unknown>) =>
-  JSON.stringify({
-    jsonrpc: "2.0",
-    id,
-    method: "tools/call",
-    params: { name, ...(args === undefined ? {} : { arguments: args }) },
-  });
-
-const mcpPost = (body: string, token: string | null = TOKEN) =>
+/** A POST to the MCP path with `body` as JSON; the static token unless `token` is null. */
+const mcpPost = (body: unknown, token: string | null = TOKEN) =>
   new Request(`${ORIGIN}/mcp`, {
     method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      "content-type": "application/json",
-      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
-    },
-    body,
+    headers: { ...CALL_HEADERS, ...(token === null ? {} : { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body),
   });
 
-async function until(what: string, check: () => Promise<boolean>): Promise<void> {
+/** Polls `read` until `done` holds for its answer, which it returns. */
+async function until<T>(what: string, read: () => Promise<T>, done: (v: T) => boolean): Promise<T> {
   const deadline = Date.now() + 5_000;
-  while (!(await check())) {
+  for (;;) {
+    const v = await read();
+    if (done(v)) return v;
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(10);
   }
@@ -265,38 +235,23 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
         spend: { unit: "tokens", ceiling: 100, store: { kind: "rootstock" } },
       },
       serve: {
-        id: "composition.http",
-        bodyLimit: { oauth: 65_536, bearer: 65_536, local: 65_536, none: 65_536 },
-        deadlineMs: 10_000,
-        idleTimeout: SERVE_HARDENING.idleTimeout,
+        ...SERVE_INPUT,
+        // A longer flush than the fixture's, so the blocked call log has time to drain.
         shutdown: { drainMs: 1_000, forceMs: 200, poolEndTimeoutS: 1, flushMs: 5_000 },
-        limits: {
-          refusal: { capacity: 20, refillPerSecond: 2, maxKeys: 64 },
-          serving: { capacity: 100, refillPerSecond: 20, maxKeys: 64 },
-          perTool: {},
-          concurrency: {},
-          turnBudget: null,
-          logIntervalMs: 1_000,
-        },
-        probes: { timeoutMs: 2_000, cacheTtlMs: 0, pendingMaxMs: 5_000 },
+        // The fixture's group and budget name tools this server does not have.
+        limits: { ...SERVE_INPUT.limits, perTool: {}, concurrency: {}, turnBudget: null },
       },
     });
     expect(config.invariants).toEqual(["serve-deadline-idle", "serve-probe-timeout"]);
     const serve = config.serve as ServeSlice;
     const usage = config.usage as UsageSlice;
-    const callLogTable = usage.callLog?.table;
-    const spendShape = usage.spend?.store;
-    if (callLogTable === undefined || spendShape === undefined || usage.spend === null) {
+    const { callLog, spend: spendSlice } = usage;
+    if (callLog === null || spendSlice === null) {
       throw new Error("the usage slice lost its call log or spend");
     }
     // Every omitted schema is the one rootstock migrates: rootstock.mcp_calls, rootstock.spend.
-    expect(callLogTable).toEqual({ schema: "rootstock", name: "mcp_calls" });
-    expect(spendShape).toEqual({ kind: "rootstock", schema: "rootstock" });
-
-    // Rootstock's own migrations, then Better Auth's tables, both in the throwaway database.
-    const report = await applyRootstockMigrations(main.transactor, config.migrate);
-    expect(report.schema).toBe("rootstock");
-    expect(report.applied.length).toBeGreaterThan(0);
+    expect(callLog.table).toEqual({ schema: "rootstock", name: "mcp_calls" });
+    expect(spendSlice.store).toEqual({ kind: "rootstock", schema: "rootstock" });
 
     const authOptions = (database: unknown): AuthOptions => ({
       baseURL: ORIGIN,
@@ -325,14 +280,26 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
     });
     // Better Auth checks its schema and seeds the resource row as soon as it
     // is built, so its tables come first, planned from the same options (a
-    // consumer runs Better Auth's migrate at deploy). The twin layer's own
-    // store never answers, so its startup waits and touches nothing.
-    const twin = defineAuth(authOptions(poolNeverAnswering()));
-    const plan = await getMigrations({
-      ...twin.instance.options,
-      database: poolOver(rawSql(authClient)),
-    } as typeof twin.instance.options);
-    await plan.runMigrations();
+    // consumer runs Better Auth's migrate at deploy). The twin layer runs on an
+    // in-memory store holding every table, as the serve/auth suites do.
+    const memory: Record<string, Record<string, unknown>[]> = {};
+    const twin = defineAuth(authOptions(memoryAdapter(memory)));
+    for (const table of Object.values(getAuthTables(twin.instance.options))) {
+      memory[table.modelName] ??= [];
+    }
+    // Rootstock's own migrations and Better Auth's tables, both in the throwaway database.
+    const [report, plan] = await Promise.all([
+      applyRootstockMigrations(main.transactor, config.migrate),
+      getMigrations({
+        ...twin.instance.options,
+        database: poolOver(rawSql(authClient)),
+      } as typeof twin.instance.options).then(async (p) => {
+        await p.runMigrations();
+        return p;
+      }),
+    ]);
+    expect(report.schema).toBe("rootstock");
+    expect(report.applied.length).toBeGreaterThan(0);
     expect(plan.toBeCreated.map((t) => t.table)).toEqual(
       expect.arrayContaining(["user", "session", "jwks", "oauthResource"]),
     );
@@ -341,15 +308,15 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
     const sql = main.transactor.sql;
     const sink = postgresCallLog({
       sql,
-      table: callLogTable,
-      maxBuffered: usage.callLog?.maxBuffered ?? 0,
-      maxBatch: usage.callLog?.maxBatch ?? 0,
+      table: callLog.table,
+      maxBuffered: callLog.maxBuffered,
+      maxBatch: callLog.maxBatch,
       log,
     });
     const spend = createSpendCeiling({
-      store: postgresSpendStore({ sql, shape: spendShape }),
-      unit: usage.spend.unit,
-      ceiling: usage.spend.ceiling,
+      store: postgresSpendStore({ sql, shape: spendSlice.store }),
+      unit: spendSlice.unit,
+      ceiling: spendSlice.ceiling,
       prices: null,
       refusal: (used, ceiling) => `daily ceiling reached: ${used} of ${ceiling}`,
       errorClass: SpendCeilingReached,
@@ -408,63 +375,69 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
     await auth.assertStoreReady();
 
     // No credential: Better Auth's own verify answers the OAuth challenge.
-    const challenge = await handle(mcpPost(callBody(1, "echo", { text: "x" }), null));
+    const challenge = await handle(mcpPost(call("echo", { text: "x" }, 1), null));
     expect(challenge.status).toBe(401);
     expect(challenge.headers.get("www-authenticate")).toContain("resource_metadata");
 
     // The authenticated calls.
-    const echo = await handle(mcpPost(callBody(2, "echo", { text: "hello" })));
+    const echo = await handle(mcpPost(call("echo", { text: "hello" }, 2)));
     expect(echo.status).toBe(200);
     expect(await echo.json()).toMatchObject({
       id: 2,
       result: { content: [{ type: "text", text: "hello" }] },
     });
     for (const id of [3, 4]) {
-      const res = await handle(mcpPost(callBody(id, "spend")));
+      const res = await handle(mcpPost(call("spend", undefined, id)));
       expect(await res.json()).toMatchObject({ id, result: { content: [{ text: "spent" }] } });
     }
     // 120 of 100 tokens spent: the next check refuses, before the tool spends anything.
-    const refused = await handle(mcpPost(callBody(5, "spend")));
+    const refused = await handle(mcpPost(call("spend", undefined, 5)));
     expect(await refused.json()).toMatchObject({
       id: 5,
       result: { isError: true, content: [{ text: "daily ceiling reached: 120 of 100" }] },
     });
-    const spendTotal = async () => {
-      const rows = await sql.unsafe<{ used: string }>(
-        `SELECT used::text AS used FROM rootstock.spend WHERE caller = $1 AND unit = 'tokens'`,
-        ["agent-1"],
-      );
-      return rows.map((r) => r.used);
-    };
-    await until("both spend writes", async () => (await spendTotal())[0] === "120");
-    expect(await spendTotal()).toEqual(["120"]);
+    const spendTotal = async () =>
+      (
+        await sql.unsafe<{ used: string }>(
+          `SELECT used::text AS used FROM rootstock.spend WHERE caller = $1 AND unit = 'tokens'`,
+          ["agent-1"],
+        )
+      ).map((r) => r.used);
+    // One row holding both writes' total.
+    await until("both spend writes", spendTotal, (t) => t.length === 1 && t[0] === "120");
 
     // The call log cannot write while another session holds its table.
-    const held = new Promise<void>((r) => {
-      unlock = r;
-    });
-    let locked = () => {};
-    const isLocked = new Promise<void>((r) => {
-      locked = r;
-    });
+    const held = signal();
+    unlock = held.resolve;
+    const locked = signal();
     const blocker = locker.transactor.begin(async (tx) => {
       await tx.unsafe("LOCK TABLE rootstock.mcp_calls IN ACCESS EXCLUSIVE MODE");
-      locked();
-      await held;
+      locked.resolve();
+      await held.promise;
     });
-    await isLocked;
-    const late = await handle(mcpPost(callBody(6, "echo", { text: "late" })));
+    await locked.promise;
+    const late = await handle(mcpPost(call("echo", { text: "late" }, 6)));
     expect(late.status).toBe(200);
 
-    let shutdownDone = false;
-    const stopping = service
-      .shutdown({ signal: "SIGTERM", server: { stop: () => {}, pending: () => 0 } })
-      .then((r) => {
-        shutdownDone = true;
-        return r;
-      });
-    await Bun.sleep(100);
-    expect(shutdownDone).toBe(false);
+    const stopping = service.shutdown({
+      signal: "SIGTERM",
+      server: { stop: () => {}, pending: () => 0 },
+    });
+    // The writer's insert is queued behind the lock, and shutdown waits for
+    // it. Read from the admin session: the call log's own client is the one blocked.
+    await until(
+      "the call log insert to wait on the lock",
+      () =>
+        admin.transactor.sql.unsafe<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE datname = $1 AND wait_event_type = 'Lock'
+             AND query ILIKE 'insert into "rootstock"."mcp_calls"%'`,
+          [DATABASE],
+        ),
+      ([r]) => (r?.n ?? 0) > 0,
+    );
+    const PENDING = Symbol("pending");
+    expect(await Promise.race([stopping, Promise.resolve(PENDING)])).toBe(PENDING);
     unlock();
     await blocker;
     expect(await stopping).toEqual({ drained: true, flushed: true, poolClosed: false });
@@ -501,11 +474,8 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
     });
     expect(rows.some((r) => r.result_ids === '["late"]')).toBe(true);
     // No call log or spend write failed; the one usage line is the refusal.
-    expect(events.filter((e) => e.event.startsWith("usage."))).toEqual([
-      {
-        event: "usage.spend_refused",
-        fields: { caller: "agent-1", ceiling: 100, unit: "tokens", used: 120 },
-      },
+    expect(log.lines.filter(([event]) => event.startsWith("usage."))).toEqual([
+      ["usage.spend_refused", { caller: "agent-1", ceiling: 100, unit: "tokens", used: 120 }],
     ]);
 
     // Readiness over the same database: rootstock's migrations are current.

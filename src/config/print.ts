@@ -137,45 +137,24 @@ function usageView(usage: NonNullable<RootstockConfig["usage"]>): unknown {
   };
 }
 
-const bucketView = (b: { capacity: number; refillPerSecond: number; maxKeys: number }) => ({
-  capacity: b.capacity,
-  maxKeys: b.maxKeys,
-  refillPerSecond: b.refillPerSecond,
-});
-
 function serveView(serve: NonNullable<RootstockConfig["serve"]>): unknown {
-  const { bodyLimit, limits, probes, shutdown } = serve;
+  const { limits } = serve;
   const turn = limits.turnBudget;
   return {
-    bodyLimit: {
-      bearer: bodyLimit.bearer,
-      local: bodyLimit.local,
-      none: bodyLimit.none,
-      oauth: bodyLimit.oauth,
-    },
+    bodyLimit: { ...serve.bodyLimit },
     deadlineMs: serve.deadlineMs,
     id: serve.id,
     idleTimeout: serve.idleTimeout,
     limits: {
       concurrency: mapView(limits.concurrency, (g) => ({ max: g.max, tools: [...g.tools] })),
       logIntervalMs: limits.logIntervalMs,
-      perTool: mapView(limits.perTool, bucketView),
-      refusal: limits.refusal === null ? null : bucketView(limits.refusal),
-      serving: limits.serving === null ? null : bucketView(limits.serving),
-      turnBudget:
-        turn === null ? null : { cap: turn.cap, maxTurns: turn.maxTurns, warnAt: turn.warnAt },
+      perTool: mapView(limits.perTool, (b) => ({ ...b })),
+      refusal: limits.refusal === null ? null : { ...limits.refusal },
+      serving: limits.serving === null ? null : { ...limits.serving },
+      turnBudget: turn === null ? null : { ...turn },
     },
-    probes: {
-      cacheTtlMs: probes.cacheTtlMs,
-      pendingMaxMs: probes.pendingMaxMs,
-      timeoutMs: probes.timeoutMs,
-    },
-    shutdown: {
-      drainMs: shutdown.drainMs,
-      flushMs: shutdown.flushMs,
-      forceMs: shutdown.forceMs,
-      poolEndTimeoutS: shutdown.poolEndTimeoutS,
-    },
+    probes: { ...serve.probes },
+    shutdown: { ...serve.shutdown },
   };
 }
 
