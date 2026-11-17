@@ -19,7 +19,10 @@ The office-document extractor needs its optional peers (`jszip`, `mammoth`,
 (`@modelcontextprotocol/server >=2.4.0 <3`) and `zod ^4.5.4`; `serve/auth`
 also needs `better-auth`, `@better-auth/mcp` and `@better-auth/cimd`, each
 `>=1.7.17 <1.8`. All are optional peers, so the app's own copies are the ones
-that load; `serve` itself never loads Better Auth.
+that load; `serve` itself never loads Better Auth. `@better-auth/mcp` depends
+on `@better-auth/oauth-provider ^1.7.17`, so that package and
+`@better-auth/core` float with each lockfile: pin them in yours and name the
+resolved versions when you bump.
 
 Each capability is a subpath export:
 
@@ -35,9 +38,9 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
 | `retrieval` | v0.9.0 | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), with an optional candidate `budget` (a `set local` run first, since the index caps candidates before SQL `limit`), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable. The database needs the extension and a `lakebase_bm25` index built after the table is populated |
 | `runner` | v0.11.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record), plan mode (`planPull`) and the queue drain (`drainQueue`) |
-| `serve` | v0.12.0 | An MCP server behind one `handle(req)`: `createMcpService` runs auth, Host/Origin checks, body limits, rate buckets, per-tool limits, concurrency groups, a turn budget and a deadline in front of the SDK's entry, with every response byte that differs between servers named in a profile; one `registerTool` seam scopes, limits and records every call; `installSeams` does the same for a stdio server; liveness, cached readiness probes and a draining shutdown; `serveSlice` for config |
+| `serve` | v0.12.0 | An MCP server behind one `handle(req)`: `createMcpService` runs auth, Host/Origin checks, body limits, the refusal and serving buckets and a deadline in front of the SDK's entry, with every response byte that differs between servers named in a profile; one `registerTool` seam checks scopes, charges the per-tool buckets, concurrency groups and turn budget, and records every call; `installSeams` does the same for a stdio server; liveness, cached readiness probes and a draining shutdown; `serveSlice` for config |
 | `serve/auth` | v0.12.0 | `defineAuth`: one Better Auth instance as an MCP OAuth resource server (JWT, the MCP and CIMD plugins, magic link or Google sign-in, listed redirects, its rate limiter always on), the routes `serve` mounts, `verify` for the MCP path and `assertStoreReady` for startup |
-| `usage` | v0.12.0 | What a tool call cost and who made it: `postgresCallLog` batches call records into `rootstock.mcp_calls` without ever delaying a call, `prometheusToolMetrics` counts handler calls, `createSpendCeiling` keeps a daily per-caller total (tokens or dollars) and refuses past it, `usageWiring` binds pricing (the `runs` price table) and error classes into `serve`; `usageSlice` for config |
+| `usage` | v0.12.0 | What a tool call cost and who made it: `postgresCallLog` batches call records into a table you name (rootstock's migration creates `rootstock.mcp_calls`) without ever delaying a call, `prometheusToolMetrics` counts handler calls, `createSpendCeiling` keeps a daily per-caller total (tokens or dollars) and refuses past it, `usageWiring` binds pricing (the `runs` price table) and error classes into `serve`; `usageSlice` for config |
 
 More arrive in phases. Phase 1 extractions must be byte-identical: each
 consumer adopts a module only where its goldens stay unchanged. Changes that
@@ -522,11 +525,15 @@ process.on("SIGTERM", async () => {
   each call a `currentCall()` handle (`setResultIds`, `meter`,
   `assertWithinSpend`) whose record reaches every sink once the call ends.
   A stdio server builds its own `McpServer` and calls `installSeams`.
-- **Auth routes are served for you.** With `auth`, the well-known metadata,
-  `/api/auth/*` (`/jwks` unmetered), `/login`, `/consent` and the assets go
-  to the auth layer; `/mcp` runs `auth.verify`. `credentials` admits static
-  bearer tokens ahead of OAuth. Better Auth's tables are the app's to
-  migrate; `assertStoreReady` refuses to start on a store without them.
+- **Auth routes are served for you.** With `auth`, the profile's
+  `authPrefixes` (the well-known metadata and Better Auth's API, `/jwks`
+  unmetered), `/login`, `/consent` and the assets go to the auth layer, and
+  `profile.mcpPath` runs `auth.verify`. `credentials` admits static bearer
+  tokens ahead of OAuth. A `node:http` server that serves Better Auth itself
+  (`toNodeHandler(auth.instance)`) wraps each response with
+  `auth.wrapNodeAuthResponse` to get the same headers and 429 log. Better
+  Auth's tables are the app's to migrate; `assertStoreReady` refuses to
+  start on a store without them.
 - **The call log never slows a call.** `postgresCallLog` writes in batches
   from one background writer; a full buffer drops and counts
   (`usage.call_log_dropped`). Both rootstock migrations (`mcp_calls`,
@@ -536,17 +543,28 @@ process.on("SIGTERM", async () => {
   charges what each call meters; a tool calls `assertWithinSpend()` before
   it spends, and nothing else is ever refused. Two concurrent calls of one
   caller can both pass the check.
-- **Shutdown drains, then flushes.** `shutdown` stops the listener, waits up
-  to `drainMs` for requests, then up to `flushMs` for every sink's `idle()`
-  and the auth layer's pending sends, then closes the pool within
-  `poolEndTimeoutS`.
+- **Shutdown drains, forces, then flushes.** `shutdown` stops the listener
+  and waits up to `drainMs` for requests, then force-closes what is left
+  (`server.stop(true)` and the SDK entry, each within `forceMs`), then waits
+  up to `flushMs` for every sink's `idle()` and the auth layer's pending
+  sends, then closes the pool within `poolEndTimeoutS`.
 - **Config prints the numbers.** `defineRootstockConfig` takes `serve`
   (`serveSlice`: body limits, deadline, idle timeout, shutdown, limits and
   probe timing) and `usage` (`usageSlice`). They print in the config golden
   only when given, and bring built-in invariants: `serve-deadline-idle`
   (when both a deadline and an idle timeout are set), `serve-probe-timeout`,
   and `usage-spend-prices` (for a ceiling in dollars). The slices hold numbers
-  only: the app passes them into `createMcpService` itself.
+  only. `createMcpService` never reads a config: the app hands the slice's
+  values to it, and nothing checks that the profile and limits it passes
+  match the slice it printed. Pass them from the slice, not beside it:
+
+  ```ts
+  const s = config.serve!; // the slice your config golden prints
+  const profile = { ...PROFILE, bodyLimit: s.bodyLimit, deadlineMs: s.deadlineMs, shutdown: s.shutdown };
+  const limits = { ...s.limits, concurrency: withBusyText(s.limits.concurrency), turnBudget: withExhaustedText(s.limits.turnBudget) };
+  ```
+  `withBusyText` and `withExhaustedText` stand for your own wording (`busy`,
+  `exhausted`), which the slice does not hold.
 
 ## Rules
 

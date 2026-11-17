@@ -42,28 +42,28 @@ describe("the serve slice in a config", () => {
     expect(Object.isFrozen(c.serve?.limits.perTool)).toBe(true);
     const printed = JSON.parse(printRootstockConfig(c));
     expect(printed.serve).toEqual({
-      bodyLimit: { bearer: 9_437_184, local: 9_437_184, none: null, oauth: 4_194_304 },
-      deadlineMs: 30_000,
+      bodyLimit: { bearer: 131_072, local: 131_072, none: null, oauth: 65_536 },
+      deadlineMs: 20_000,
       id: "app.http",
-      idleTimeout: 45,
+      idleTimeout: 30,
       limits: {
-        concurrency: { dedup: { max: 1, tools: ["slow", "boom"] } },
-        logIntervalMs: 1000,
-        perTool: { search: { capacity: 10, maxKeys: 4096, refillPerSecond: 10 / 60 } },
-        refusal: { capacity: 20, maxKeys: 4096, refillPerSecond: 2 },
-        serving: { capacity: 120, maxKeys: 4096, refillPerSecond: 20 },
-        turnBudget: { cap: 30, maxTurns: 2000, warnAt: 5 },
+        concurrency: { pair: { max: 1, tools: ["alpha", "beta"] } },
+        logIntervalMs: 500,
+        perTool: { lookup: { capacity: 7, maxKeys: 512, refillPerSecond: 0.25 } },
+        refusal: { capacity: 12, maxKeys: 256, refillPerSecond: 3 },
+        serving: { capacity: 90, maxKeys: 256, refillPerSecond: 15 },
+        turnBudget: { cap: 24, maxTurns: 500, warnAt: 4 },
       },
-      probes: { cacheTtlMs: 5000, pendingMaxMs: 10_000, timeoutMs: 2000 },
-      shutdown: { drainMs: 10_000, flushMs: 2_000, forceMs: 2_000, poolEndTimeoutS: 5 },
+      probes: { cacheTtlMs: 4_000, pendingMaxMs: 8_000, timeoutMs: 1_500 },
+      shutdown: { drainMs: 3_000, flushMs: 1_500, forceMs: 500, poolEndTimeoutS: 2 },
     });
   });
 
   test("serve-deadline-idle: the deadline ends before the listener's idle timeout", () => {
     expect(() =>
-      defineRootstockConfig({ ...BASE, serve: { ...SERVE, deadlineMs: 45_000 } }),
+      defineRootstockConfig({ ...BASE, serve: { ...SERVE, deadlineMs: 30_000 } }),
     ).toThrow(
-      "serve-deadline-idle: serve.deadlineMs 45000 must be below serve.idleTimeout 45 × 1000",
+      "serve-deadline-idle: serve.deadlineMs 30000 must be below serve.idleTimeout 30 × 1000",
     );
     for (const over of [{ deadlineMs: null }, { idleTimeout: null }]) {
       const c = defineRootstockConfig({ ...BASE, serve: { ...SERVE, ...over } });

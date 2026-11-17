@@ -442,6 +442,15 @@ const W5_RULES: readonly ImportRule[] = [
     targets: ["src/serve/types.ts", "src/internal/"],
     packages: ["better-auth", "@better-auth/mcp", "@better-auth/cimd"],
   },
+  // serve's refusal and number helpers: the slice below loads them, so they
+  // load no package either, keeping config's load path SDK-free transitively.
+  {
+    prefix: "src/serve/errors.ts",
+    own: null,
+    targets: ["src/internal/slice.ts"],
+    typeTargets: ["src/serve/types.ts"],
+    packages: [],
+  },
   // The serve config slice: `config` loads it, so a value import here may
   // never reach the MCP SDK (an optional peer); the runtime types are types only.
   {
@@ -564,11 +573,13 @@ describe("serve, serve/auth and usage", () => {
       ["src/usage/index.ts", "../internal/slice.ts"],
       ["src/serve/slice.ts", "../internal/slice.ts"],
       ["src/serve/slice.ts", "./errors.ts"],
+      ["src/serve/errors.ts", "../internal/slice.ts"],
     ];
     const typeOnly: [string, string][] = [
       ["src/serve/slice.ts", 'import type { Limits } from "./limits.ts";'],
       ["src/serve/slice.ts", 'import type { ProbeTiming } from "./probes.ts";'],
       ["src/serve/slice.ts", 'import type { Caller } from "./types.ts";'],
+      ["src/serve/errors.ts", 'import type { LogEvent } from "./types.ts";'],
     ];
     expect(typeOnly.filter(([path, src]) => w5Offenders(path, src).length)).toEqual([]);
     const wrong = admitted.filter(([path, spec]) => w5Offenders(path, `import "${spec}";`).length);
@@ -594,6 +605,8 @@ describe("serve, serve/auth and usage", () => {
       ["src/serve/slice.ts", 'import { type Limits } from "./limits.ts";'],
       ["src/serve/slice.ts", 'import { createMcpService } from "./service.ts";'],
       ["src/serve/slice.ts", 'import { McpServer } from "@modelcontextprotocol/server";'],
+      ["src/serve/errors.ts", 'import { ProtocolError } from "@modelcontextprotocol/server";'],
+      ["src/serve/errors.ts", 'import { raceDeadline } from "./deadline.ts";'],
       // serve/auth sees the shared types only.
       ["src/serve/auth/index.ts", 'import { createMcpService } from "../index.ts";'],
       ["src/serve/auth/index.ts", 'import { McpServer } from "@modelcontextprotocol/server";'],

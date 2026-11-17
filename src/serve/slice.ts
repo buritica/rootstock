@@ -1,11 +1,20 @@
 // The serve config slice (W5 contract §8): the numbers of one serving
 // profile, its limits and its probe timing, for defineRootstockConfig to
 // check and print. Config and print only: createMcpService keeps its own
-// options, and a consumer passes these values into them. This file loads
-// nothing beyond the shared slice pieces, so `config` composes it without
-// the MCP SDK peer.
+// options, and a consumer passes these values into them; nothing checks the
+// slice against the service it describes. Its value imports are the shared
+// slice pieces and serve's `errors.ts` (whose number rules the service
+// applies too), neither of which loads a package, so `config` composes it
+// without the MCP SDK peer.
 
-import { type Brand, isRecord, own, sliceBrand, sliceRefusals } from "../internal/slice.ts";
+import {
+  type Brand,
+  bounded,
+  isRecord,
+  own,
+  sliceBrand,
+  sliceRefusals,
+} from "../internal/slice.ts";
 import { isNonNegativeNumber, isPositiveInteger, isPositiveNumber } from "./errors.ts";
 import type { BucketLimits, ConcurrencyGroup, TurnBudgetLimits } from "./limits.ts";
 import type { ProbeTiming } from "./probes.ts";
@@ -41,7 +50,10 @@ export interface ServeSliceInput {
   probes: ProbeTiming;
 }
 
-type Frozen<T> = { readonly [K in keyof T]: T[K] extends object ? Frozen<T[K]> : T[K] };
+// Distributes over a union, so a nullable member (`BucketLimits | null`) is
+// read-only too, as the parser freezes it.
+type FrozenValue<V> = V extends object ? Frozen<V> : V;
+type Frozen<T> = { readonly [K in keyof T]: FrozenValue<T[K]> };
 
 declare const serveSliceBrand: unique symbol;
 export interface ServeSlice extends Frozen<ServeSliceInput> {
@@ -49,7 +61,16 @@ export interface ServeSlice extends Frozen<ServeSliceInput> {
 }
 
 const PARSER = "serveSlice";
-const REQUIRED = [
+
+/** A key list and its Set, for the required and unknown-key checks. */
+interface Keys<K extends string> {
+  readonly list: readonly K[];
+  readonly set: ReadonlySet<string>;
+}
+const keys = <const K extends string>(...list: K[]): Keys<K> =>
+  Object.freeze({ list: Object.freeze(list), set: new Set<string>(list) });
+
+const REQUIRED = keys(
   "id",
   "bodyLimit",
   "deadlineMs",
@@ -57,30 +78,17 @@ const REQUIRED = [
   "shutdown",
   "limits",
   "probes",
-] as const;
-const KINDS = ["oauth", "bearer", "local", "none"] as const satisfies readonly Kind[];
-const SHUTDOWN = ["drainMs", "forceMs", "poolEndTimeoutS", "flushMs"] as const;
-const LIMITS = [
-  "refusal",
-  "serving",
-  "perTool",
-  "concurrency",
-  "turnBudget",
-  "logIntervalMs",
-] as const;
-const BUCKET = ["capacity", "refillPerSecond", "maxKeys"] as const;
-const GROUP = ["tools", "max"] as const;
-const TURN = ["cap", "warnAt", "maxTurns"] as const;
-const PROBES = ["timeoutMs", "cacheTtlMs", "pendingMaxMs"] as const;
-const ID = /^[a-z0-9][a-z0-9.-]*$/;
-
-/** Each key list above as a Set, for the unknown-key check. */
-const KEY_SETS: ReadonlyMap<readonly string[], ReadonlySet<string>> = new Map(
-  [REQUIRED, KINDS, SHUTDOWN, LIMITS, BUCKET, GROUP, TURN, PROBES].map((keys) => [
-    keys,
-    new Set(keys),
-  ]),
 );
+const KINDS = keys<Kind>("oauth", "bearer", "local", "none");
+const SHUTDOWN = keys("drainMs", "forceMs", "poolEndTimeoutS", "flushMs");
+const LIMITS = keys("refusal", "serving", "perTool", "concurrency", "turnBudget", "logIntervalMs");
+const BUCKET = keys("capacity", "refillPerSecond", "maxKeys");
+const GROUP = keys("tools", "max");
+const TURN = keys("cap", "warnAt", "maxTurns");
+const PROBES = keys("timeoutMs", "cacheTtlMs", "pendingMaxMs");
+const ID = /^[a-z0-9][a-z0-9.-]*$/;
+/** Bun.serve's idleTimeout: whole seconds, at most 255. */
+const MAX_IDLE_TIMEOUT_S = 255;
 
 const refuse = sliceRefusals(PARSER);
 const brand: Brand<ServeSlice> = sliceBrand("ServeSlice", PARSER);
@@ -89,10 +97,12 @@ const brand: Brand<ServeSlice> = sliceBrand("ServeSlice", PARSER);
 const at = (path: string): string => (path === "" ? "" : `${path}.`);
 
 /** `raw` as an object holding exactly `keys`, each present, or the refusal. */
-function exact(path: string, raw: unknown, keys: readonly string[]): Record<string, unknown> {
+function exact(path: string, raw: unknown, k: Keys<string>): Record<string, unknown> {
   const r = path === "" && !isRecord(raw) ? {} : refuse.record(path, raw);
-  refuse.refuseUnknownKeys(r, KEY_SETS.get(keys) ?? new Set(keys), at(path));
-  for (const k of keys) if (own(r, k) === undefined) throw refuse.required(`${at(path)}${k}`);
+  refuse.refuseUnknownKeys(r, k.set, at(path));
+  for (const key of k.list) {
+    if (own(r, key) === undefined) throw refuse.required(`${at(path)}${key}`);
+  }
   return r;
 }
 
@@ -116,12 +126,12 @@ function orNull<T>(v: unknown, parse: (v: unknown) => T): T | null {
 function numbers<K extends string, T>(
   path: string,
   raw: unknown,
-  keys: readonly K[],
+  k: Keys<K>,
   parse: (path: string, v: unknown) => T,
 ): Readonly<Record<K, T>> {
-  const r = exact(path, raw, keys);
+  const r = exact(path, raw, k);
   const out = {} as Record<K, T>;
-  for (const k of keys) out[k] = parse(`${path}.${k}`, own(r, k));
+  for (const key of k.list) out[key] = parse(`${path}.${key}`, own(r, key));
   return Object.freeze(out);
 }
 
@@ -131,12 +141,31 @@ const bucket = (path: string, raw: unknown): BucketLimits => numbers(path, raw, 
 /** A map keyed by tool or group name, each entry through `entry`. */
 function named<T>(path: string, raw: unknown, entry: (p: string, v: unknown) => T) {
   const m = refuse.record(path, raw);
-  const out: Record<string, T> = {};
-  for (const [k, v] of Object.entries(m)) {
-    if (k === "") throw refuse.invalid(path, "keyed by non-empty names", m);
-    out[k] = entry(`${path}.${k}`, v);
-  }
+  if (Object.hasOwn(m, "")) throw refuse.invalid(path, "keyed by non-empty names", m);
+  // fromEntries defines each key as an own property, so `__proto__` stays a name.
+  const out: Readonly<Record<string, T>> = Object.fromEntries(
+    Object.entries(m).map(([k, v]) => [k, entry(`${path}.${k}`, v)]),
+  );
   return Object.freeze(out);
+}
+
+/** Each tool in one concurrency group at most, and once within it. */
+function distinctTools(groups: Readonly<Record<string, Omit<ConcurrencyGroup, "busy">>>): void {
+  const seen = new Map<string, string>();
+  for (const [name, g] of Object.entries(groups)) {
+    for (const tool of g.tools) {
+      const other = seen.get(tool);
+      if (other !== undefined) {
+        const where = other === name ? "twice in this group" : `also in group ${other}`;
+        throw refuse.invalid(
+          `limits.concurrency.${name}.tools`,
+          `tools in one group only, each once (${where})`,
+          tool,
+        );
+      }
+      seen.set(tool, name);
+    }
+  }
 }
 
 function group(path: string, raw: unknown): Omit<ConcurrencyGroup, "busy"> {
@@ -171,11 +200,13 @@ function turnBudget(raw: unknown): Omit<TurnBudgetLimits, "exhausted"> {
 
 function limits(raw: unknown): ServeSlice["limits"] {
   const l = exact("limits", raw, LIMITS);
+  const concurrency = named("limits.concurrency", own(l, "concurrency"), group);
+  distinctTools(concurrency);
   return Object.freeze({
     refusal: orNull(own(l, "refusal"), (v) => bucket("limits.refusal", v)),
     serving: orNull(own(l, "serving"), (v) => bucket("limits.serving", v)),
     perTool: named("limits.perTool", own(l, "perTool"), bucket),
-    concurrency: named("limits.concurrency", own(l, "concurrency"), group),
+    concurrency,
     turnBudget: orNull(own(l, "turnBudget"), turnBudget),
     logIntervalMs: nonNeg("limits.logIntervalMs", own(l, "logIntervalMs")),
   });
@@ -202,7 +233,9 @@ export function serveSlice(input: ServeSliceInput): ServeSlice {
       orNull(v, (n) => posInt(p, n)),
     ),
     deadlineMs: orNull(own(raw, "deadlineMs"), (v) => posInt("deadlineMs", v)),
-    idleTimeout: orNull(own(raw, "idleTimeout"), (v) => posNum("idleTimeout", v)),
+    idleTimeout: orNull(own(raw, "idleTimeout"), (v) =>
+      bounded(refuse, "idleTimeout", v, 1, MAX_IDLE_TIMEOUT_S),
+    ),
     shutdown: numbers("shutdown", own(raw, "shutdown"), SHUTDOWN, nonNeg),
     limits: limits(own(raw, "limits")),
     probes: numbers("probes", own(raw, "probes"), PROBES, nonNeg),
