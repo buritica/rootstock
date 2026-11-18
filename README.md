@@ -509,7 +509,8 @@ const server = Bun.serve({
   ...SERVE_HARDENING,
   idleTimeout: s.idleTimeout ?? SERVE_HARDENING.idleTimeout,
   async fetch(req, srv) {
-    // No Host header leaves a bare path in req.url: URL.parse answers null, handle refuses it.
+    // HTTP/1.0 with no (or a bad) Host leaves a bare path in req.url: URL.parse
+    // answers null and handle refuses it, so such a probe gets no /health either.
     const pathname = URL.parse(req.url)?.pathname;
     if (pathname === "/health") return health();
     if (pathname === "/ready") return ready();
@@ -537,14 +538,18 @@ process.on("SIGTERM", async () => {
   a handler's throw with `{"error":"<tool> failed"}` (`isError: true`), so a
   database driver's message (SQL, parameters) never reaches the client;
   `"message"` sends the error's message, as the SDK does. Either way the
-  call record keeps the class and the full message for your sinks. A
-  `ProtocolError` the handler throws, a result it returns, and rootstock's
-  own refusals are never rewritten. The choice is made where the handler
-  throws, so an `aroundCall` hook already sees the generic result. Added in
-  0.13.0 (required).
-- **A request with no Host header is refused, not a 500.** Its `req.url` is
-  a bare path. With a `hostCheck` it gets that check's refusal on every
-  path and face (the 404 text, or the SDK's 403 "Missing Host header") and
+  call record keeps the thrown error's message (and its class, as
+  classified) for your sinks. A result the handler returns and rootstock's
+  own refusals are never rewritten, and neither is a `ProtocolError` the
+  handler throws: its message reaches the client as written, including one
+  a proxy tool rethrows from an upstream MCP server. An `aroundCall` hook
+  sees the result the client gets. Added in 0.13.0 (required).
+- **A request with no usable URL is refused, not a 500.** Bun hands `fetch`
+  a bare path when it cannot build an absolute URL: HTTP/1.0 with no Host,
+  or a Host that does not parse (HTTP/1.1 without Host gets Bun's own 400).
+  With a `hostCheck` it gets that check's refusal on every path and face,
+  before any method answer (the 404 text, or the SDK's 403 for that Host,
+  "Missing Host header" when there is none), and
   a throttled `serve.host_refused`; without one, the profile's 404 with the
   refusal bucket charged, even under `passUnknown`. Parse `req.url` in your
   own `fetch` with `URL.parse`, never `new URL`, for the same reason.

@@ -941,7 +941,8 @@ export function createMcpService(o: McpServiceOptions): McpService {
       try {
         sourceKey = sourceKeyFor(req, info, profile.clientIpHeader);
         const url = URL.parse(req.url);
-        // F4: no Host header leaves a bare path, which cannot be routed. With
+        // F4: Bun hands over a bare path when it cannot build an absolute URL
+        // (HTTP/1.0 with no Host, or a Host that does not parse). With
         // a host check it is that check's refusal on every face; without one,
         // the profile's 404 (refusal bucket charged, as step 4), never a 500
         // and never handed on, even when passUnknown.

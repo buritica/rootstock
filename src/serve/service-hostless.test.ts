@@ -1,5 +1,5 @@
-// F4: a request with no Host header reaches `fetch` with a bare path for its
-// URL (Bun and node:http both hand one over for HTTP/1.0). It used to throw in
+// F4: Bun hands `fetch` a bare path for its URL when it cannot build an
+// absolute one (HTTP/1.0 with no Host, or a Host that does not parse). It used to throw in
 // `new URL(req.url)` and answer the profile's 500.
 
 import { describe, expect, test } from "bun:test";
@@ -96,6 +96,15 @@ describe("F4: a request whose URL cannot be parsed", () => {
     expect(log.names()).not.toContain("serve.host_refused");
   });
 
+  test("an unparsable URL is refused before a 405-first method answer", async () => {
+    const { service } = withAuth(TRANSPORT_EMPTY);
+    expect(await snapshot(await service.handle(hostless("/mcp"), SOURCE))).toEqual({
+      status: 404,
+      headers: [["cache-control", "no-store"]],
+      body: "",
+    });
+  });
+
   test("no host check and passUnknown: still the 404, never handed on", async () => {
     const { service } = withAuth({ ...HANDLER_JSON, hostCheck: false });
     const res = await service.handle(hostless("/mcp"), SOURCE);
@@ -108,10 +117,14 @@ describe("F4: a request whose URL cannot be parsed", () => {
 
   test("over a real Bun listener: HTTP/1.0 with no Host answers the host check's 404", async () => {
     const { service } = withAuth(TRANSPORT_TEXT);
+    const urls: string[] = [];
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
-      fetch: async (req) => (await service.handle(req, {})) ?? new Response(null, { status: 418 }),
+      fetch: async (req) => {
+        urls.push(req.url);
+        return (await service.handle(req, {})) ?? new Response(null, { status: 418 });
+      },
     });
     const port = server.port;
     if (port === undefined) throw new Error("the listener has no port");
@@ -129,6 +142,9 @@ describe("F4: a request whose URL cannot be parsed", () => {
       });
       expect(raw.split("\r\n")[0]).toBe("HTTP/1.1 404 Not Found");
       expect(raw.endsWith("\r\n\r\nNot Found")).toBe(true);
+      // The case F4 is about: Bun handed over a URL that does not parse.
+      expect(urls).toEqual(["/mcp"]);
+      expect(URL.parse(urls[0] ?? "")).toBeNull();
     } finally {
       await server.stop(true);
     }

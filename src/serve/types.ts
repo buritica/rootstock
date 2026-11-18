@@ -146,8 +146,9 @@ export interface ServeProfile {
    * SDK's `isError` result with the error's message as its text (a database
    * driver's message can carry SQL and parameters). "generic": the labeled
    * error `{"error":"<tool> failed"}` with `isError: true`. Either way the
-   * CallRecord keeps the class and full message for sinks. A ProtocolError
-   * the handler throws (the SDK's own wording) is not rewritten.
+   * CallRecord keeps the thrown message (and its class, as classified). A
+   * ProtocolError the handler throws is not rewritten: its message reaches
+   * the client as written, including one rethrown from an upstream server.
    */
   toolThrow: "message" | "generic";
   requireCaller: boolean;

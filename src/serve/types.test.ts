@@ -310,5 +310,9 @@ test("ServeProfile admits the rev 3 members and refuses the old ones", () => {
     other: "auth-then-entry",
   };
   expect([answers.length, jwks.length]).toEqual([3, 3]);
-  expect([staleJwks, staleGet, staleMethods.get]).toHaveLength(3);
+  // @ts-expect-error toolThrow is "message" or "generic" (required since 0.13)
+  const staleThrow: ServeProfile["toolThrow"] = "quiet";
+  // @ts-expect-error a profile without toolThrow does not compile
+  const noThrow: ServeProfile = { ...({} as Omit<ServeProfile, "toolThrow">) };
+  expect([staleJwks, staleGet, staleMethods.get, staleThrow, noThrow]).toHaveLength(5);
 });

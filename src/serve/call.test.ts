@@ -488,7 +488,7 @@ describe("the handle", () => {
 
 describe("toolThrow (F5): what a handler's throw shows the client", () => {
   // A driver-style message: the text a client must not see under "generic".
-  const LEAKY = "Failed query: select * from t where id = $1\nparams: 7";
+  const LEAKY = "db error: select * from t where id = $1\nparams: 7";
   const register = (server: McpServer) => {
     server.registerTool("leaky", { description: "leaky" }, async () => {
       throw new Error(LEAKY);
@@ -518,7 +518,7 @@ describe("toolThrow (F5): what a handler's throw shows the client", () => {
     expect(JSON.stringify(res)).toBe(
       '{"content":[{"type":"text","text":"{\\"error\\":\\"leaky failed\\"}"}],"isError":true}',
     );
-    expect(JSON.stringify(res)).not.toContain("Failed query");
+    expect(JSON.stringify(res)).not.toContain("db error");
     expect(records[0]).toMatchObject({
       stage: "handler",
       ok: false,
@@ -541,7 +541,57 @@ describe("toolThrow (F5): what a handler's throw shows the client", () => {
       content: [{ type: "text", text: LEAKY }],
       isError: true,
     });
-    expect(records[0]).toMatchObject({ errorClass: "Error", errorMessage: LEAKY });
+    expect(records[0]).toMatchObject({
+      stage: "handler",
+      ok: false,
+      errorClass: "Error",
+      errorMessage: LEAKY,
+      outputText: LEAKY,
+    });
+  });
+
+  test('"generic": an aroundCall hook sees the result the client gets', async () => {
+    const seen: unknown[] = [];
+    const { peer, records } = await stdio({
+      toolThrow: "generic",
+      register,
+      toolScopes,
+      hooks: {
+        aroundCall: async (_call, next) => {
+          const r = await next();
+          seen.push(r);
+          return r;
+        },
+      },
+    });
+    const res = resultOf(await peer.callTool("leaky"));
+    expect(seen).toEqual([res]);
+    expect(JSON.stringify(seen)).not.toContain("db error");
+    expect(records[0]).toMatchObject({ errorMessage: LEAKY });
+  });
+
+  test('"generic" is read at install: changing the profile afterwards does not leak', async () => {
+    const profile = { unknownTool: "protocolError" as const, toolThrow: "generic" as string };
+    const server = new McpServer({ name: "t", version: "0" });
+    const caller = LOCAL_CALLER(new Set(["mcp:tools"]));
+    installSeams(server, {
+      profile: profile as never,
+      caller,
+      toolScopes,
+      limits: { ...NO_LIMITS },
+      usage: null,
+      ctx: localRequestContext(caller),
+      hooks: {},
+      clock: fakeTime(),
+      log: captureLog(),
+    });
+    register(server);
+    profile.toolThrow = "message";
+    const peer = await connectPeer(server);
+    expect(resultOf(await peer.callTool("leaky"))).toEqual({
+      content: [{ type: "text", text: '{"error":"leaky failed"}' }],
+      isError: true,
+    });
   });
 
   test('"generic" leaves a thrown ProtocolError, a returned isError, refusals and rejections alone', async () => {

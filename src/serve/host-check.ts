@@ -81,10 +81,11 @@ const refusalAs = (hc: HostCheck, sdk: Response): Response =>
   hc.refusal === "sdk-403" ? sdk : notFound("text-not-found");
 
 /**
- * The refusal for a request whose URL cannot be parsed (F4: a request with no
- * Host header reaches `fetch` with a bare path): the SDK's verdict on its Host
- * header against an empty allowlist, which always refuses ("Missing Host
- * header" when there is none), in the profile's refusal style.
+ * The refusal for a request whose URL cannot be parsed (F4: Bun hands over a
+ * bare path for HTTP/1.0 with no Host, or a Host that does not parse): the
+ * SDK's verdict on its Host header against an empty allowlist, which always
+ * refuses ("Missing Host header" when there is none), in the profile's
+ * refusal style. The trailing notFound is for the type checker only.
  */
 export function unroutableRefusal(hc: HostCheck, req: Request): Response {
   return refusalAs(hc, hostHeaderValidationResponse(req, []) ?? notFound("text-not-found"));

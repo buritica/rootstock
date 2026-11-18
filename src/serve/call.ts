@@ -393,6 +393,8 @@ export function installSeamsWith(
   },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
+  // Read once: a later change to the profile object cannot fall back to "message".
+  const genericThrow = o.profile.toolThrow === "generic";
   try {
     server.server.assertCanSetRequestHandler("tools/call");
   } catch {
@@ -465,7 +467,7 @@ export function installSeamsWith(
         // F5: under "generic" an unlabeled throw answers the labeled error, so
         // its message never reaches the client; the record keeps class and
         // message from state.thrown. A ProtocolError is the author's answer.
-        if (o.profile.toolThrow === "generic" && !(err instanceof ProtocolError)) {
+        if (genericThrow && !(err instanceof ProtocolError)) {
           return labeledError(`${name} failed`);
         }
         throw err;
