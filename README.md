@@ -509,7 +509,8 @@ const server = Bun.serve({
   ...SERVE_HARDENING,
   idleTimeout: s.idleTimeout ?? SERVE_HARDENING.idleTimeout,
   async fetch(req, srv) {
-    const { pathname } = new URL(req.url);
+    // No Host header leaves a bare path in req.url: URL.parse answers null, handle refuses it.
+    const pathname = URL.parse(req.url)?.pathname;
     if (pathname === "/health") return health();
     if (pathname === "/ready") return ready();
     const res = await service.handle(req, { remoteAddress: srv.requestIP(req)?.address });
@@ -532,6 +533,19 @@ process.on("SIGTERM", async () => {
   stateless handler), which non-POST methods authenticate first, body
   limits per caller kind, the deadline, Host/Origin rules and each refusal's
   exact bytes. Every field is required; nothing defaults.
+- **A tool's throw can stay on the server.** `toolThrow: "generic"` answers
+  a handler's throw with `{"error":"<tool> failed"}` (`isError: true`), so a
+  database driver's message (SQL, parameters) never reaches the client;
+  `"message"` sends the error's message, as the SDK does. Either way the
+  call record keeps the class and the full message for your sinks. A
+  `ProtocolError` the handler throws, a result it returns, and rootstock's
+  own refusals are never rewritten. Added in 0.13.0 (required).
+- **A request with no Host header is refused, not a 500.** Its `req.url` is
+  a bare path. With a `hostCheck` it gets that check's refusal on every
+  path and face (the 404 text, or the SDK's 403 "Missing Host header") and
+  a throttled `serve.host_refused`; without one, the profile's 404 with the
+  refusal bucket charged, even under `passUnknown`. Parse `req.url` in your
+  own `fetch` with `URL.parse`, never `new URL`, for the same reason.
 - **Limits are per process.** Buckets, concurrency groups and turn budgets
   live in memory: N instances allow N times the rate. Build the `Limits`
   object once; a fresh object per request starts every bucket full.
