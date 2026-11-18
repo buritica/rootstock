@@ -142,6 +142,8 @@ describe("createSpendCeiling", () => {
     );
     expect(err).toBeInstanceOf(CeilingReached);
     expect((err as Error).message).toBe("budget reached (100/100)");
+    // Marked for the client: serve's toolThrow "generic" passes it through.
+    expect((err as Record<symbol, unknown>)[Symbol.for("rootstock.clientFacing")]).toBe(true);
     expect(m.calls.load).toBe(1);
   });
 

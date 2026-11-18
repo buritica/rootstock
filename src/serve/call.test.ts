@@ -629,6 +629,54 @@ describe("toolThrow (F5): what a handler's throw shows the client", () => {
     ]);
   });
 
+  test('"generic" passes the spend ceiling\'s refusal through; a store failure is unlabeled', async () => {
+    let fail: Error = new Error("unused");
+    const usage = wiring([], {
+      spend: {
+        forCaller: () => ({
+          assertWithin: async () => {
+            throw fail;
+          },
+          record: async () => {},
+        }),
+      },
+    });
+    const { peer } = await stdio({
+      toolThrow: "generic",
+      usage,
+      toolScopes,
+      register: (server) =>
+        server.registerTool("caught", { description: "spend" }, async () => {
+          await currentCall().assertWithinSpend();
+          return { content: [] };
+        }),
+    });
+    fail = new Error("daily ceiling reached");
+    Object.defineProperty(fail, Symbol.for("rootstock.clientFacing"), { value: true });
+    expect(resultOf(await peer.callTool("caught"))).toEqual({
+      content: [{ type: "text", text: "daily ceiling reached" }],
+      isError: true,
+    });
+    fail = new Error("db error: connection refused");
+    expect(resultOf(await peer.callTool("caught"))).toEqual({
+      content: [{ type: "text", text: '{"error":"caught failed"}' }],
+      isError: true,
+    });
+  });
+
+  test('"generic" with no sink logs the throw, since no record is built', async () => {
+    const log = captureLog();
+    const { peer } = await stdio({ toolThrow: "generic", register, toolScopes, usage: null, log });
+    await peer.callTool("leaky");
+    expect(log.lines.filter(([e]) => e === "serve.tool_threw")).toEqual([
+      ["serve.tool_threw", { tool: "leaky", errorClass: "Error", message: LEAKY }],
+    ]);
+    const wired = captureLog();
+    const { peer: p2 } = await stdio({ toolThrow: "generic", register, toolScopes, log: wired });
+    await p2.callTool("leaky");
+    expect(wired.names()).not.toContain("serve.tool_threw");
+  });
+
   test("a profile without toolThrow (pre-0.13) is refused", () => {
     for (const toolThrow of [undefined, "quiet"]) {
       const server = new McpServer({ name: "t", version: "0" });

@@ -335,6 +335,13 @@ export function checkToolThrow(fn: string, value: unknown): void {
   }
 }
 
+/** rootstock's own refusals thrown from inside a handler (the spend ceiling) carry this mark. */
+const CLIENT_FACING = Symbol.for("rootstock.clientFacing");
+const clientFacing = (err: unknown): boolean =>
+  typeof err === "object" &&
+  err !== null &&
+  (err as Record<symbol, unknown>)[CLIENT_FACING] === true;
+
 /** The labeled-error envelope: one JSON text block `{"error": text}`, `isError: true`. */
 function labeledError(text: string) {
   return {
@@ -393,7 +400,7 @@ export function installSeamsWith(
   },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
-  // Read once: a later change to the profile object cannot fall back to "message".
+  // Read once per server: a later change to the profile cannot fall back to "message".
   const genericThrow = o.profile.toolThrow === "generic";
   try {
     server.server.assertCanSetRequestHandler("tools/call");
@@ -467,7 +474,15 @@ export function installSeamsWith(
         // F5: under "generic" an unlabeled throw answers the labeled error, so
         // its message never reaches the client; the record keeps class and
         // message from state.thrown. A ProtocolError is the author's answer.
-        if (genericThrow && !(err instanceof ProtocolError)) {
+        if (genericThrow && !(err instanceof ProtocolError) && !clientFacing(err)) {
+          // With no sink the record is never built: log it, or nobody sees it.
+          if (sinks.length === 0 || usage === null) {
+            log("serve.tool_threw", {
+              tool: name,
+              errorClass: className(err),
+              message: errorMessage(err),
+            });
+          }
           return labeledError(`${name} failed`);
         }
         throw err;

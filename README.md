@@ -40,7 +40,7 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
 | `retrieval` | v0.9.0 | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), with an optional candidate `budget` (a `set local` run first, since the index caps candidates before SQL `limit`), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable. The database needs the extension and a `lakebase_bm25` index built after the table is populated |
 | `runner` | v0.11.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record), plan mode (`planPull`) and the queue drain (`drainQueue`) |
-| `serve` | v0.12.0 | An MCP server behind one `handle(req)`: `createMcpService` runs auth, Host/Origin checks, body limits, the refusal and serving buckets and a deadline in front of the SDK's entry, with every response byte that differs between servers named in a profile; one `registerTool` seam checks scopes, charges the per-tool buckets, concurrency groups and turn budget, and records every call; `installSeams` does the same for a stdio server; liveness, cached readiness probes and a draining shutdown; `serveSlice` for config |
+| `serve` | v0.13.0 | An MCP server behind one `handle(req)`: `createMcpService` runs auth, Host/Origin checks, body limits, the refusal and serving buckets and a deadline in front of the SDK's entry, with every response byte that differs between servers named in a profile; one `registerTool` seam checks scopes, charges the per-tool buckets, concurrency groups and turn budget, and records every call; `installSeams` does the same for a stdio server; liveness, cached readiness probes and a draining shutdown; `serveSlice` for config |
 | `serve/auth` | v0.12.0 | `defineAuth`: one Better Auth instance as an MCP OAuth resource server (JWT, the MCP and CIMD plugins, magic link or Google sign-in, listed redirects, its rate limiter always on), the routes `serve` mounts, `verify` for the MCP path and `assertStoreReady` for startup |
 | `usage` | v0.12.0 | What a tool call cost and who made it: `postgresCallLog` batches call records into a table you name (rootstock's migration creates `rootstock.mcp_calls`) without ever delaying a call, `prometheusToolMetrics` counts handler calls, `createSpendCeiling` keeps a daily per-caller total (tokens or dollars) and refuses past it, `usageWiring` binds pricing (the `runs` price table) and error classes into `serve`; `usageSlice` for config |
 
@@ -539,10 +539,12 @@ process.on("SIGTERM", async () => {
   database driver's message (SQL, parameters) never reaches the client;
   `"message"` sends the error's message, as the SDK does. Either way the
   call record keeps the thrown error's message (and its class, as
-  classified) for your sinks. A result the handler returns and rootstock's
-  own refusals are never rewritten, and neither is a `ProtocolError` the
-  handler throws: its message reaches the client as written, including one
-  a proxy tool rethrows from an upstream MCP server. An `aroundCall` hook
+  classified) for your sinks; with none, `serve.tool_threw` {tool,
+  errorClass, message} logs it. Never rewritten: a result the handler
+  returns, rootstock's own refusals (the spend ceiling's included), the
+  SDK's output-validation error, and a `ProtocolError` the handler throws,
+  whose message reaches the client as written (including one a proxy tool
+  rethrows from an upstream MCP server). An `aroundCall` hook
   sees the result the client gets. Added in 0.13.0 (required).
 - **A request with no usable URL is refused, not a 500.** Bun hands `fetch`
   a bare path when it cannot build an absolute URL: HTTP/1.0 with no Host,
@@ -550,7 +552,7 @@ process.on("SIGTERM", async () => {
   With a `hostCheck` it gets that check's refusal on every path and face,
   before any method answer (the 404 text, or the SDK's 403 for that Host,
   "Missing Host header" when there is none), and
-  a throttled `serve.host_refused`; without one, the profile's 404 with the
+  a throttled `serve.host_refused` (reason `unroutable`); without one, the profile's 404 with the
   refusal bucket charged, even under `passUnknown`. Parse `req.url` in your
   own `fetch` with `URL.parse`, never `new URL`, for the same reason.
 - **Limits are per process.** Buckets, concurrency groups and turn budgets

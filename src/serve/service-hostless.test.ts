@@ -50,7 +50,10 @@ describe("F4: a request whose URL cannot be parsed", () => {
       }
     }
     expect(log.lines.filter(([e]) => e === "serve.host_refused")).toEqual([
-      ["serve.host_refused", { sourceKey: "192.0.2.7", host: "", origin: "" }],
+      [
+        "serve.host_refused",
+        { sourceKey: "192.0.2.7", host: "", origin: "", reason: "unroutable" },
+      ],
     ]);
     expect(log.names()).not.toContain("serve.uncaught");
     expect(records).toEqual([]);

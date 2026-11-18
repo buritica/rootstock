@@ -301,7 +301,9 @@ interface Entry {
 
 export function createMcpService(o: McpServiceOptions): McpService {
   validate(o);
-  const { profile, clock, timers, toolScopes, hooks } = o;
+  const { clock, timers, toolScopes, hooks } = o;
+  // A copy: the profile validate() checked is the one every request sees.
+  const profile: ServeProfile = Object.freeze({ ...o.profile });
   // Wrapped once: a throwing logger never changes an answer.
   const log: LogEvent = safeLog((event, fields) =>
     o.log(
@@ -358,7 +360,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
   const HOST_LOG_MS = 60_000;
   const HOST_LOG_KEYS = 1_024;
   const hostLogged = new Map<string, number>();
-  const hostRefusedLog = (req: Request, sourceKey: string) => {
+  const hostRefusedLog = (req: Request, sourceKey: string, reason?: "unroutable") => {
     const t = clock.monotonic();
     const at = hostLogged.get(sourceKey);
     if (at !== undefined && t - at < HOST_LOG_MS) return;
@@ -372,6 +374,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
       sourceKey,
       host: (req.headers.get("host") ?? "").slice(0, 200),
       origin: (req.headers.get("origin") ?? "").slice(0, 200),
+      ...(reason === undefined ? {} : { reason }),
     });
   };
 
@@ -948,7 +951,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         // and never handed on, even when passUnknown.
         if (url === null) {
           if (hc !== false) {
-            hostRefusedLog(req, sourceKey);
+            hostRefusedLog(req, sourceKey, "unroutable");
             return unroutableRefusal(hc, req);
           }
           return refused(req.method, sourceKey) ?? bodies.notFound(profile.bodies.notFound);
