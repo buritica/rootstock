@@ -77,3 +77,17 @@ export function hostGuard(hc: HostCheck): HostGuard {
     return undefined;
   };
 }
+
+/**
+ * The refusal for a request whose URL cannot be parsed (F4: a request with no
+ * Host header reaches `fetch` with a bare path). The guard's own refusal when
+ * it has one; else "404-text" answers its 404 and "sdk-403" the SDK's 403 for
+ * that Host header against an empty allowlist ("Missing Host header" when
+ * there is none). Never undefined: an unroutable request is always refused.
+ */
+export function unroutableRefusal(hc: HostCheck, guard: HostGuard): (req: Request) => Response {
+  return (req) =>
+    guard(req) ??
+    (hc.refusal === "sdk-403" ? hostHeaderValidationResponse(req, []) : undefined) ??
+    notFound("text-not-found");
+}
