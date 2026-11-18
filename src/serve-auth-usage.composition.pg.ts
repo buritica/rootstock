@@ -183,6 +183,7 @@ function profileFrom(serve: ServeSlice): ServeProfile {
     bodyLimit: serve.bodyLimit,
     deadlineMs: serve.deadlineMs,
     unknownTool: "isError",
+    toolThrow: "message",
     requireCaller: true,
     oauthScopes: ["mcp:tools"],
     hostCheck: false,

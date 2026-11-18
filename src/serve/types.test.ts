@@ -221,6 +221,7 @@ test("the shared types admit a complete value", () => {
     bodyLimit: { oauth: 4_194_304, bearer: 4_194_304, local: null, none: 4_194_304 },
     deadlineMs: null,
     unknownTool: "protocolError",
+    toolThrow: "generic",
     requireCaller: true,
     oauthScopes: ["mcp:tools"],
     hostCheck: {

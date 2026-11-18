@@ -76,7 +76,7 @@ export interface ServeHooks {
 }
 
 export interface InstallSeamsOptions {
-  profile: Pick<ServeProfile, "unknownTool">;
+  profile: Pick<ServeProfile, "unknownTool" | "toolThrow">;
   caller: Caller;
   toolScopes: ToolScopes;
   /** Bucket and group state lives with this object: pass the same one to every server that shares limits. */
@@ -328,6 +328,13 @@ function onceEach(max: number): (key: string) => boolean {
 
 // ------------------------------------------------------------------ seams
 
+/** Refuses a `toolThrow` that is not one of its two values (a pre-0.13 profile has none). */
+export function checkToolThrow(fn: string, value: unknown): void {
+  if (value !== "message" && value !== "generic") {
+    throw configError(fn, 'profile.toolThrow must be "message" or "generic"', value);
+  }
+}
+
 /** The labeled-error envelope: one JSON text block `{"error": text}`, `isError: true`. */
 function labeledError(text: string) {
   return {
@@ -384,6 +391,7 @@ export function installSeamsWith(
   },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
+  checkToolThrow("installSeams", o.profile.toolThrow);
   try {
     server.server.assertCanSetRequestHandler("tools/call");
   } catch {
@@ -580,6 +588,17 @@ export function installSeamsWith(
           : rejectionClass(text, tool);
         record("rejected", result, errorClass);
       } else {
+        // The handler threw and the SDK answered isError with its message
+        // (F5): under "generic" the client gets the labeled error instead;
+        // the record keeps the class and message from state.thrown.
+        if (
+          o.profile.toolThrow === "generic" &&
+          state.thrown !== undefined &&
+          !(state.thrown.err instanceof ProtocolError) &&
+          (result as { isError?: unknown } | undefined)?.isError === true
+        ) {
+          result = labeledError(`${tool} failed`);
+        }
         record("handler", result);
       }
       return result;

@@ -29,6 +29,7 @@ import {
 } from "@modelcontextprotocol/server";
 import * as bodies from "./bodies.ts";
 import {
+  checkToolThrow,
   installSeamsWith,
   LOCAL_CALLER,
   type RequestContext,
@@ -44,7 +45,7 @@ import {
   safeLog,
 } from "./errors.ts";
 import { sourceKeyFor } from "./hardening.ts";
-import { hostGuard } from "./host-check.ts";
+import { hostGuard, unroutableRefusal } from "./host-check.ts";
 import { type BucketLimiter, createBucketLimiter, type Limits } from "./limits.ts";
 import {
   type Caller,
@@ -203,6 +204,7 @@ function validate(o: McpServiceOptions): void {
   if (typeof p?.mcpPath !== "string" || !p.mcpPath.startsWith("/")) {
     throw configError("createMcpService", "profile.mcpPath must start with /", p?.mcpPath);
   }
+  checkToolThrow("createMcpService", p.toolThrow);
   for (const [kind, limit] of Object.entries(p.bodyLimit)) {
     if (limit !== null && !isPositiveInteger(limit)) {
       throw configError(
@@ -328,10 +330,15 @@ export function createMcpService(o: McpServiceOptions): McpService {
     log("serve.unauthenticated_http", { mcpPath: profile.mcpPath });
   }
   const hc = profile.hostCheck;
-  const host =
-    hc === false
-      ? null
-      : { guard: hostGuard(hc), privateFirst: hc.appliesTo === "all-but-public-auth" };
+  const host = (() => {
+    if (hc === false) return null;
+    const guard = hostGuard(hc);
+    return {
+      guard,
+      unroutable: unroutableRefusal(hc, guard),
+      privateFirst: hc.appliesTo === "all-but-public-auth",
+    };
+  })();
 
   /**
    * The Host/Origin refusal at `step`, or undefined. Under
@@ -938,7 +945,18 @@ export function createMcpService(o: McpServiceOptions): McpService {
       let sourceKey: string | undefined;
       try {
         sourceKey = sourceKeyFor(req, info, profile.clientIpHeader);
-        const url = new URL(req.url);
+        const url = URL.parse(req.url);
+        // F4: no Host header leaves a bare path, which cannot be routed. With
+        // a host check it is that check's refusal on every face; without one,
+        // the profile's 404 (refusal bucket charged, as step 4), never a 500
+        // and never handed on, even when passUnknown.
+        if (url === null) {
+          if (host !== null) {
+            hostRefusedLog(req, sourceKey);
+            return host.unroutable(req);
+          }
+          return refused(req.method, sourceKey) ?? bodies.notFound(profile.bodies.notFound);
+        }
         // acceptCredentials decides the face: no static bearer is the public one.
         const faces = o.acceptCredentials?.(req, info) ?? ALL_FACES;
         const answer = methodAnswer(req.method);
