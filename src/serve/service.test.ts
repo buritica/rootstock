@@ -801,7 +801,7 @@ describe("step 5.10 and the SDK-detail pin, under both entries over HTTP", () =>
       expect(records[0]).toMatchObject({ stage: "rejected", errorClass: "InvalidParams" });
     });
 
-    test(`${label}: a throwing tool (toolThrow ${profile.toolThrow})`, async () => {
+    test(`${label}: a throwing tool`, async () => {
       const { rpc, records } = await send(call("boom"));
       const text = profile.toolThrow === "generic" ? '{"error":"boom failed"}' : "kaboom";
       expect(JSON.stringify(rpc.result)).toBe(

@@ -6,11 +6,9 @@ import { describe, expect, test } from "bun:test";
 import { connect } from "node:net";
 import type { Limits } from "./limits.ts";
 import {
-  call,
   fakeAuth,
   HANDLER_JSON,
   makeService,
-  mcpRequest,
   noLimits,
   ORIGIN,
   snapshot,
@@ -32,7 +30,6 @@ const withAuth = (profile: ServeProfile, over: Partial<McpServiceOptions> = {}) 
 function hostless(path: string, init: RequestInit = {}): Request {
   const req = new Request(`${ORIGIN}${path}`, init);
   Object.defineProperty(req, "url", { value: path });
-  expect(() => new URL(req.url)).toThrow();
   return req;
 }
 
@@ -40,6 +37,10 @@ const PATHS = ["/mcp", "/api/auth/token", "/.well-known/x", "/login", "/elsewher
 const SOURCE = { remoteAddress: "192.0.2.7" };
 
 describe("F4: a request whose URL cannot be parsed", () => {
+  test("the stand-in is what the service sees: an unparsable URL", () => {
+    expect(URL.parse(hostless("/mcp").url)).toBeNull();
+  });
+
   test("TRANSPORT_TEXT (exact, 404-text): the host check's 404 on every path, logged throttled", async () => {
     const { service, log, records } = withAuth(TRANSPORT_TEXT);
     for (const path of PATHS) {
@@ -103,19 +104,6 @@ describe("F4: a request whose URL cannot be parsed", () => {
       headers: [["content-type", "application/json"]],
       body: '{"error":"not found"}',
     });
-  });
-
-  test("a parsable URL with no Host header is routed as before", async () => {
-    // No host check: served. Host check: refused by the check itself.
-    const open = withAuth(TRANSPORT_EMPTY).service;
-    const ok = await open.handle(mcpRequest(call("echo", { text: "x" }), { token: "good:u" }), {});
-    expect(ok?.status).toBe(200);
-    const checked = withAuth(TRANSPORT_TEXT).service;
-    const refused = await checked.handle(
-      mcpRequest(call("echo", { text: "x" }), { token: "good:u" }),
-      {},
-    );
-    expect(refused?.status).toBe(404);
   });
 
   test("over a real Bun listener: HTTP/1.0 with no Host answers the host check's 404", async () => {

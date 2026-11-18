@@ -374,6 +374,8 @@ function errorMessage(err: unknown): string | null {
  * already has a `tools/call` handler throws ERR_ROOTSTOCK_SERVE_CONFIG.
  */
 export function installSeams(server: McpServer, o: InstallSeamsOptions): void {
+  // createMcpService checks the profile once in validate(); this is the other entry.
+  checkToolThrow("installSeams", o.profile.toolThrow);
   installSeamsWith(server, o, { timedOut: () => false });
 }
 
@@ -391,7 +393,6 @@ export function installSeamsWith(
   },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
-  checkToolThrow("installSeams", o.profile.toolThrow);
   try {
     server.server.assertCanSetRequestHandler("tools/call");
   } catch {
@@ -461,6 +462,12 @@ export function installSeamsWith(
         return await handler(...args);
       } catch (err) {
         if (state) state.thrown = { err };
+        // F5: under "generic" an unlabeled throw answers the labeled error, so
+        // its message never reaches the client; the record keeps class and
+        // message from state.thrown. A ProtocolError is the author's answer.
+        if (o.profile.toolThrow === "generic" && !(err instanceof ProtocolError)) {
+          return labeledError(`${name} failed`);
+        }
         throw err;
       } finally {
         release?.();
@@ -588,17 +595,6 @@ export function installSeamsWith(
           : rejectionClass(text, tool);
         record("rejected", result, errorClass);
       } else {
-        // The handler threw and the SDK answered isError with its message
-        // (F5): under "generic" the client gets the labeled error instead;
-        // the record keeps the class and message from state.thrown.
-        if (
-          o.profile.toolThrow === "generic" &&
-          state.thrown !== undefined &&
-          !(state.thrown.err instanceof ProtocolError) &&
-          (result as { isError?: unknown } | undefined)?.isError === true
-        ) {
-          result = labeledError(`${tool} failed`);
-        }
         record("handler", result);
       }
       return result;

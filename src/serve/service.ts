@@ -330,15 +330,10 @@ export function createMcpService(o: McpServiceOptions): McpService {
     log("serve.unauthenticated_http", { mcpPath: profile.mcpPath });
   }
   const hc = profile.hostCheck;
-  const host = (() => {
-    if (hc === false) return null;
-    const guard = hostGuard(hc);
-    return {
-      guard,
-      unroutable: unroutableRefusal(hc, guard),
-      privateFirst: hc.appliesTo === "all-but-public-auth",
-    };
-  })();
+  const host =
+    hc === false
+      ? null
+      : { guard: hostGuard(hc), privateFirst: hc.appliesTo === "all-but-public-auth" };
 
   /**
    * The Host/Origin refusal at `step`, or undefined. Under
@@ -951,9 +946,9 @@ export function createMcpService(o: McpServiceOptions): McpService {
         // the profile's 404 (refusal bucket charged, as step 4), never a 500
         // and never handed on, even when passUnknown.
         if (url === null) {
-          if (host !== null) {
+          if (hc !== false) {
             hostRefusedLog(req, sourceKey);
-            return host.unroutable(req);
+            return unroutableRefusal(hc, req);
           }
           return refused(req.method, sourceKey) ?? bodies.notFound(profile.bodies.notFound);
         }

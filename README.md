@@ -539,7 +539,9 @@ process.on("SIGTERM", async () => {
   `"message"` sends the error's message, as the SDK does. Either way the
   call record keeps the class and the full message for your sinks. A
   `ProtocolError` the handler throws, a result it returns, and rootstock's
-  own refusals are never rewritten. Added in 0.13.0 (required).
+  own refusals are never rewritten. The choice is made where the handler
+  throws, so an `aroundCall` hook already sees the generic result. Added in
+  0.13.0 (required).
 - **A request with no Host header is refused, not a 500.** Its `req.url` is
   a bare path. With a `hostCheck` it gets that check's refusal on every
   path and face (the 404 text, or the SDK's 403 "Missing Host header") and

@@ -145,7 +145,7 @@ export function defineAuth(o: AuthOptions): AuthLayer {
       }
       logIf429(
         res.status,
-        new URL(req.url).pathname,
+        URL.parse(req.url)?.pathname ?? req.url,
         clientOf(req.headers),
         res.headers.get("x-retry-after"),
       );
