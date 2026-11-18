@@ -141,6 +141,16 @@ export interface ServeProfile {
   bodyLimit: Readonly<Record<Caller["kind"], number | null>>;
   deadlineMs: number | null;
   unknownTool: "isError" | "protocolError";
+  /**
+   * What the client sees when a tool's handler throws (F5). "message": the
+   * SDK's `isError` result with the error's message as its text (a database
+   * driver's message can carry SQL and parameters). "generic": the labeled
+   * error `{"error":"<tool> failed"}` with `isError: true`. Either way the
+   * CallRecord keeps the thrown message (and its class, as classified). A
+   * ProtocolError the handler throws is not rewritten: its message reaches
+   * the client as written, including one rethrown from an upstream server.
+   */
+  toolThrow: "message" | "generic";
   requireCaller: boolean;
   /** Base scopes for every OAuth caller. */
   oauthScopes: readonly string[];

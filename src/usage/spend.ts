@@ -83,6 +83,9 @@ export function postgresSpendStore(o: PostgresSpendStoreOptions): SpendStore {
   );
 }
 
+/** Marks an error whose message is meant for the client (serve's call seam reads it). */
+const CLIENT_FACING = Symbol.for("rootstock.clientFacing");
+
 /** A class whose instances are the refusal, built from its text. */
 export type ErrorConstructorOf = new (message: string) => Error;
 
@@ -314,7 +317,10 @@ export function createSpendCeiling(o: SpendCeilingOptions): SpendCharger {
               e.refusalLogged = true;
               log("usage.spend_refused", { caller, used, ceiling, unit });
             }
-            throw new errorClass(refusal(used, ceiling));
+            const err = new errorClass(refusal(used, ceiling));
+            // A refusal for the client: toolThrow "generic" passes it through.
+            Object.defineProperty(err, CLIENT_FACING, { value: true });
+            throw err;
           }
         },
         record(u) {

@@ -29,6 +29,7 @@ import {
 } from "@modelcontextprotocol/server";
 import * as bodies from "./bodies.ts";
 import {
+  checkToolThrow,
   installSeamsWith,
   LOCAL_CALLER,
   type RequestContext,
@@ -44,7 +45,7 @@ import {
   safeLog,
 } from "./errors.ts";
 import { sourceKeyFor } from "./hardening.ts";
-import { hostGuard } from "./host-check.ts";
+import { hostGuard, unroutableRefusal } from "./host-check.ts";
 import { type BucketLimiter, createBucketLimiter, type Limits } from "./limits.ts";
 import {
   type Caller,
@@ -203,6 +204,7 @@ function validate(o: McpServiceOptions): void {
   if (typeof p?.mcpPath !== "string" || !p.mcpPath.startsWith("/")) {
     throw configError("createMcpService", "profile.mcpPath must start with /", p?.mcpPath);
   }
+  checkToolThrow("createMcpService", p.toolThrow);
   for (const [kind, limit] of Object.entries(p.bodyLimit)) {
     if (limit !== null && !isPositiveInteger(limit)) {
       throw configError(
@@ -299,7 +301,9 @@ interface Entry {
 
 export function createMcpService(o: McpServiceOptions): McpService {
   validate(o);
-  const { profile, clock, timers, toolScopes, hooks } = o;
+  const { clock, timers, toolScopes, hooks } = o;
+  // A copy: the profile validate() checked is the one every request sees.
+  const profile: ServeProfile = Object.freeze({ ...o.profile });
   // Wrapped once: a throwing logger never changes an answer.
   const log: LogEvent = safeLog((event, fields) =>
     o.log(
@@ -356,7 +360,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
   const HOST_LOG_MS = 60_000;
   const HOST_LOG_KEYS = 1_024;
   const hostLogged = new Map<string, number>();
-  const hostRefusedLog = (req: Request, sourceKey: string) => {
+  const hostRefusedLog = (req: Request, sourceKey: string, reason?: "unroutable") => {
     const t = clock.monotonic();
     const at = hostLogged.get(sourceKey);
     if (at !== undefined && t - at < HOST_LOG_MS) return;
@@ -370,6 +374,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
       sourceKey,
       host: (req.headers.get("host") ?? "").slice(0, 200),
       origin: (req.headers.get("origin") ?? "").slice(0, 200),
+      ...(reason === undefined ? {} : { reason }),
     });
   };
 
@@ -938,7 +943,19 @@ export function createMcpService(o: McpServiceOptions): McpService {
       let sourceKey: string | undefined;
       try {
         sourceKey = sourceKeyFor(req, info, profile.clientIpHeader);
-        const url = new URL(req.url);
+        const url = URL.parse(req.url);
+        // F4: Bun hands over a bare path when it cannot build an absolute URL
+        // (HTTP/1.0 with no Host, or a Host that does not parse). With
+        // a host check it is that check's refusal on every face; without one,
+        // the profile's 404 (refusal bucket charged, as step 4), never a 500
+        // and never handed on, even when passUnknown.
+        if (url === null) {
+          if (hc !== false) {
+            hostRefusedLog(req, sourceKey, "unroutable");
+            return unroutableRefusal(hc, req);
+          }
+          return refused(req.method, sourceKey) ?? bodies.notFound(profile.bodies.notFound);
+        }
         // acceptCredentials decides the face: no static bearer is the public one.
         const faces = o.acceptCredentials?.(req, info) ?? ALL_FACES;
         const answer = methodAnswer(req.method);

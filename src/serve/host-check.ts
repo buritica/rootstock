@@ -55,13 +55,11 @@ export function hostGuard(hc: HostCheck): HostGuard {
         : hosts;
 
   if (hc.hosts.match === "hostname") {
-    const refuse = (sdk: Response): Response =>
-      hc.refusal === "sdk-403" ? sdk : notFound("text-not-found");
     return (req) => {
       const h = hosts === null ? undefined : hostHeaderValidationResponse(req, hosts);
-      if (h) return refuse(h);
+      if (h) return refusalAs(hc, h);
       const o = origins === null ? undefined : originValidationResponse(req, origins);
-      return o ? refuse(o) : undefined;
+      return o ? refusalAs(hc, o) : undefined;
     };
   }
   // Exact matching always refuses with "404-text" (sdk-403 is refused above).
@@ -76,4 +74,19 @@ export function hostGuard(hc: HostCheck): HostGuard {
     }
     return undefined;
   };
+}
+
+/** The profile's refusal style applied to the SDK's refusal. */
+const refusalAs = (hc: HostCheck, sdk: Response): Response =>
+  hc.refusal === "sdk-403" ? sdk : notFound("text-not-found");
+
+/**
+ * The refusal for a request whose URL cannot be parsed (F4: Bun hands over a
+ * bare path for HTTP/1.0 with no Host, or a Host that does not parse): the
+ * SDK's verdict on its Host header against an empty allowlist, which always
+ * refuses ("Missing Host header" when there is none), in the profile's
+ * refusal style. The trailing notFound is for the type checker only.
+ */
+export function unroutableRefusal(hc: HostCheck, req: Request): Response {
+  return refusalAs(hc, hostHeaderValidationResponse(req, []) ?? notFound("text-not-found"));
 }

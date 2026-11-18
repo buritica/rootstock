@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { McpServer } from "@modelcontextprotocol/server";
+import { McpServer, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import {
   type CallHandle,
@@ -64,6 +64,7 @@ interface Setup {
   limits?: Limits | null;
   usage?: UsageWiring | null;
   unknownTool?: "isError" | "protocolError";
+  toolThrow?: "message" | "generic";
   ctx?: RequestContext;
   hooks?: Parameters<typeof installSeams>[1]["hooks"];
   register?: (server: McpServer) => void;
@@ -79,7 +80,7 @@ async function stdio(s: Setup = {}) {
   const caller = s.caller ?? LOCAL_CALLER(new Set(["mcp:tools"]));
   const server = new McpServer({ name: "t", version: "0" });
   installSeams(server, {
-    profile: { unknownTool: s.unknownTool ?? "protocolError" },
+    profile: { unknownTool: s.unknownTool ?? "protocolError", toolThrow: s.toolThrow ?? "message" },
     caller,
     toolScopes: s.toolScopes ?? SCOPES,
     // A fresh object per server: one Limits shared by servers with other logs is rebuilt (and says so).
@@ -485,6 +486,218 @@ describe("the handle", () => {
   });
 });
 
+describe("toolThrow (F5): what a handler's throw shows the client", () => {
+  // A driver-style message: the text a client must not see under "generic".
+  const LEAKY = "db error: select * from t where id = $1\nparams: 7";
+  const register = (server: McpServer) => {
+    server.registerTool("leaky", { description: "leaky" }, async () => {
+      throw new Error(LEAKY);
+    });
+    server.registerTool("proto", { description: "proto" }, async () => {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "id must be positive");
+    });
+    server.registerTool("caught", { description: "caught" }, async () => {
+      currentCall().fail(new TypeError("handled inside"));
+      return { content: [{ type: "text", text: "partial" }], isError: true };
+    });
+    server.registerTool("text", { description: "text" }, async () => {
+      throw "a bare string";
+    });
+  };
+  const toolScopes = defineToolScopes({
+    id: "test",
+    tools: Object.fromEntries(
+      ["echo", "boom", "leaky", "proto", "caught", "text"].map((t) => [t, "mcp:tools"]),
+    ),
+    implies: { "mcp:tools": ["mcp:tools"] },
+  });
+
+  test('"generic": the labeled error, isError; the record keeps class and full message', async () => {
+    const { peer, records } = await stdio({ toolThrow: "generic", register, toolScopes });
+    const res = resultOf(await peer.callTool("leaky"));
+    expect(JSON.stringify(res)).toBe(
+      '{"content":[{"type":"text","text":"{\\"error\\":\\"leaky failed\\"}"}],"isError":true}',
+    );
+    expect(JSON.stringify(res)).not.toContain("db error");
+    expect(records[0]).toMatchObject({
+      stage: "handler",
+      ok: false,
+      errorClass: "Error",
+      errorMessage: LEAKY,
+      // keepOutput: the text the client got, never the message.
+      outputText: '{"error":"leaky failed"}',
+    });
+    // A non-Error throw is unlabeled too.
+    expect(resultOf(await peer.callTool("text"))).toEqual({
+      content: [{ type: "text", text: '{"error":"text failed"}' }],
+      isError: true,
+    });
+    expect(records[1]).toMatchObject({ stage: "handler", errorMessage: "a bare string" });
+  });
+
+  test("\"message\": today's bytes, the SDK's isError with the message", async () => {
+    const { peer, records } = await stdio({ toolThrow: "message", register, toolScopes });
+    expect(resultOf(await peer.callTool("leaky"))).toEqual({
+      content: [{ type: "text", text: LEAKY }],
+      isError: true,
+    });
+    expect(records[0]).toMatchObject({
+      stage: "handler",
+      ok: false,
+      errorClass: "Error",
+      errorMessage: LEAKY,
+      outputText: LEAKY,
+    });
+  });
+
+  test('"generic": an aroundCall hook sees the result the client gets', async () => {
+    const seen: unknown[] = [];
+    const { peer, records } = await stdio({
+      toolThrow: "generic",
+      register,
+      toolScopes,
+      hooks: {
+        aroundCall: async (_call, next) => {
+          const r = await next();
+          seen.push(r);
+          return r;
+        },
+      },
+    });
+    const res = resultOf(await peer.callTool("leaky"));
+    expect(seen).toEqual([res]);
+    expect(JSON.stringify(seen)).not.toContain("db error");
+    expect(records[0]).toMatchObject({ errorMessage: LEAKY });
+  });
+
+  test('"generic" is read at install: changing the profile afterwards does not leak', async () => {
+    const profile = { unknownTool: "protocolError" as const, toolThrow: "generic" as string };
+    const server = new McpServer({ name: "t", version: "0" });
+    const caller = LOCAL_CALLER(new Set(["mcp:tools"]));
+    installSeams(server, {
+      profile: profile as never,
+      caller,
+      toolScopes,
+      limits: { ...NO_LIMITS },
+      usage: null,
+      ctx: localRequestContext(caller),
+      hooks: {},
+      clock: fakeTime(),
+      log: captureLog(),
+    });
+    register(server);
+    profile.toolThrow = "message";
+    const peer = await connectPeer(server);
+    expect(resultOf(await peer.callTool("leaky"))).toEqual({
+      content: [{ type: "text", text: '{"error":"leaky failed"}' }],
+      isError: true,
+    });
+  });
+
+  test('"generic" leaves a thrown ProtocolError, a returned isError, refusals and rejections alone', async () => {
+    const limits: Limits = {
+      ...NO_LIMITS,
+      perTool: { echo: { capacity: 1, refillPerSecond: 1, maxKeys: 10 } },
+    };
+    const { peer, records } = await stdio({ toolThrow: "generic", register, toolScopes, limits });
+    expect(resultOf(await peer.callTool("proto"))).toEqual({
+      content: [{ type: "text", text: "id must be positive" }],
+      isError: true,
+    });
+    expect(resultOf(await peer.callTool("caught"))).toEqual({
+      content: [{ type: "text", text: "partial" }],
+      isError: true,
+    });
+    await peer.callTool("echo", { text: "a" });
+    expect(resultOf(await peer.callTool("echo", { text: "b" }))).toEqual({
+      content: [{ type: "text", text: "Rate limit exceeded for echo — try again shortly." }],
+      isError: true,
+    });
+    const invalid = resultOf(await peer.callTool("echo", { text: 5 }));
+    expect((invalid.content as { text: string }[])[0]?.text).toStartWith("Input validation error:");
+    expect((await peer.callTool("nope", {})).error).toEqual({
+      code: -32602,
+      message: "Tool nope not found",
+    });
+    expect(records.map((r) => [r.stage, r.errorClass, r.errorMessage])).toEqual([
+      ["handler", "ProtocolError", "id must be positive"],
+      ["handler", "TypeError", "handled inside"],
+      ["handler", null, null],
+      ["refused", "RateLimited", null],
+      ["rejected", "InvalidParams", null],
+      ["rejected", "UnknownTool", null],
+    ]);
+  });
+
+  test('"generic" passes the spend ceiling\'s refusal through; a store failure is unlabeled', async () => {
+    let fail: Error = new Error("unused");
+    const usage = wiring([], {
+      spend: {
+        forCaller: () => ({
+          assertWithin: async () => {
+            throw fail;
+          },
+          record: async () => {},
+        }),
+      },
+    });
+    const { peer } = await stdio({
+      toolThrow: "generic",
+      usage,
+      toolScopes,
+      register: (server) =>
+        server.registerTool("caught", { description: "spend" }, async () => {
+          await currentCall().assertWithinSpend();
+          return { content: [] };
+        }),
+    });
+    fail = new Error("daily ceiling reached");
+    Object.defineProperty(fail, Symbol.for("rootstock.clientFacing"), { value: true });
+    expect(resultOf(await peer.callTool("caught"))).toEqual({
+      content: [{ type: "text", text: "daily ceiling reached" }],
+      isError: true,
+    });
+    fail = new Error("db error: connection refused");
+    expect(resultOf(await peer.callTool("caught"))).toEqual({
+      content: [{ type: "text", text: '{"error":"caught failed"}' }],
+      isError: true,
+    });
+  });
+
+  test('"generic" with no sink logs the throw, since no record is built', async () => {
+    const log = captureLog();
+    const { peer } = await stdio({ toolThrow: "generic", register, toolScopes, usage: null, log });
+    await peer.callTool("leaky");
+    expect(log.lines.filter(([e]) => e === "serve.tool_threw")).toEqual([
+      ["serve.tool_threw", { tool: "leaky", errorClass: "Error", message: LEAKY }],
+    ]);
+    const wired = captureLog();
+    const { peer: p2 } = await stdio({ toolThrow: "generic", register, toolScopes, log: wired });
+    await p2.callTool("leaky");
+    expect(wired.names()).not.toContain("serve.tool_threw");
+  });
+
+  test("a profile without toolThrow (pre-0.13) is refused", () => {
+    for (const toolThrow of [undefined, "quiet"]) {
+      const server = new McpServer({ name: "t", version: "0" });
+      const caller = LOCAL_CALLER(new Set(["mcp:tools"]));
+      expect(() =>
+        installSeams(server, {
+          profile: { unknownTool: "protocolError", toolThrow } as never,
+          caller,
+          toolScopes: SCOPES,
+          limits: null,
+          usage: null,
+          ctx: localRequestContext(caller),
+          hooks: {},
+          clock: fakeTime(),
+          log: captureLog(),
+        }),
+      ).toThrow(/profile.toolThrow must be "message" or "generic"/);
+    }
+  });
+});
+
 describe("limits in the seams", () => {
   test("per-tool bucket: charged only after validation, refusal thrown, refused/RateLimited", async () => {
     const limits: Limits = {
@@ -756,7 +969,7 @@ test("installSeams on a server that already has tools throws ERR_ROOTSTOCK_SERVE
   let caught: unknown;
   try {
     installSeams(server, {
-      profile: { unknownTool: "protocolError" },
+      profile: { unknownTool: "protocolError", toolThrow: "message" },
       caller,
       toolScopes: SCOPES,
       limits: NO_LIMITS,

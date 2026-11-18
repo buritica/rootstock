@@ -76,7 +76,7 @@ export interface ServeHooks {
 }
 
 export interface InstallSeamsOptions {
-  profile: Pick<ServeProfile, "unknownTool">;
+  profile: Pick<ServeProfile, "unknownTool" | "toolThrow">;
   caller: Caller;
   toolScopes: ToolScopes;
   /** Bucket and group state lives with this object: pass the same one to every server that shares limits. */
@@ -328,6 +328,20 @@ function onceEach(max: number): (key: string) => boolean {
 
 // ------------------------------------------------------------------ seams
 
+/** Refuses a `toolThrow` that is not one of its two values (a pre-0.13 profile has none). */
+export function checkToolThrow(fn: string, value: unknown): void {
+  if (value !== "message" && value !== "generic") {
+    throw configError(fn, 'profile.toolThrow must be "message" or "generic"', value);
+  }
+}
+
+/** rootstock's own refusals thrown from inside a handler (the spend ceiling) carry this mark. */
+const CLIENT_FACING = Symbol.for("rootstock.clientFacing");
+const clientFacing = (err: unknown): boolean =>
+  typeof err === "object" &&
+  err !== null &&
+  (err as Record<symbol, unknown>)[CLIENT_FACING] === true;
+
 /** The labeled-error envelope: one JSON text block `{"error": text}`, `isError: true`. */
 function labeledError(text: string) {
   return {
@@ -367,6 +381,8 @@ function errorMessage(err: unknown): string | null {
  * already has a `tools/call` handler throws ERR_ROOTSTOCK_SERVE_CONFIG.
  */
 export function installSeams(server: McpServer, o: InstallSeamsOptions): void {
+  // createMcpService checks the profile once in validate(); this is the other entry.
+  checkToolThrow("installSeams", o.profile.toolThrow);
   installSeamsWith(server, o, { timedOut: () => false });
 }
 
@@ -384,6 +400,8 @@ export function installSeamsWith(
   },
 ): void {
   const { caller, toolScopes, usage, ctx, hooks, clock } = o;
+  // Read once per server: a later change to the profile cannot fall back to "message".
+  const genericThrow = o.profile.toolThrow === "generic";
   try {
     server.server.assertCanSetRequestHandler("tools/call");
   } catch {
@@ -453,6 +471,20 @@ export function installSeamsWith(
         return await handler(...args);
       } catch (err) {
         if (state) state.thrown = { err };
+        // F5: under "generic" an unlabeled throw answers the labeled error, so
+        // its message never reaches the client; the record keeps class and
+        // message from state.thrown. A ProtocolError is the author's answer.
+        if (genericThrow && !(err instanceof ProtocolError) && !clientFacing(err)) {
+          // With no sink the record is never built: log it, or nobody sees it.
+          if (sinks.length === 0 || usage === null) {
+            log("serve.tool_threw", {
+              tool: name,
+              errorClass: className(err),
+              message: errorMessage(err),
+            });
+          }
+          return labeledError(`${name} failed`);
+        }
         throw err;
       } finally {
         release?.();

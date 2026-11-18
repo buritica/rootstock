@@ -42,6 +42,7 @@ export const TRANSPORT_EMPTY: ServeProfile = {
   bodyLimit: { oauth: null, bearer: null, local: null, none: null },
   deadlineMs: 1_000,
   unknownTool: "isError",
+  toolThrow: "message",
   requireCaller: true,
   oauthScopes: ["mcp:tools"],
   hostCheck: false,
@@ -115,6 +116,7 @@ export const HANDLER_JSON: ServeProfile = {
   bodyLimit: { oauth: 2_048, bearer: 8_192, local: 8_192, none: 2_048 },
   deadlineMs: null,
   unknownTool: "protocolError",
+  toolThrow: "generic",
   hostCheck: {
     hosts: {
       list: ["app.example.test"],

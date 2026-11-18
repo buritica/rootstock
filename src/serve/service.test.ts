@@ -766,10 +766,12 @@ describe("step 5.10 and the SDK-detail pin, under both entries over HTTP", () =>
   for (const profile of [
     { ...TRANSPORT_TEXT, unknownTool: "isError" as const },
     TRANSPORT_TEXT,
+    { ...TRANSPORT_TEXT, toolThrow: "generic" as const },
     HANDLER_JSON,
     { ...HANDLER_JSON, unknownTool: "isError" as const },
+    { ...HANDLER_JSON, toolThrow: "message" as const },
   ]) {
-    const label = `${profile.entry.kind}/${profile.unknownTool}`;
+    const label = `${profile.entry.kind}/${profile.unknownTool}/${profile.toolThrow}`;
     const send = async (body: unknown) => {
       const { service, records } = withAuth(profile);
       const res = await service.handle(mcpRequest(body, { token: "good:u", headers: HOST }), {});
@@ -801,8 +803,16 @@ describe("step 5.10 and the SDK-detail pin, under both entries over HTTP", () =>
 
     test(`${label}: a throwing tool`, async () => {
       const { rpc, records } = await send(call("boom"));
-      expect(rpc.result).toEqual({ content: [{ type: "text", text: "kaboom" }], isError: true });
-      expect(records[0]).toMatchObject({ stage: "handler", errorClass: "RangeError" });
+      const text = profile.toolThrow === "generic" ? '{"error":"boom failed"}' : "kaboom";
+      expect(JSON.stringify(rpc.result)).toBe(
+        JSON.stringify({ content: [{ type: "text", text }], isError: true }),
+      );
+      expect(records[0]).toMatchObject({
+        stage: "handler",
+        ok: false,
+        errorClass: "RangeError",
+        errorMessage: "kaboom",
+      });
     });
 
     test(`${label}: batch calls keep their own handles`, async () => {
@@ -959,6 +969,12 @@ describe("build-time refusals", () => {
       }),
     ).toThrow(/bodyLimit.oauth/);
     expect(() => makeService({ profile: HANDLER_JSON })).toThrow(/needs acceptCredentials/);
+  });
+  test("a profile without toolThrow (pre-0.13)", () => {
+    const { toolThrow: _, ...old } = TRANSPORT_EMPTY;
+    expect(() => makeService({ profile: old as ServeProfile })).toThrow(
+      /profile.toolThrow must be "message" or "generic"/,
+    );
   });
 });
 
