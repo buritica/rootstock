@@ -153,7 +153,8 @@ export const noLimits = (): Limits => ({
 /**
  * Bearer tokens: `good:<sub>` → next with that sub, `nosub` → next with no
  * sub, `jwks` / `nojwks` → the two JWKS throws, `jwksnet` → Better Auth's
- * network-error text, `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
+ * network-error text, `jwksconn` → older Bun's refused fetch (code
+ * ConnectionRefused), `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
  * 401 challenge.
  */
 export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
@@ -190,6 +191,15 @@ export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
       if (token === "jwks") throw new Error("Jwks failed: fetch refused");
       if (token === "nojwks") throw new Error("No jwks found");
       if (token === "jwksnet") throw new Error("JWKS fetch failed");
+      if (token === "jwksconn") {
+        // Bun before 1.4: a refused fetch is a plain Error with a code.
+        throw Object.assign(
+          new Error("Unable to connect. Is the computer able to access the url?"),
+          {
+            code: "ConnectionRefused",
+          },
+        );
+      }
       if (token === "jwkstimeout") {
         // jose's class: the code is the contract, the name is constructor.name.
         throw Object.assign(new Error("request timed out"), {

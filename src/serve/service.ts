@@ -144,13 +144,38 @@ const NO_REJECTION = Object.freeze({ rejection: undefined });
  * or an empty set (`No jwks found`). Both are a dependency failure, answered
  * with `bodies.jwksFailure`.
  */
+/**
+ * fetch's connection-failure codes. Bun before 1.4 rejects a refused or
+ * unresolvable fetch with a plain Error carrying one of these (not a
+ * TypeError), which Better Auth rethrows unwrapped instead of as
+ * "JWKS fetch failed"; verify's only network call is the JWKS fetch.
+ */
+const FETCH_CONNECT_CODES: ReadonlySet<string> = new Set([
+  "ConnectionRefused",
+  "ConnectionClosed",
+  "FailedToOpenSocket",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+]);
+
 function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
   try {
     if (!(err instanceof Error)) return undefined;
     // jose's timeout by its code, as Better Auth matches it: the class name a
     // minifier can rename, the code is a string field.
     const code: unknown = (err as { code?: unknown }).code;
-    if (err.message === "JWKS fetch failed" || code === "ERR_JWKS_TIMEOUT") return "unreachable";
+    if (
+      err.message === "JWKS fetch failed" ||
+      code === "ERR_JWKS_TIMEOUT" ||
+      (typeof code === "string" && FETCH_CONNECT_CODES.has(code))
+    ) {
+      return "unreachable";
+    }
     if (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found") return "failed";
     return undefined;
   } catch {
