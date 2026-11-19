@@ -26,13 +26,26 @@ const stalled = Bun.listen({
   port: 0,
   socket: { data() {}, open() {} },
 });
-// Bound, then closed: a refused connection (Better Auth's "JWKS fetch failed"
-// on Bun 1.4+, Bun's ConnectionRefused on 1.3; both log the same line).
+// Accepts, then closes on the request: a reset.
+const resets = Bun.listen({
+  hostname: "127.0.0.1",
+  port: 0,
+  socket: {
+    data(s) {
+      s.end();
+    },
+    open() {},
+  },
+});
+// Bound, then closed: a refused connection. Refused and reset are Better
+// Auth's "JWKS fetch failed" on Bun 1.4+, Bun's own codes on 1.3; both log the
+// same line.
 const refusedPort = quiet.port;
 quiet.stop(true);
 afterAll(() => {
   badGateway.stop(true);
   stalled.stop(true);
+  resets.stop(true);
 });
 
 async function answerFor(baseURL: string) {
@@ -72,6 +85,14 @@ async function answerFor(baseURL: string) {
 describe("the real verifier's JWKS throws (Better Auth 1.7.17, jose 6)", () => {
   test("a refused connection is unreachable: bodies.jwksFailure", async () => {
     expect(await answerFor(`http://127.0.0.1:${refusedPort}`)).toEqual({
+      status: 503,
+      retryAfter: "5",
+      threw: [["Error", true, true]],
+    });
+  });
+
+  test("a connection reset is unreachable: bodies.jwksFailure", async () => {
+    expect(await answerFor(`http://127.0.0.1:${resets.port}`)).toEqual({
       status: 503,
       retryAfter: "5",
       threw: [["Error", true, true]],

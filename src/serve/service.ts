@@ -143,9 +143,10 @@ const NO_REJECTION = Object.freeze({ rejection: undefined });
  * failed". Seen on 1.3.14: refused and unresolvable hosts give
  * ConnectionRefused, an unroutable IPv6 address FailedToOpenSocket. A reset is
  * errno ECONNRESET, which database drivers also throw (verify can touch the
- * DPoP replay store), so it counts only with Bun's own message. A TLS failure
- * on 1.3 (a certificate code) stays bodies.internal: a misconfiguration, not an
- * outage.
+ * DPoP replay store), so it counts only with Bun's own message. Not matched:
+ * a TLS failure on 1.3 (a certificate code) stays bodies.internal, where 1.4
+ * wraps it as "JWKS fetch failed". These codes name no URL, so on 1.3 a
+ * consumer verify's own failed fetch is labelled jwks too.
  */
 const BUN_FETCH_CONNECT_CODES: ReadonlySet<unknown> = new Set([
   "ConnectionRefused",
