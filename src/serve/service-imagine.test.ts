@@ -112,19 +112,21 @@ test("a deadline with the handler entry is refused at build", () => {
   );
 });
 
-test("JWKS fetch failed and JWKSTimeout log authUnreachable; the answer stays bodies.internal", async () => {
+test("JWKS fetch failed and JWKSTimeout are JWKS failures logged authUnreachable; other throws stay bodies.internal", async () => {
   const { service, log } = withAuth(TRANSPORT_TEXT);
+  const statuses: number[] = [];
   for (const token of ["jwksnet", "jwkstimeout", "throw"]) {
     const res = await service.handle(echo(token, { host: "app.example.test" }), {});
-    expect(res?.status).toBe(500);
+    statuses.push(res?.status ?? 0);
   }
+  expect(statuses).toEqual([503, 503, 500]);
   expect(
     log.lines
       .filter(([e]) => e === "serve.auth_threw")
       .map(([, f]) => [f.errorClass, f.authUnreachable ?? false, f.jwks ?? false]),
   ).toEqual([
-    ["Error", true, false],
-    ["JWKSTimeout", true, false],
+    ["Error", true, true],
+    ["JWKSTimeout", true, true],
     ["TypeError", false, false],
   ]);
 });

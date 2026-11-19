@@ -136,8 +136,14 @@ const UNPARSABLE: unique symbol = Symbol("unparsable");
 /** For `finish` on a body serve built itself: the rejection is known, so nothing is read. */
 const NO_REJECTION = Object.freeze({ rejection: undefined });
 
-/** `requireMcpAuth`'s JWKS failure texts (@better-auth/core oauth2/verify). */
+/**
+ * `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify):
+ * an HTTP error (`Jwks failed: …`), an empty set (`No jwks found`), or the
+ * auth server unreachable (see isAuthUnreachable). All three are a dependency
+ * failure, answered with `bodies.jwksFailure`.
+ */
 function isJwksFailure(err: unknown): boolean {
+  if (isAuthUnreachable(err)) return true;
   try {
     return (
       err instanceof Error &&
@@ -149,8 +155,8 @@ function isJwksFailure(err: unknown): boolean {
 }
 
 /**
- * The auth server could not be reached: Better Auth's network-error text or
- * jose's JWKS timeout. A log field only; the answer stays bodies.internal.
+ * The auth server could not be reached: Better Auth 1.7.17's network-error
+ * text or jose's JWKS timeout. A JWKS failure, logged with `authUnreachable`.
  */
 function isAuthUnreachable(err: unknown): boolean {
   try {
@@ -714,7 +720,7 @@ export function createMcpService(o: McpServiceOptions): McpService {
         chargeRefusal("serve.auth_threw", {
           errorClass: className(err),
           ...(jwks ? { jwks: true } : {}),
-          ...(!jwks && isAuthUnreachable(err) ? { authUnreachable: true } : {}),
+          ...(isAuthUnreachable(err) ? { authUnreachable: true } : {}),
           error: err,
         });
         return jwks
