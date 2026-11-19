@@ -137,24 +137,33 @@ const UNPARSABLE: unique symbol = Symbol("unparsable");
 const NO_REJECTION = Object.freeze({ rejection: undefined });
 
 /**
- * Bun's own fetch connection-failure codes. Bun before 1.4 rejects a refused
- * or unresolvable fetch with a plain Error carrying one of these (not a
- * TypeError), which Better Auth rethrows unwrapped instead of as
- * "JWKS fetch failed". Only Bun's names, never errno codes, so a database
- * driver's ECONNREFUSED (verify can touch the DPoP replay store) is not
- * mistaken for the JWKS.
+ * Bun 1.3's fetch connection failures. Bun 1.3 (CI's oldest) rejects a fetch
+ * that cannot connect with a plain Error carrying one of Bun's own codes, not
+ * a TypeError, which Better Auth rethrows unwrapped instead of as "JWKS fetch
+ * failed". Seen on 1.3.14: refused and unresolvable hosts give
+ * ConnectionRefused, an unroutable IPv6 address FailedToOpenSocket. A reset is
+ * errno ECONNRESET, which database drivers also throw (verify can touch the
+ * DPoP replay store), so it counts only with Bun's own message. A TLS failure
+ * on 1.3 (a certificate code) stays bodies.internal: a misconfiguration, not an
+ * outage.
  */
 const BUN_FETCH_CONNECT_CODES: ReadonlySet<unknown> = new Set([
   "ConnectionRefused",
-  "ConnectionClosed",
   "FailedToOpenSocket",
 ]);
+const BUN_FETCH_RESET = "The socket connection was closed unexpectedly";
+
+function isBunFetchConnectFailure(err: Error, code: unknown): boolean {
+  if (err.constructor !== Error) return false;
+  if (BUN_FETCH_CONNECT_CODES.has(code)) return true;
+  return code === "ECONNRESET" && err.message.startsWith(BUN_FETCH_RESET);
+}
 
 /**
  * Why `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify),
  * or undefined when the throw is something else. `"unreachable"`: the auth
- * server could not be reached (Better Auth 1.7.17's network-error text, older
- * Bun's fetch connection codes, jose's JWKS timeout). `"failed"`: it answered
+ * server could not be reached (Better Auth 1.7.17's network-error text, Bun
+ * 1.3's fetch connection failures, jose's JWKS timeout). `"failed"`: it answered
  * with an HTTP error (`Jwks failed: …`) or an empty set (`No jwks found`).
  * Both are a dependency failure, answered with `bodies.jwksFailure`.
  */
@@ -167,7 +176,7 @@ function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
     if (
       err.message === "JWKS fetch failed" ||
       code === "ERR_JWKS_TIMEOUT" ||
-      (err.constructor === Error && BUN_FETCH_CONNECT_CODES.has(code))
+      isBunFetchConnectFailure(err, code)
     ) {
       return "unreachable";
     }

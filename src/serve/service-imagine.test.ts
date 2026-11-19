@@ -112,21 +112,23 @@ test("a deadline with the handler entry is refused at build", () => {
   );
 });
 
-test("JWKS fetch failed, older Bun's connection codes and JWKSTimeout (matched by code) are JWKS failures logged authUnreachable; other throws stay bodies.internal", async () => {
+test("JWKS fetch failed, Bun 1.3's connection failures and JWKSTimeout (matched by code) are JWKS failures logged authUnreachable; a driver's errno code and other throws stay bodies.internal", async () => {
   const { service, log } = withAuth(TRANSPORT_TEXT);
   const statuses: number[] = [];
   for (const token of [
     "jwksnet",
     "jwksconn",
+    "jwksreset",
     "jwkstimeout",
     "jwkstimeout-min",
+    "jwksconn-sub",
     "dbconn",
     "throw",
   ]) {
     const res = await service.handle(echo(token, { host: "app.example.test" }), {});
     statuses.push(res?.status ?? 0);
   }
-  expect(statuses).toEqual([503, 503, 503, 503, 500, 500]);
+  expect(statuses).toEqual([503, 503, 503, 503, 503, 500, 500, 500]);
   expect(
     log.lines
       .filter(([e]) => e === "serve.auth_threw")
@@ -134,8 +136,10 @@ test("JWKS fetch failed, older Bun's connection codes and JWKSTimeout (matched b
   ).toEqual([
     ["Error", true, true],
     ["Error", true, true],
+    ["Error", true, true],
     ["JWKSTimeout", true, true],
     ["a", true, true],
+    ["TypeError", false, false],
     ["Error", false, false],
     ["TypeError", false, false],
   ]);

@@ -1,7 +1,8 @@
 // serve's JWKS classifier against the real verifier: defineAuth's verify
 // (Better Auth's requireMcpAuth) fetching its own <baseURL>/jwks from a server
 // that refuses the connection, answers an HTTP error, or never answers. The
-// classifier matches Better Auth's error texts and jose's error code; the fake
+// classifier matches Better Auth's error texts, jose's error code and Bun 1.3's
+// fetch connection codes; the fake
 // auth layer throws hand-made copies, so only these tests see an upstream
 // patch change them (the peer range admits every 1.7.x).
 
@@ -25,7 +26,8 @@ const stalled = Bun.listen({
   port: 0,
   socket: { data() {}, open() {} },
 });
-// Bound, then closed: a refused connection (Better Auth's "JWKS fetch failed").
+// Bound, then closed: a refused connection (Better Auth's "JWKS fetch failed"
+// on Bun 1.4+, Bun's ConnectionRefused on 1.3; both log the same line).
 const refusedPort = quiet.port;
 quiet.stop(true);
 afterAll(() => {

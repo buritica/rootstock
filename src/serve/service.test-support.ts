@@ -154,7 +154,9 @@ export const noLimits = (): Limits => ({
  * Bearer tokens: `good:<sub>` → next with that sub, `nosub` → next with no
  * sub, `jwks` / `nojwks` → the two JWKS throws, `jwksnet` → Better Auth's
  * network-error text, `jwksconn` → older Bun's refused fetch (code
- * ConnectionRefused), `dbconn` → a driver's ECONNREFUSED, `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
+ * ConnectionRefused), `jwksreset` → Bun 1.3's
+ * reset, `jwksconn-sub` → that code on a TypeError, `dbconn` → a node-style
+ * driver's ECONNREFUSED, `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
  * 401 challenge.
  */
 export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
@@ -200,8 +202,21 @@ export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
           },
         );
       }
+      if (token === "jwksreset") {
+        // Bun 1.3: a reset is errno ECONNRESET with Bun's own message.
+        throw Object.assign(
+          new Error(
+            "The socket connection was closed unexpectedly. For more information, pass `verbose: true`",
+          ),
+          { code: "ECONNRESET" },
+        );
+      }
+      if (token === "jwksconn-sub") {
+        // Bun's code on a TypeError: not Bun 1.3's plain fetch Error.
+        throw Object.assign(new TypeError("Unable to connect"), { code: "ConnectionRefused" });
+      }
       if (token === "dbconn") {
-        // A database driver's errno code (the DPoP replay store): not the JWKS.
+        // A node-style driver's errno code (postgres.js, pg): not the JWKS.
         throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
       }
       if (token === "jwkstimeout") {
