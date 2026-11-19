@@ -153,7 +153,7 @@ export const noLimits = (): Limits => ({
 /**
  * Bearer tokens: `good:<sub>` → next with that sub, `nosub` → next with no
  * sub, `jwks` / `nojwks` → the two JWKS throws, `jwksnet` → Better Auth's
- * network-error text, `jwkstimeout` → jose's JWKSTimeout, `throw` → a TypeError, `deny` → a 403; no token → a
+ * network-error text, `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
  * 401 challenge.
  */
 export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
@@ -191,7 +191,18 @@ export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
       if (token === "nojwks") throw new Error("No jwks found");
       if (token === "jwksnet") throw new Error("JWKS fetch failed");
       if (token === "jwkstimeout") {
-        throw Object.assign(new Error("request timed out"), { name: "JWKSTimeout" });
+        // jose's class: the code is the contract, the name is constructor.name.
+        throw Object.assign(new Error("request timed out"), {
+          name: "JWKSTimeout",
+          code: "ERR_JWKS_TIMEOUT",
+        });
+      }
+      if (token === "jwkstimeout-min") {
+        // A minified bundle: constructor.name renamed, the code intact.
+        throw Object.assign(new Error("request timed out"), {
+          name: "a",
+          code: "ERR_JWKS_TIMEOUT",
+        });
       }
       if (token === "deny") return new Response(null, { status: 403 });
       throw new TypeError("verifier broke");

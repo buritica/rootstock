@@ -147,7 +147,10 @@ const NO_REJECTION = Object.freeze({ rejection: undefined });
 function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
   try {
     if (!(err instanceof Error)) return undefined;
-    if (err.message === "JWKS fetch failed" || err.name === "JWKSTimeout") return "unreachable";
+    // jose's timeout by its code, as Better Auth matches it: the class name a
+    // minifier can rename, the code is a string field.
+    const code: unknown = (err as { code?: unknown }).code;
+    if (err.message === "JWKS fetch failed" || code === "ERR_JWKS_TIMEOUT") return "unreachable";
     if (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found") return "failed";
     return undefined;
   } catch {
