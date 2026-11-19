@@ -137,34 +137,21 @@ const UNPARSABLE: unique symbol = Symbol("unparsable");
 const NO_REJECTION = Object.freeze({ rejection: undefined });
 
 /**
- * `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify):
- * an HTTP error (`Jwks failed: …`), an empty set (`No jwks found`), or the
- * auth server unreachable (see isAuthUnreachable). All three are a dependency
- * failure, answered with `bodies.jwksFailure`.
+ * Why `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify),
+ * or undefined when the throw is something else. `"unreachable"`: the auth
+ * server could not be reached (Better Auth 1.7.17's network-error text, jose's
+ * JWKS timeout). `"failed"`: it answered with an HTTP error (`Jwks failed: …`)
+ * or an empty set (`No jwks found`). Both are a dependency failure, answered
+ * with `bodies.jwksFailure`.
  */
-function isJwksFailure(err: unknown): boolean {
-  if (isAuthUnreachable(err)) return true;
+function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
   try {
-    return (
-      err instanceof Error &&
-      (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found")
-    );
+    if (!(err instanceof Error)) return undefined;
+    if (err.message === "JWKS fetch failed" || err.name === "JWKSTimeout") return "unreachable";
+    if (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found") return "failed";
+    return undefined;
   } catch {
-    return false;
-  }
-}
-
-/**
- * The auth server could not be reached: Better Auth 1.7.17's network-error
- * text or jose's JWKS timeout. A JWKS failure, logged with `authUnreachable`.
- */
-function isAuthUnreachable(err: unknown): boolean {
-  try {
-    return (
-      err instanceof Error && (err.message === "JWKS fetch failed" || err.name === "JWKSTimeout")
-    );
-  } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -716,11 +703,11 @@ export function createMcpService(o: McpServiceOptions): McpService {
           return proceed(verified, { name: sub, kind: "oauth", scopes, claims });
         });
       } catch (err) {
-        const jwks = isJwksFailure(err);
+        const jwks = jwksFailureOf(err);
         chargeRefusal("serve.auth_threw", {
           errorClass: className(err),
           ...(jwks ? { jwks: true } : {}),
-          ...(isAuthUnreachable(err) ? { authUnreachable: true } : {}),
+          ...(jwks === "unreachable" ? { authUnreachable: true } : {}),
           error: err,
         });
         return jwks
