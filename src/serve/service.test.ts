@@ -323,9 +323,12 @@ describe("step 5.2–5.7: credentials", () => {
       },
     ],
   ] as const) {
-    test(`5.4: both JWKS texts answer ${profile.bodies.jwksFailure}, charged, logged auth_threw jwks`, async () => {
-      const { service, log } = withAuth(profile, { limits: limits({ refusal: bucket(2) }) });
-      for (const token of ["jwks", "nojwks"]) {
+    test(`5.4: the JWKS throws and an unreachable auth server answer ${profile.bodies.jwksFailure}, charged, logged auth_threw jwks`, async () => {
+      const throws = ["jwks", "nojwks", "jwksnet", "jwkstimeout"];
+      const { service, log } = withAuth(profile, {
+        limits: limits({ refusal: bucket(throws.length) }),
+      });
+      for (const token of throws) {
         const res = await service.handle(
           mcpRequest(call("echo", { text: "x" }), { token, headers: HOST }),
           {},
@@ -341,10 +344,14 @@ describe("step 5.2–5.7: credentials", () => {
         )?.status,
       ).toBe(429);
       expect(
-        log.lines.filter(([e]) => e === "serve.auth_threw").map(([, f]) => [f.errorClass, f.jwks]),
+        log.lines
+          .filter(([e]) => e === "serve.auth_threw")
+          .map(([, f]) => [f.errorClass, f.jwks, f.authUnreachable ?? false]),
       ).toEqual([
-        ["Error", true],
-        ["Error", true],
+        ["Error", true, false],
+        ["Error", true, false],
+        ["Error", true, true],
+        ["JWKSTimeout", true, true],
       ]);
     });
   }

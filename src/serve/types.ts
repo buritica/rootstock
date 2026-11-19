@@ -183,6 +183,10 @@ export interface ServeProfile {
   /** Response bytes that differ per consumer. */
   bodies: {
     unauthorizedNoSub: "jsonrpc-401" | "empty-401";
+    /**
+     * The verifier could not get the JWKS: an HTTP error, an empty set, or
+     * the auth server unreachable (network error or timeout; 0.13.1).
+     */
     jwksFailure: "503-retry" | "500-empty" | "jsonrpc-500";
     notFound: "empty-no-store" | "text-not-found" | "json-not-found";
     internal: "empty-500" | "json-500" | "text-500";

@@ -136,29 +136,55 @@ const UNPARSABLE: unique symbol = Symbol("unparsable");
 /** For `finish` on a body serve built itself: the rejection is known, so nothing is read. */
 const NO_REJECTION = Object.freeze({ rejection: undefined });
 
-/** `requireMcpAuth`'s JWKS failure texts (@better-auth/core oauth2/verify). */
-function isJwksFailure(err: unknown): boolean {
-  try {
-    return (
-      err instanceof Error &&
-      (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found")
-    );
-  } catch {
-    return false;
-  }
+/**
+ * Bun 1.3's fetch connection failures. Bun 1.3 (CI's oldest) rejects a fetch
+ * that cannot connect with a plain Error carrying one of Bun's own codes, not
+ * a TypeError, which Better Auth rethrows unwrapped instead of as "JWKS fetch
+ * failed". Seen on 1.3.14: refused and unresolvable hosts give
+ * ConnectionRefused, an unroutable IPv6 address FailedToOpenSocket. A reset is
+ * errno ECONNRESET, which database drivers also throw (verify can touch the
+ * DPoP replay store), so it counts only with Bun's own message. Not matched:
+ * a TLS failure on 1.3 (a certificate code) stays bodies.internal, where 1.4
+ * wraps it as "JWKS fetch failed". These codes name no URL, so on 1.3 a
+ * consumer verify's own failed fetch is labelled jwks too.
+ */
+const BUN_FETCH_CONNECT_CODES: ReadonlySet<unknown> = new Set([
+  "ConnectionRefused",
+  "FailedToOpenSocket",
+]);
+const BUN_FETCH_RESET = "The socket connection was closed unexpectedly";
+
+function isBunFetchConnectFailure(err: Error, code: unknown): boolean {
+  if (err.constructor !== Error) return false;
+  if (BUN_FETCH_CONNECT_CODES.has(code)) return true;
+  return code === "ECONNRESET" && err.message.startsWith(BUN_FETCH_RESET);
 }
 
 /**
- * The auth server could not be reached: Better Auth's network-error text or
- * jose's JWKS timeout. A log field only; the answer stays bodies.internal.
+ * Why `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify),
+ * or undefined when the throw is something else. `"unreachable"`: the auth
+ * server could not be reached (Better Auth 1.7.17's network-error text, Bun
+ * 1.3's fetch connection failures, jose's JWKS timeout). `"failed"`: it answered
+ * with an HTTP error (`Jwks failed: …`) or an empty set (`No jwks found`).
+ * Both are a dependency failure, answered with `bodies.jwksFailure`.
  */
-function isAuthUnreachable(err: unknown): boolean {
+function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
   try {
-    return (
-      err instanceof Error && (err.message === "JWKS fetch failed" || err.name === "JWKSTimeout")
-    );
+    if (!(err instanceof Error)) return undefined;
+    // jose's timeout by its code, as Better Auth matches it: the class name a
+    // minifier can rename, the code is a string field.
+    const code: unknown = (err as { code?: unknown }).code;
+    if (
+      err.message === "JWKS fetch failed" ||
+      code === "ERR_JWKS_TIMEOUT" ||
+      isBunFetchConnectFailure(err, code)
+    ) {
+      return "unreachable";
+    }
+    if (err.message.startsWith("Jwks failed: ") || err.message === "No jwks found") return "failed";
+    return undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -710,11 +736,11 @@ export function createMcpService(o: McpServiceOptions): McpService {
           return proceed(verified, { name: sub, kind: "oauth", scopes, claims });
         });
       } catch (err) {
-        const jwks = isJwksFailure(err);
+        const jwks = jwksFailureOf(err);
         chargeRefusal("serve.auth_threw", {
           errorClass: className(err),
           ...(jwks ? { jwks: true } : {}),
-          ...(!jwks && isAuthUnreachable(err) ? { authUnreachable: true } : {}),
+          ...(jwks === "unreachable" ? { authUnreachable: true } : {}),
           error: err,
         });
         return jwks

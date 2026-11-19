@@ -71,19 +71,18 @@ describe("the handler entry's legacy leg", () => {
 });
 
 describe("JWKS failure texts", () => {
-  // Better Auth's verify throws these three. The contract classifies the first
-  // two as JWKS failures; the network-error text is not one, because a
-  // consumer answers it with its generic 500 today.
-  test('"Jwks failed: …" and "No jwks found" are jwks; "JWKS fetch failed" is bodies.internal', async () => {
+  // Better Auth's verify throws these three. All are JWKS failures (rev 3.5):
+  // 1.7.17 throws "JWKS fetch failed" where 1.7.8 swallowed the network error.
+  test('"Jwks failed: …", "No jwks found" and "JWKS fetch failed" are jwks', async () => {
     const { service, log } = withAuth(TRANSPORT_TEXT);
     const statuses: number[] = [];
     for (const token of ["jwks", "nojwks", "jwksnet"]) {
       statuses.push((await service.handle(echo(token), {}))?.status ?? 0);
     }
-    expect(statuses).toEqual([503, 503, 500]);
+    expect(statuses).toEqual([503, 503, 503]);
     expect(
       log.lines.filter(([e]) => e === "serve.auth_threw").map(([, f]) => f.jwks ?? false),
-    ).toEqual([true, true, false]);
+    ).toEqual([true, true, true]);
   });
 });
 
