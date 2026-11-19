@@ -137,32 +137,27 @@ const UNPARSABLE: unique symbol = Symbol("unparsable");
 const NO_REJECTION = Object.freeze({ rejection: undefined });
 
 /**
- * Why `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify),
- * or undefined when the throw is something else. `"unreachable"`: the auth
- * server could not be reached (Better Auth 1.7.17's network-error text, jose's
- * JWKS timeout). `"failed"`: it answered with an HTTP error (`Jwks failed: …`)
- * or an empty set (`No jwks found`). Both are a dependency failure, answered
- * with `bodies.jwksFailure`.
- */
-/**
- * fetch's connection-failure codes. Bun before 1.4 rejects a refused or
- * unresolvable fetch with a plain Error carrying one of these (not a
+ * Bun's own fetch connection-failure codes. Bun before 1.4 rejects a refused
+ * or unresolvable fetch with a plain Error carrying one of these (not a
  * TypeError), which Better Auth rethrows unwrapped instead of as
- * "JWKS fetch failed"; verify's only network call is the JWKS fetch.
+ * "JWKS fetch failed". Only Bun's names, never errno codes, so a database
+ * driver's ECONNREFUSED (verify can touch the DPoP replay store) is not
+ * mistaken for the JWKS.
  */
-const FETCH_CONNECT_CODES: ReadonlySet<string> = new Set([
+const BUN_FETCH_CONNECT_CODES: ReadonlySet<unknown> = new Set([
   "ConnectionRefused",
   "ConnectionClosed",
   "FailedToOpenSocket",
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "ENOTFOUND",
-  "EAI_AGAIN",
-  "EHOSTUNREACH",
-  "ENETUNREACH",
-  "ETIMEDOUT",
 ]);
 
+/**
+ * Why `requireMcpAuth` could not get the JWKS (@better-auth/core oauth2/verify),
+ * or undefined when the throw is something else. `"unreachable"`: the auth
+ * server could not be reached (Better Auth 1.7.17's network-error text, older
+ * Bun's fetch connection codes, jose's JWKS timeout). `"failed"`: it answered
+ * with an HTTP error (`Jwks failed: …`) or an empty set (`No jwks found`).
+ * Both are a dependency failure, answered with `bodies.jwksFailure`.
+ */
 function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
   try {
     if (!(err instanceof Error)) return undefined;
@@ -172,7 +167,7 @@ function jwksFailureOf(err: unknown): "unreachable" | "failed" | undefined {
     if (
       err.message === "JWKS fetch failed" ||
       code === "ERR_JWKS_TIMEOUT" ||
-      (typeof code === "string" && FETCH_CONNECT_CODES.has(code))
+      (err.constructor === Error && BUN_FETCH_CONNECT_CODES.has(code))
     ) {
       return "unreachable";
     }

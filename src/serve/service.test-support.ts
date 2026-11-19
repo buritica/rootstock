@@ -154,7 +154,7 @@ export const noLimits = (): Limits => ({
  * Bearer tokens: `good:<sub>` → next with that sub, `nosub` → next with no
  * sub, `jwks` / `nojwks` → the two JWKS throws, `jwksnet` → Better Auth's
  * network-error text, `jwksconn` → older Bun's refused fetch (code
- * ConnectionRefused), `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
+ * ConnectionRefused), `dbconn` → a driver's ECONNREFUSED, `jwkstimeout` → jose's JWKSTimeout (`jwkstimeout-min`: its name minified), `throw` → a TypeError, `deny` → a 403; no token → a
  * 401 challenge.
  */
 export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
@@ -199,6 +199,10 @@ export function fakeAuth(): NonNullable<McpServiceOptions["auth"]> & {
             code: "ConnectionRefused",
           },
         );
+      }
+      if (token === "dbconn") {
+        // A database driver's errno code (the DPoP replay store): not the JWKS.
+        throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
       }
       if (token === "jwkstimeout") {
         // jose's class: the code is the contract, the name is constructor.name.
