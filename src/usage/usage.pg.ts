@@ -303,30 +303,38 @@ describe("postgresCallLog", () => {
       },
     ]);
   });
-  test("callLogRetentionStatus reads the oldest row by the server's clock", async () => {
+  test("callLogRetentionStatus reads the lag and age by the server's clock", async () => {
     const s = await migrated();
     const table = { schema: s, name: "mcp_calls" };
     const retention = { keepDays: 30 };
+    const insertAgo = (days: number) =>
+      sql.unsafe(
+        `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+         VALUES (now() - make_interval(days => ${days}), 'c', 't', '{}'::jsonb, 1, true)`,
+      );
     expect(await callLogRetentionStatus({ sql, table, retention })).toEqual({
       keepDays: 30,
       oldestAgeSeconds: null,
+      lagSeconds: null,
       overdue: false,
     });
-    await sql.unsafe(
-      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
-       VALUES (now() - make_interval(days => 31), 'c', 't', '{}'::jsonb, 1, true)`,
-    );
+    // Quiet: one row 40 days old and nothing since. Old, but no lag.
+    await insertAgo(40);
+    const quiet = await callLogRetentionStatus({ sql, table, retention });
+    expect(quiet.overdue).toBe(false);
+    expect(quiet.lagSeconds).toBe(0);
+    expect(quiet.oldestAgeSeconds).toBeGreaterThanOrEqual(40 * 86_400);
+    expect(quiet.oldestAgeSeconds).toBeLessThan(40 * 86_400 + 60);
+    // A call 9 days ago, so the lag is 31 days: within the slack.
+    await insertAgo(9);
     const inSlack = await callLogRetentionStatus({ sql, table, retention });
     expect(inSlack.overdue).toBe(false);
-    expect(inSlack.oldestAgeSeconds).toBeGreaterThanOrEqual(31 * 86_400);
-    expect(inSlack.oldestAgeSeconds).toBeLessThan(31 * 86_400 + 60);
-    await sql.unsafe(
-      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
-       VALUES (now() - make_interval(days => 33), 'c', 't', '{}'::jsonb, 1, true)`,
-    );
+    expect(inSlack.lagSeconds).toBeCloseTo(31 * 86_400, 0);
+    // A call now: the lag is 40 days, past 30 plus 2.
+    await insertAgo(0);
     expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
     expect((await callLogRetentionStatus({ sql, table, retention: null })).overdue).toBe(false);
-    expect((await callLogRetentionStatus({ sql, table, retention, slackDays: 5 })).overdue).toBe(
+    expect((await callLogRetentionStatus({ sql, table, retention, slackDays: 15 })).overdue).toBe(
       false,
     );
   });

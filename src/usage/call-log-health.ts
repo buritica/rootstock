@@ -3,10 +3,11 @@ import { intIn, KEEP_DAYS_MAX, KEEP_DAYS_MIN, q, quoteTable } from "../internal/
 import { configError } from "./errors.ts";
 
 /**
- * Days past `keepDays` the oldest row may reach before retention counts as
- * behind. A pass runs at most hourly and only when a call arrives, so a
- * quiet day leaves a row a day older than `keepDays`; two days is one quiet
- * day plus a pass that failed, and less than a third pass.
+ * Days past `keepDays` the retention may lag before it counts as behind. A
+ * pass runs at most hourly and takes at most `PRUNE_STEPS` steps, so a
+ * working retention keeps the lag within an hour or so of `keepDays` once a
+ * backlog is cleared; two days leaves room for a large first backlog and a
+ * failed pass, and is well short of a day of hourly failures.
  */
 export const RETENTION_SLACK_DAYS = 2;
 
@@ -23,36 +24,46 @@ export interface CallLogRetentionStatus {
   /** Seconds since the oldest row was created; null for an empty table. */
   readonly oldestAgeSeconds: number | null;
   /**
-   * True when the oldest row is more than `keepDays` plus the slack old:
-   * pruning failed, is not wired, or no call has come in for days. Always
-   * false without a retention.
+   * How old the oldest row was when the newest was written: the newest
+   * `created_at` minus the oldest; null for an empty table. A pass only runs
+   * when a call is recorded, so a quiet week ages the oldest row but leaves
+   * the lag alone, and only a retention that fails while calls arrive grows it.
+   */
+  readonly lagSeconds: number | null;
+  /**
+   * True when the lag is more than `keepDays` plus the slack: pruning is
+   * failing, is not wired, or the sink never runs a pass. Always false
+   * without a retention.
    */
   readonly overdue: boolean;
 }
 
-/** The one statement: `min(created_at)` reads one end of the `created_at` index. */
-export function callLogOldestAge(table: Table): string {
-  return `select extract(epoch from (now() - min(created_at)))::float8 as age from ${quoteTable(table)}`;
+/**
+ * The one statement: `min` and `max` of `created_at` read the two ends of its
+ * index (after a large prune, the old end walks dead entries until vacuum).
+ */
+export function callLogRetentionRead(table: Table): string {
+  return `select extract(epoch from (now() - min(created_at)))::float8 as age, extract(epoch from (max(created_at) - min(created_at)))::float8 as lag from ${quoteTable(table)}`;
 }
 
-function checkRetention(fn: string, retention: Retention): void {
-  if (
-    retention !== null &&
-    (typeof retention !== "object" || !intIn(retention.keepDays, KEEP_DAYS_MIN, KEEP_DAYS_MAX))
-  ) {
-    throw configError(
-      `${fn}: retention must be null or { keepDays: an integer from ${KEEP_DAYS_MIN} to ${KEEP_DAYS_MAX} } — got ${q(retention)}`,
-    );
+function seconds(raw: number | string | null | undefined, what: string): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new TypeError(`callLogRetentionStatus: the database answered ${what} ${q(raw)}`);
   }
+  return n;
 }
 
 /**
  * Whether the call log's retention is keeping up, from the table itself:
- * the age of its oldest row against `keepDays` plus `slackDays`
- * (`RETENTION_SLACK_DAYS` unless given). It sees every way pruning stops
- * (refused deletes, retention not wired, a sink that never runs a pass), not
- * only the ones a process counts, so it is the check to alert on. Pass the
- * same `retention` the sink got. One indexed read; a database error rejects.
+ * the lag between its oldest and newest rows against `keepDays` plus
+ * `slackDays` (`RETENTION_SLACK_DAYS` unless given). It sees every way
+ * pruning stops while calls arrive (refused deletes, retention not wired, a
+ * sink that never runs a pass), not only the ones a process counts, and a
+ * quiet spell does not trip it, so it is the check to alert on. Pass the same
+ * `retention` the sink got. One read; a database error rejects, so a caller
+ * that renders metrics catches it and renders the counters without a status.
  */
 export async function callLogRetentionStatus(o: {
   sql: Sql;
@@ -60,25 +71,33 @@ export async function callLogRetentionStatus(o: {
   retention: Retention;
   slackDays?: number;
 }): Promise<CallLogRetentionStatus> {
-  checkRetention("callLogRetentionStatus", o.retention);
+  const { retention } = o;
+  if (
+    retention !== null &&
+    (typeof retention !== "object" || !intIn(retention.keepDays, KEEP_DAYS_MIN, KEEP_DAYS_MAX))
+  ) {
+    throw configError(
+      `callLogRetentionStatus: retention must be null or { keepDays: an integer from ${KEEP_DAYS_MIN} to ${KEEP_DAYS_MAX} } — got ${q(retention)}`,
+    );
+  }
   const slackDays = o.slackDays ?? RETENTION_SLACK_DAYS;
   if (!intIn(slackDays, 0, SLACK_DAYS_MAX)) {
     throw configError(
       `callLogRetentionStatus: slackDays must be an integer from 0 to ${SLACK_DAYS_MAX} — got ${q(slackDays)}`,
     );
   }
-  const [row] = await o.sql.unsafe<{ age: number | string | null }>(callLogOldestAge(o.table), []);
-  const raw = row?.age ?? null;
-  const oldestAgeSeconds = raw === null ? null : Number(raw);
-  if (oldestAgeSeconds !== null && !Number.isFinite(oldestAgeSeconds)) {
-    throw configError(`callLogRetentionStatus: the database answered an age of ${q(raw)}`);
-  }
-  const keepDays = o.retention === null ? null : o.retention.keepDays;
+  // float8 arrives as a number from every supported driver; a string is
+  // accepted in case a driver is set to return numerics as text.
+  const [row] = await o.sql.unsafe<{ age: number | string | null; lag: number | string | null }>(
+    callLogRetentionRead(o.table),
+    [],
+  );
+  const oldestAgeSeconds = seconds(row?.age, "an age of");
+  const lagSeconds = seconds(row?.lag, "a lag of");
+  const keepDays = retention === null ? null : retention.keepDays;
   const overdue =
-    keepDays !== null &&
-    oldestAgeSeconds !== null &&
-    oldestAgeSeconds > (keepDays + slackDays) * DAY_SECONDS;
-  return { keepDays, oldestAgeSeconds, overdue };
+    keepDays !== null && lagSeconds !== null && lagSeconds > (keepDays + slackDays) * DAY_SECONDS;
+  return { keepDays, oldestAgeSeconds, lagSeconds, overdue };
 }
 
 /** The counts `postgresCallLog` keeps, as the metrics read them. */
@@ -95,13 +114,15 @@ const SINCE_START = `since this ${"pro"}${"cess"} started`;
 
 /**
  * The call log's Prometheus series, ending in a newline. The four counters
- * are the sink's own, ${SINCE_START} (read them with
- * increase()). With a `status`, two gauges follow:
- * `<prefix>_call_log_oldest_row_age_seconds` (0 for an empty table) and,
- * when there is a retention, `<prefix>_call_log_keep_seconds`, so an alert
- * reads `oldest_row_age_seconds > keep_seconds + slack` with no number
- * copied from the consumer. The first three series' HELP texts are word for
- * word the ones the first server to export them wrote.
+ * are the sink's own and start at 0 with it (read them with increase()).
+ * With a `status`, gauges follow: `<prefix>_call_log_retention_overdue`
+ * (0 or 1, the status's own verdict, so the slack lives in one place and the
+ * rule is `== 1`), `_retention_lag_seconds` and `_oldest_row_age_seconds`
+ * (0 for an empty table), and with a retention `_keep_seconds`. Read the
+ * status on each scrape beside the counters, not inside a cached body, and
+ * on a failed read render without it: the gauges go missing, so pair the
+ * rule with `absent()`. The first three series' HELP texts are word for word
+ * the ones the first server to export them wrote (mycel's `src/metrics.ts`).
  */
 export function renderCallLogMetrics(o: {
   prefix: string;
@@ -134,6 +155,14 @@ export function renderCallLogMetrics(o: {
   const { status } = o;
   if (status != null) {
     lines.push(
+      "",
+      `# HELP ${p}_retention_overdue 1 when the retention lags more than keepDays plus the slack behind the newest row, else 0`,
+      `# TYPE ${p}_retention_overdue gauge`,
+      `${p}_retention_overdue ${status.overdue ? 1 : 0}`,
+      "",
+      `# HELP ${p}_retention_lag_seconds Age of the oldest call-log row when the newest was written (0 when the table is empty)`,
+      `# TYPE ${p}_retention_lag_seconds gauge`,
+      `${p}_retention_lag_seconds ${status.lagSeconds ?? 0}`,
       "",
       `# HELP ${p}_oldest_row_age_seconds Age of the oldest call-log row by the database clock (0 when the table is empty)`,
       `# TYPE ${p}_oldest_row_age_seconds gauge`,
