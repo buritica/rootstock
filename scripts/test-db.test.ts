@@ -14,6 +14,7 @@ import {
   suitesUnder,
   TRANSACTORS,
   testsPassed,
+  testsSkipped,
 } from "./test-db.ts";
 
 const ROOT = `${import.meta.dir}/..`;
@@ -73,14 +74,22 @@ test("a hypotheses marker must match hypothesis() calls, both ways", () => {
   expect(markerProblem("a", `hypothesis("H1", f);`)).toContain("lacks");
   expect(markerProblem("a", `${marked}test("T", f);`)).toContain("calls no hypothesis()");
   expect(markerProblem("a", `test("T", f);`)).toBeNull();
+  // Prose and imports are not calls.
+  expect(markerProblem("a", `import { hypothesis } from "x";\n// see hypothesis(H1)\n`)).toBeNull();
+  expect(markerProblem("a", `// rootstock-test: driver-only (why)\n`)).toContain("unknown marker");
+});
+
+test("testsSkipped reads bun test's skip count, and 0 when there is none", () => {
+  expect(testsSkipped(" 3 pass\n 2 skip\n 0 fail\n")).toBe(2);
+  expect(testsSkipped(" 3 pass\n 0 fail\n")).toBe(0);
 });
 
 test("drizzle skips driver-only suites; --hypotheses runs only the marked ones", () => {
   const suites: Suite[] = [
-    { path: "plain", driverOnly: false, hypotheses: false },
-    { path: "driver", driverOnly: true, hypotheses: false },
-    { path: "both", driverOnly: true, hypotheses: true },
-    { path: "measured", driverOnly: false, hypotheses: true },
+    { path: "plain", driverOnly: false, hypotheses: false, conditional: 0 },
+    { path: "driver", driverOnly: true, hypotheses: false, conditional: 0 },
+    { path: "both", driverOnly: true, hypotheses: true, conditional: 0 },
+    { path: "measured", driverOnly: false, hypotheses: true, conditional: 0 },
   ];
   expect(suitesFor("drizzle", suites, false)).toEqual(["plain", "measured"]);
   expect(suitesFor("bun-sql", suites, false)).toEqual(["plain", "driver", "both", "measured"]);
@@ -100,10 +109,14 @@ test("this checkout's markers agree with its suites", async () => {
 
 test("the hypotheses workflow runs on a change to every hypotheses suite", async () => {
   const workflow = await Bun.file(`${ROOT}/.github/workflows/hypotheses.yml`).text();
+  const globs = [...workflow.matchAll(/^\s+- "(src\/[^"]+)"$/gm)].map(
+    (m) => new Bun.Glob(`${m[1]}`),
+  );
   const { suites } = await readSuites(ROOT, await suitesUnder(ROOT));
   const unwatched = suites
     .filter((s) => s.hypotheses)
     .map((s) => s.path.slice(2))
-    .filter((path) => !workflow.includes(`- "${path}"`));
+    .filter((path) => !globs.some((g) => g.match(path)));
   expect(unwatched).toEqual([]);
+  expect(globs.some((g) => g.match("src/lock/session.ts"))).toBe(true);
 });

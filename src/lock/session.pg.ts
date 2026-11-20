@@ -1,6 +1,6 @@
 // rootstock-test: driver-only
 // rootstock-test: hypotheses
-import { afterAll, beforeAll, describe, expect } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { bunSqlOptions, postgresJsOptions, type Sql } from "../db/index.ts";
 import { openSecond, type TestTransactor } from "../db/transactor.pg-support.ts";
 import {
@@ -242,37 +242,37 @@ describe("C-S1: a killed lock backend", () => {
     );
   }
 
-  hypothesis(
-    "X4: close() on a killed backend is bounded, and a second close() calls no driver",
-    async () => {
-      const { session, ends } = openCounted();
-      const [row] = await session.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
-      await killBackend(adminSql, Number(row?.pid));
-      const started = performance.now();
-      await session.close().catch(() => undefined);
-      expect(performance.now() - started).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
-      expect(ends()).toBe(1);
-      expect(await session.close()).toBeUndefined();
-      expect(ends()).toBe(1);
+  // X4 checks rootstock's own close() bound, so it runs on every PR.
+  test("X4: close() on a killed backend is bounded, and a second close() calls no driver", async () => {
+    const { session, ends } = openCounted();
+    const [row] = await session.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
+    await killBackend(adminSql, Number(row?.pid));
+    const started = performance.now();
+    await session.close().catch(() => undefined);
+    expect(performance.now() - started).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+    expect(ends()).toBe(1);
+    expect(await session.close()).toBeUndefined();
+    expect(ends()).toBe(1);
 
-      // A query that outlives the bound: close() still settles within it.
-      const busy = openCounted();
-      await busy.session.sql.unsafe("SELECT 1");
-      const sleeping = busy.session.sql.unsafe("SELECT pg_sleep(30)").catch(() => undefined);
-      await Bun.sleep(100);
-      const t0 = performance.now();
-      await busy.session.close().catch(() => undefined);
-      expect(performance.now() - t0).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
-      void sleeping;
-    },
-    15_000,
-  );
+    // A query that outlives the bound: close() still settles within it.
+    const busy = openCounted();
+    await busy.session.sql.unsafe("SELECT 1");
+    const sleeping = busy.session.sql.unsafe("SELECT pg_sleep(30)").catch(() => undefined);
+    await Bun.sleep(100);
+    const t0 = performance.now();
+    await busy.session.close().catch(() => undefined);
+    expect(performance.now() - t0).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+    void sleeping;
+  }, 15_000);
+
+  test("X5: a lock client's options carry no idle-timeout key", () => {
+    expect(Object.keys(postgresJsOptions(LOCK_CLIENT, "lock"))).not.toContain("idle_timeout");
+    expect(Object.keys(bunSqlOptions(LOCK_CLIENT, "lock"))).not.toContain("idleTimeout");
+  });
 
   hypothesis(
-    "X5: the driver-default idle timeout emits no key and keeps the session",
+    "X5: with the driver-default idle timeout the session stays on its backend",
     async () => {
-      expect(Object.keys(postgresJsOptions(LOCK_CLIENT, "lock"))).not.toContain("idle_timeout");
-      expect(Object.keys(bunSqlOptions(LOCK_CLIENT, "lock"))).not.toContain("idleTimeout");
       const s = openDedicated();
       try {
         const before = await probe(s.sql);

@@ -17,7 +17,7 @@ export const TEST_TRANSACTOR_KINDS = ["bun-sql", "postgres-js", "drizzle"] as co
 export type TestTransactorKind = (typeof TEST_TRANSACTOR_KINDS)[number];
 
 /** The driver a lock session runs on. */
-export type LockDriver = "postgres-js" | "bun-sql";
+export type LockDriver = Extract<TestTransactorKind, "postgres-js" | "bun-sql">;
 
 /**
  * The lock session's driver under a transactor kind: `drizzle` sits on

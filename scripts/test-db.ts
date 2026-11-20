@@ -40,15 +40,22 @@ export interface Suite {
   path: string;
   driverOnly: boolean;
   hypotheses: boolean;
+  /** `hypothesisIf` calls: the most hypothesis tests a hypotheses run may skip. */
+  conditional: number;
 }
 
 /** The markers in a suite's leading `//` lines. */
-export function markersOf(text: string): { driverOnly: boolean; hypotheses: boolean } {
+function headerOf(text: string): string[] {
   const header: string[] = [];
   for (const line of text.split("\n")) {
     if (!line.startsWith("//")) break;
     header.push(line.trim());
   }
+  return header;
+}
+
+export function markersOf(text: string): { driverOnly: boolean; hypotheses: boolean } {
+  const header = headerOf(text);
   return {
     driverOnly: header.includes(SUITE_MARKERS.driverOnly),
     hypotheses: header.includes(SUITE_MARKERS.hypotheses),
@@ -61,7 +68,10 @@ export function markersOf(text: string): { driverOnly: boolean; hypotheses: bool
  * the marker on a suite with none would run it for nothing.
  */
 export function markerProblem(path: string, text: string): string | null {
-  const calls = /\bhypothesis(?:If)?\(/.test(text);
+  const known = new Set<string>(Object.values(SUITE_MARKERS));
+  const unknown = headerOf(text).find((l) => l.startsWith("// rootstock-test:") && !known.has(l));
+  if (unknown !== undefined) return `${path} has an unknown marker "${unknown}"`;
+  const calls = /^\s*hypothesis(?:If\(.*?\))?\(/m.test(text);
   const marked = markersOf(text).hypotheses;
   if (calls && !marked) return `${path} calls hypothesis() but lacks "${SUITE_MARKERS.hypotheses}"`;
   if (marked && !calls) return `${path} is marked hypotheses but calls no hypothesis()`;
@@ -108,7 +118,8 @@ export async function readSuites(
   const problems: string[] = [];
   for (const path of paths) {
     const text = await Bun.file(`${root}/${path}`).text();
-    suites.push({ path, ...markersOf(text) });
+    const conditional = text.match(/^\s*hypothesisIf\(/gm)?.length ?? 0;
+    suites.push({ path, ...markersOf(text), conditional });
     const problem = markerProblem(path, text);
     if (problem !== null) problems.push(problem);
   }
@@ -122,6 +133,13 @@ export async function readSuites(
  */
 export function testsPassed(output: string): number {
   const counts = [...output.matchAll(/^\s*(\d+) pass$/gm)];
+  const last = counts.at(-1);
+  return last ? Number(last[1]) : 0;
+}
+
+/** How many tests a `bun test` run reports as skipped, or 0. The last summary wins. */
+export function testsSkipped(output: string): number {
+  const counts = [...output.matchAll(/^\s*(\d+) skip$/gm)];
   const last = counts.at(-1);
   return last ? Number(last[1]) : 0;
 }
@@ -163,6 +181,7 @@ async function runSuites(
   kind: string,
   suites: string[],
   hypotheses: boolean,
+  maxSkips: number,
 ): Promise<string | null> {
   // process.execPath, never "bun" from PATH: the oldest-Bun job must run its own Bun.
   const proc = Bun.spawn([process.execPath, "test", ...suites], {
@@ -185,6 +204,12 @@ async function runSuites(
   live.child = null;
   if (code !== 0) return `exited ${code}${proc.signalCode ? ` (${proc.signalCode})` : ""}`;
   if (testsPassed(stdout + stderr) === 0) return "reported 0 passing tests";
+  // A hypotheses run that skips more than its Bun-version cells allow did not
+  // get the switch: the plain tests in its suites would pass it anyway.
+  const skipped = testsSkipped(stdout + stderr);
+  if (hypotheses && skipped > maxSkips) {
+    return `skipped ${skipped} tests, at most ${maxSkips} expected — were the hypotheses switched on?`;
+  }
   return null;
 }
 
@@ -295,7 +320,16 @@ async function main(): Promise<number> {
       for (const kind of kinds) {
         const own = suitesFor(kind, suites, hypotheses);
         out(`\n=== ${name} · ${kind}: ${own.join(" ")} ===`);
-        const failure = await runSuites(await databaseFor(pg.url, kind), kind, own, hypotheses);
+        // No file arguments would make `bun test` run the whole repo.
+        if (own.length === 0) {
+          failures.push(`${name} · ${kind}: no suite selected`);
+          continue;
+        }
+        const maxSkips = suites
+          .filter((s) => own.includes(s.path))
+          .reduce((n, s) => n + s.conditional, 0);
+        const url = await databaseFor(pg.url, kind);
+        const failure = await runSuites(url, kind, own, hypotheses, maxSkips);
         if (failure !== null) failures.push(`${name} · ${kind}: ${failure}`);
       }
     } catch (err) {

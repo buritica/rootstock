@@ -128,15 +128,15 @@ export function otherDatabaseUrl(database: string): string {
 
 const HYPOTHESES = process.env[HYPOTHESES_ENV] === "1";
 
+/** A hypothesis test, further gated on `condition` (a Bun-version cell). */
+export function hypothesisIf(condition: boolean): typeof test {
+  return test.if(HYPOTHESES && condition);
+}
+
 /**
  * A D-S1 / C-S1 hypothesis test: a measurement of Postgres or driver
  * behaviour, not of rootstock code. Runs only under `bun run
  * test:db:hypotheses` (why: `.github/workflows/hypotheses.yml`); a suite that
  * uses it carries the `hypotheses` marker (`SUITE_MARKERS`).
  */
-export const hypothesis = test.if(HYPOTHESES);
-
-/** {@link hypothesis}, further gated on `condition` (a Bun-version cell). */
-export function hypothesisIf(condition: boolean): typeof test {
-  return test.if(HYPOTHESES && condition);
-}
+export const hypothesis = hypothesisIf(true);
