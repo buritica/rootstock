@@ -4,9 +4,11 @@
 # result moves only when Postgres, Bun or a driver does. The per-PR matrix in
 # ci.yml skips them; this workflow runs them on the changes that can move them
 # (the lockfile, the pinned images in scripts/test-db.ts, the Bun pin, the
-# suites, their support modules and the lock and db code they drive) and weekly, so a quiet month cannot let the
-# job rot unseen. Not part of `ci-pass`: a red run here names an assumption to
-# re-check, not a broken build.
+# suites, their support modules and the code they drive) and weekly, so a
+# quiet month cannot let the job rot unseen. Not part of `ci-pass`: a red run
+# here names an assumption to re-check, not a broken build. A red scheduled run
+# opens (or comments on) an issue, since GitHub notifies only the cron's last
+# editor.
 name: Hypotheses
 
 on:
@@ -16,6 +18,8 @@ on:
       - "scripts/test-db.ts"
       - "src/lock/**"
       - "src/db/**"
+      - "src/migrate/**"
+      - "src/internal/**"
       - "src/runs/spike.pg.ts"
       - "src/**/*.pg-support.ts"
       - ".github/workflows/hypotheses.yml"
@@ -45,3 +49,29 @@ jobs:
       bun-version: "1.3.14"
       install-args: "--no-save"
       command: "bun run test:db:hypotheses"
+
+  # A red scheduled run files nothing on its own and GitHub notifies only the
+  # cron's last editor, so open one issue (or comment on the open one).
+  report:
+    needs: [hypotheses, hypotheses-oldest-bun]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the failure issue
+        run: |
+          title="Hypotheses run failed"
+          body="The scheduled Hypotheses run failed: $RUN_URL. A red run names a Postgres or driver assumption to re-check."
+          open=$(gh issue list --state open --search "in:title $title" --json number --jq length)
+          if [ "$open" = "0" ]; then
+            gh issue create --title "$title" --body "$body"
+          else
+            number=$(gh issue list --state open --search "in:title $title" --json number --jq '.[0].number')
+            gh issue comment "$number" --body "$body"
+          fi
