@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IMAGES, suitesUnder, TRANSACTORS, testsPassed } from "./test-db.ts";
+import { IMAGES, selectMatrix, suitesUnder, TRANSACTORS, testsPassed } from "./test-db.ts";
 
 test("suites are the *.pg.ts files under src, ./-prefixed and sorted, never support modules", async () => {
   const root = await mkdtemp(join(tmpdir(), "test-db-"));
@@ -41,4 +41,22 @@ test("the matrix is two digest-pinned images by three transactor kinds", () => {
   ]);
   for (const image of IMAGES) expect(image).toMatch(/@sha256:[0-9a-f]{64}$/);
   expect([...TRANSACTORS]).toEqual(["bun-sql", "postgres-js", "drizzle"]);
+});
+
+test("selectMatrix with no flags is the whole matrix", () => {
+  expect(selectMatrix([])).toEqual({ images: [...IMAGES], transactors: [...TRANSACTORS] });
+});
+
+test("selectMatrix narrows to one image tag and one transactor", () => {
+  const picked = selectMatrix(["--image", "pg18", "--transactor", "drizzle"]);
+  expect(picked.images).toEqual([IMAGES[1]]);
+  expect(picked.transactors).toEqual(["drizzle"]);
+});
+
+test("selectMatrix refuses an unknown value instead of selecting nothing", () => {
+  expect(() => selectMatrix(["--image", "pg16"])).toThrow("--image must be one of pg17, pg18");
+  expect(() => selectMatrix(["--transactor", "knex"])).toThrow(
+    "--transactor must be one of bun-sql, postgres-js, drizzle",
+  );
+  expect(() => selectMatrix(["--bogus"])).toThrow();
 });
