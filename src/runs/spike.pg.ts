@@ -7,6 +7,7 @@ import {
 } from "../db/transactor.pg-support.ts";
 import { quoteTable } from "../internal/slice.ts";
 import {
+  hypothesis,
   lockDriver,
   openBunSqlClient,
   openPostgresJsClient,
@@ -195,136 +196,149 @@ describe("D-S1 run-record hypotheses (§14)", () => {
   // 74 rounds in 200, depending on the reading driver). The row reads not-live
   // within a few ms, and always once the backend has left pg_stat_activity;
   // pg_terminate_backend(pid, timeout) waits for that exit (the next case).
-  test("H1: after pg_terminate_backend of the holder, the row reads not-live once the backend is gone, within 100 ms", async () => {
-    for (let i = 0; i < 20; i += 1) {
-      const holder = openRaw();
-      const id = uuid();
-      try {
-        const pid = await holdAndStart(holder.sql, "alpha-sync", uuid(), id);
-        expect(await liveOf(id)).toEqual({ status: "running", live: true });
-        const terminated = performance.now();
-        await adminSql.unsafe("SELECT pg_terminate_backend($1)", [pid]);
-        const notLiveMs = await msUntil(async () => !(await liveOf(id)).live, terminated, 5_000);
-        expect(notLiveMs).toBeLessThan(100);
-        await msUntil(async () => !(await alive(pid)), terminated, 5_000);
-        expect(await liveOf(id)).toEqual({ status: "running", live: false });
-      } finally {
-        await holder.end().catch(() => {});
-      }
-    }
-  });
-
-  test("H1: with pg_terminate_backend's wait form, the very next statement reads not-live", async () => {
-    for (let i = 0; i < 10; i += 1) {
-      const holder = openRaw();
-      const id = uuid();
-      try {
-        const pid = await holdAndStart(holder.sql, "alpha-sync", uuid(), id);
-        const [t] = await adminSql.unsafe("SELECT pg_terminate_backend($1, 5000) AS ok", [pid]);
-        expect(truthy(t?.ok)).toBe(true);
-        expect(await liveOf(id)).toEqual({ status: "running", live: false });
-      } finally {
-        await holder.end().catch(() => {});
-      }
-    }
-  });
-
-  test("H2: after kill -9 of the holder's process, the server drops its backend and the lock within 1 s, and the next start settles its row", async () => {
-    const holder = uuid();
-    const id = uuid();
-    const child = Bun.spawn(
-      [
-        process.execPath,
-        new URL("./spike-child.pg-support.ts", import.meta.url).pathname,
-        driver,
-        s,
-        "beta-sync",
-        holder,
-        id,
-      ],
-      {
-        env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: testUrl() },
-        stdout: "pipe",
-        stderr: "ignore",
-      },
-    );
-    try {
-      const reader = child.stdout.getReader();
-      let text = "";
-      while (!text.includes("\n")) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        text += new TextDecoder().decode(chunk.value);
-      }
-      const { locked, pid } = JSON.parse(text) as { locked: unknown; pid: number };
-      expect(truthy(locked)).toBe(true);
-      expect(await liveOf(id)).toEqual({ status: "running", live: true });
-      const killed = performance.now();
-      child.kill(9);
-      const freedMs = await msUntil(async () => !(await held("beta-sync")), killed, 10_000);
-      const goneMs = await msUntil(async () => !(await alive(pid)), killed, 10_000);
-      expect(freedMs).toBeLessThan(1_000);
-      expect(goneMs).toBeLessThan(1_000);
-      expect(await liveOf(id)).toEqual({ status: "running", live: false });
-      const next = openRaw();
-      try {
-        const [l1] = await next.sql.unsafe(L1, ["beta-sync"]);
-        expect(truthy(l1?.locked)).toBe(true);
-        const successor = uuid();
-        await next.sql.unsafe(fence, ["beta-sync", successor]);
-        const started = await start(next.sql, uuid(), "beta-sync", successor);
-        expect(started).toEqual({ inserted: true, settled: [{ id, job: "alpha-sync" }] });
-        expect((await liveOf(id)).status).toBe("interrupted");
-      } finally {
-        await next.end();
-      }
-    } finally {
-      child.kill(9);
-      await child.exited;
-    }
-  });
-
-  test("H3: a black-holed holder keeps the lock until the proxy closes; its row reads live meanwhile, and no successor can start", async () => {
-    const proxy = startStallProxy();
-    const client =
-      driver === "bun-sql" ? openBunSqlClient(1, proxy.url) : openPostgresJsClient(1, proxy.url);
-    const sql = rawSql(client);
-    const id = uuid();
-    try {
-      const pid = await holdAndStart(sql, "shared-write", uuid(), id);
-      proxy.freeze({ forwardClose: false });
-      const other = openRaw();
-      try {
-        const frozen = performance.now();
-        while (performance.now() - frozen < 2_000) {
-          expect(await held("shared-write")).toBe(true);
+  hypothesis(
+    "H1: after pg_terminate_backend of the holder, the row reads not-live once the backend is gone, within 100 ms",
+    async () => {
+      for (let i = 0; i < 20; i += 1) {
+        const holder = openRaw();
+        const id = uuid();
+        try {
+          const pid = await holdAndStart(holder.sql, "alpha-sync", uuid(), id);
           expect(await liveOf(id)).toEqual({ status: "running", live: true });
-          const [l1] = await other.sql.unsafe(L1, ["shared-write"]);
-          expect(truthy(l1?.locked)).toBe(false);
-          // A would-be successor that never fenced starts nothing and settles nothing.
-          expect(await start(other.sql, uuid(), "shared-write", uuid())).toEqual({
-            inserted: false,
-            settled: [],
-          });
-          await Bun.sleep(200);
+          const terminated = performance.now();
+          await adminSql.unsafe("SELECT pg_terminate_backend($1)", [pid]);
+          const notLiveMs = await msUntil(async () => !(await liveOf(id)).live, terminated, 5_000);
+          expect(notLiveMs).toBeLessThan(100);
+          await msUntil(async () => !(await alive(pid)), terminated, 5_000);
+          expect(await liveOf(id)).toEqual({ status: "running", live: false });
+        } finally {
+          await holder.end().catch(() => {});
         }
-        expect(await alive(pid)).toBe(true);
-        const stopped = performance.now();
-        proxy.stop();
-        const freedMs = await msUntil(async () => !(await held("shared-write")), stopped, 5_000);
-        expect(freedMs).toBeLessThan(1_000);
-        expect(await liveOf(id)).toEqual({ status: "running", live: false });
-      } finally {
-        await other.end();
       }
-    } finally {
-      proxy.stop();
-      await (driver === "bun-sql"
-        ? (client as ReturnType<typeof openBunSqlClient>).close({ timeout: 0 })
-        : (client as ReturnType<typeof openPostgresJsClient>).end({ timeout: 0 })
-      ).catch(() => {});
-    }
-  }, 30_000);
+    },
+  );
+
+  hypothesis(
+    "H1: with pg_terminate_backend's wait form, the very next statement reads not-live",
+    async () => {
+      for (let i = 0; i < 10; i += 1) {
+        const holder = openRaw();
+        const id = uuid();
+        try {
+          const pid = await holdAndStart(holder.sql, "alpha-sync", uuid(), id);
+          const [t] = await adminSql.unsafe("SELECT pg_terminate_backend($1, 5000) AS ok", [pid]);
+          expect(truthy(t?.ok)).toBe(true);
+          expect(await liveOf(id)).toEqual({ status: "running", live: false });
+        } finally {
+          await holder.end().catch(() => {});
+        }
+      }
+    },
+  );
+
+  hypothesis(
+    "H2: after kill -9 of the holder's process, the server drops its backend and the lock within 1 s, and the next start settles its row",
+    async () => {
+      const holder = uuid();
+      const id = uuid();
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          new URL("./spike-child.pg-support.ts", import.meta.url).pathname,
+          driver,
+          s,
+          "beta-sync",
+          holder,
+          id,
+        ],
+        {
+          env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: testUrl() },
+          stdout: "pipe",
+          stderr: "ignore",
+        },
+      );
+      try {
+        const reader = child.stdout.getReader();
+        let text = "";
+        while (!text.includes("\n")) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          text += new TextDecoder().decode(chunk.value);
+        }
+        const { locked, pid } = JSON.parse(text) as { locked: unknown; pid: number };
+        expect(truthy(locked)).toBe(true);
+        expect(await liveOf(id)).toEqual({ status: "running", live: true });
+        const killed = performance.now();
+        child.kill(9);
+        const freedMs = await msUntil(async () => !(await held("beta-sync")), killed, 10_000);
+        const goneMs = await msUntil(async () => !(await alive(pid)), killed, 10_000);
+        expect(freedMs).toBeLessThan(1_000);
+        expect(goneMs).toBeLessThan(1_000);
+        expect(await liveOf(id)).toEqual({ status: "running", live: false });
+        const next = openRaw();
+        try {
+          const [l1] = await next.sql.unsafe(L1, ["beta-sync"]);
+          expect(truthy(l1?.locked)).toBe(true);
+          const successor = uuid();
+          await next.sql.unsafe(fence, ["beta-sync", successor]);
+          const started = await start(next.sql, uuid(), "beta-sync", successor);
+          expect(started).toEqual({ inserted: true, settled: [{ id, job: "alpha-sync" }] });
+          expect((await liveOf(id)).status).toBe("interrupted");
+        } finally {
+          await next.end();
+        }
+      } finally {
+        child.kill(9);
+        await child.exited;
+      }
+    },
+  );
+
+  hypothesis(
+    "H3: a black-holed holder keeps the lock until the proxy closes; its row reads live meanwhile, and no successor can start",
+    async () => {
+      const proxy = startStallProxy();
+      const client =
+        driver === "bun-sql" ? openBunSqlClient(1, proxy.url) : openPostgresJsClient(1, proxy.url);
+      const sql = rawSql(client);
+      const id = uuid();
+      try {
+        const pid = await holdAndStart(sql, "shared-write", uuid(), id);
+        proxy.freeze({ forwardClose: false });
+        const other = openRaw();
+        try {
+          const frozen = performance.now();
+          while (performance.now() - frozen < 2_000) {
+            expect(await held("shared-write")).toBe(true);
+            expect(await liveOf(id)).toEqual({ status: "running", live: true });
+            const [l1] = await other.sql.unsafe(L1, ["shared-write"]);
+            expect(truthy(l1?.locked)).toBe(false);
+            // A would-be successor that never fenced starts nothing and settles nothing.
+            expect(await start(other.sql, uuid(), "shared-write", uuid())).toEqual({
+              inserted: false,
+              settled: [],
+            });
+            await Bun.sleep(200);
+          }
+          expect(await alive(pid)).toBe(true);
+          const stopped = performance.now();
+          proxy.stop();
+          const freedMs = await msUntil(async () => !(await held("shared-write")), stopped, 5_000);
+          expect(freedMs).toBeLessThan(1_000);
+          expect(await liveOf(id)).toEqual({ status: "running", live: false });
+        } finally {
+          await other.end();
+        }
+      } finally {
+        proxy.stop();
+        await (driver === "bun-sql"
+          ? (client as ReturnType<typeof openBunSqlClient>).close({ timeout: 0 })
+          : (client as ReturnType<typeof openPostgresJsClient>).end({ timeout: 0 })
+        ).catch(() => {});
+      }
+    },
+    30_000,
+  );
 
   test("H4: in a rolling-deploy overlap, a waiting second process never settles the first's row", async () => {
     const open = () =>
@@ -411,20 +425,23 @@ describe("D-S1 run-record hypotheses (§14)", () => {
     expect(await adminSql.unsafe(`SELECT 1 FROM ${R} WHERE id = $1::uuid`, [id])).toEqual([]);
   });
 
-  test("H9: gen_random_uuid() in Q2's UPDATE gives a distinct token per row in one statement", async () => {
-    await adminSql.unsafe(
-      `INSERT INTO ${Q} (key, source, kind) SELECT 'alpha:' || i, 'alpha', 'put' FROM generate_series(1, 50) AS i`,
-    );
-    const first = await adminSql.unsafe(q2(Q), ["alpha", 30, 50, "expired", 5, "worker-a"]);
-    expect(first).toHaveLength(50);
-    const firstTokens = new Set(first.map((r) => String(r.claim_token)));
-    expect(firstTokens.size).toBe(50);
-    // A reclaim of every expired claim (timeout 0 minutes) mints 50 new distinct tokens.
-    const again = await adminSql.unsafe(q2(Q), ["alpha", 0, 50, "expired", 5, "worker-b"]);
-    const againTokens = new Set(again.map((r) => String(r.claim_token)));
-    expect(againTokens.size).toBe(50);
-    expect([...againTokens].filter((t) => firstTokens.has(t))).toEqual([]);
-  });
+  hypothesis(
+    "H9: gen_random_uuid() in Q2's UPDATE gives a distinct token per row in one statement",
+    async () => {
+      await adminSql.unsafe(
+        `INSERT INTO ${Q} (key, source, kind) SELECT 'alpha:' || i, 'alpha', 'put' FROM generate_series(1, 50) AS i`,
+      );
+      const first = await adminSql.unsafe(q2(Q), ["alpha", 30, 50, "expired", 5, "worker-a"]);
+      expect(first).toHaveLength(50);
+      const firstTokens = new Set(first.map((r) => String(r.claim_token)));
+      expect(firstTokens.size).toBe(50);
+      // A reclaim of every expired claim (timeout 0 minutes) mints 50 new distinct tokens.
+      const again = await adminSql.unsafe(q2(Q), ["alpha", 0, 50, "expired", 5, "worker-b"]);
+      const againTokens = new Set(again.map((r) => String(r.claim_token)));
+      expect(againTokens.size).toBe(50);
+      expect([...againTokens].filter((t) => firstTokens.has(t))).toEqual([]);
+    },
+  );
 });
 
 function lockDeps(events: LockEvent[]): LockDeps {

@@ -1,0 +1,48 @@
+# The D-S1 / C-S1 hypothesis tests (scripts/test-db.ts `--hypotheses`): what
+# Postgres and the drivers do when a lock backend is killed, stalled or blocked.
+# They measure Postgres and driver behaviour, not rootstock code, so their
+# result moves only when Postgres, Bun or a driver does. The per-PR matrix in
+# ci.yml skips them; this workflow runs them on the changes that can move them
+# (dependencies, the pinned images in scripts/test-db.ts, the Bun pin, the
+# suites and their support modules) and weekly, so a quiet month cannot let the
+# job rot unseen. Not part of `ci-pass`: a red run here names an assumption to
+# re-check, not a broken build.
+name: Hypotheses
+
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "bun.lock"
+      - "scripts/test-db.ts"
+      - "src/lock/block.pg.ts"
+      - "src/lock/session.pg.ts"
+      - "src/runs/spike.pg.ts"
+      - "src/**/*.pg-support.ts"
+      - ".github/workflows/hypotheses.yml"
+      - ".github/workflows/reusable-setup.yml"
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: hypotheses-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hypotheses:
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      command: "bun run test:db:hypotheses"
+
+  # The oldest supported Bun, as ci.yml's test-db-oldest-bun: the driver
+  # behaviour under test differs across Bun releases (A38).
+  hypotheses-oldest-bun:
+    uses: ./.github/workflows/reusable-setup.yml
+    with:
+      bun-version: "1.3.14"
+      install-args: "--no-save"
+      command: "bun run test:db:hypotheses"

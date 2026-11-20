@@ -1,3 +1,4 @@
+import { test } from "bun:test";
 import { SQL } from "bun";
 import postgres from "postgres";
 import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/index.ts";
@@ -117,3 +118,14 @@ export function openRaw(max = 1): { sql: Sql; end: () => Promise<void> } {
 export function otherDatabaseUrl(database: string): string {
   return testDatabaseUrlFor(database);
 }
+
+/**
+ * Whether the D-S1 / C-S1 hypothesis tests run: only under
+ * `bun run test:db:hypotheses` (scripts/test-db.ts `--hypotheses`). They
+ * measure Postgres and driver behaviour, which moves only with a Postgres,
+ * Bun or driver change, so the per-PR matrix skips them.
+ */
+export const HYPOTHESES = Bun.env.ROOTSTOCK_HYPOTHESES === "1";
+
+/** A hypothesis test: `test`, on only when {@link HYPOTHESES} is. */
+export const hypothesis = test.if(HYPOTHESES);

@@ -2,7 +2,17 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IMAGES, suitesUnder, TRANSACTORS, testsPassed } from "./test-db.ts";
+import {
+  DRIVER_ONLY_SUITES,
+  HYPOTHESIS_SUITES,
+  HYPOTHESIS_TRANSACTORS,
+  IMAGES,
+  missingListed,
+  suitesFor,
+  suitesUnder,
+  TRANSACTORS,
+  testsPassed,
+} from "./test-db.ts";
 
 test("suites are the *.pg.ts files under src, ./-prefixed and sorted, never support modules", async () => {
   const root = await mkdtemp(join(tmpdir(), "test-db-"));
@@ -41,4 +51,23 @@ test("the matrix is two digest-pinned images by three transactor kinds", () => {
   ]);
   for (const image of IMAGES) expect(image).toMatch(/@sha256:[0-9a-f]{64}$/);
   expect([...TRANSACTORS]).toEqual(["bun-sql", "postgres-js", "drizzle"]);
+});
+
+test("drizzle skips the driver-only suites; every other kind runs them all", () => {
+  const suites = ["./src/db/connect.pg.ts", ...DRIVER_ONLY_SUITES, "./src/runs/spike.pg.ts"];
+  expect(suitesFor("drizzle", suites)).toEqual([
+    "./src/db/connect.pg.ts",
+    "./src/runs/spike.pg.ts",
+  ]);
+  expect(suitesFor("bun-sql", suites)).toEqual(suites);
+  expect(suitesFor("postgres-js", suites)).toEqual(suites);
+});
+
+test("the hypotheses run on one kind per lock driver, never drizzle", () => {
+  expect([...HYPOTHESIS_TRANSACTORS]).toEqual(["bun-sql", "postgres-js"]);
+});
+
+test("every listed suite exists in this checkout, and a missing one is named", async () => {
+  expect(missingListed(await suitesUnder(`${import.meta.dir}/..`))).toEqual([]);
+  expect(missingListed(["./src/lock/block.pg.ts"])).toContain(HYPOTHESIS_SUITES[2]);
 });

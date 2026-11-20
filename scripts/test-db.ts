@@ -10,6 +10,9 @@ import {
 /**
  * The DB test matrix: every `src/**\/*.pg.ts` suite, once per transactor kind,
  * against each digest-pinned Postgres image, on the Bun running this script.
+ * The driver-only suites skip `drizzle` ({@link DRIVER_ONLY_SUITES}).
+ * `--hypotheses` runs only {@link HYPOTHESIS_SUITES}, with the hypothesis
+ * tests switched on, under one kind per lock driver.
  *
  * Red, never empty: it fails when docker is missing, when no suite is found,
  * when a container will not start, when any run exits non-zero, and when any
@@ -23,6 +26,50 @@ export const IMAGES = [
 ] as const;
 
 export const TRANSACTORS = TEST_TRANSACTOR_KINDS;
+
+/**
+ * Suites whose code under test talks to Postgres only through the lock
+ * session's driver. `lockDriver()` maps the `drizzle` kind to postgres.js, and
+ * these suites touch the transactor only to create and drop their schema, so
+ * a `drizzle` run of them repeats the `postgres-js` run. They skip `drizzle`.
+ * A suite that queries through `main.transactor` (run-lock, record, spike's
+ * H8) does not belong here.
+ */
+export const DRIVER_ONLY_SUITES = [
+  "./src/lock/block.pg.ts",
+  "./src/lock/session.pg.ts",
+  "./src/lock/stall.pg.ts",
+  "./src/lock/wait.pg.ts",
+] as const;
+
+/**
+ * The suites holding the D-S1 / C-S1 hypothesis tests: measurements of how
+ * Postgres and the drivers behave, not of rootstock code. Their result moves
+ * only when Postgres, Bun or a driver does, so they run under `--hypotheses`
+ * (the hypotheses workflow: dependency or image changes, and weekly), with
+ * `ROOTSTOCK_HYPOTHESES=1`, on the two lock drivers only.
+ */
+export const HYPOTHESIS_SUITES = [
+  "./src/lock/block.pg.ts",
+  "./src/lock/session.pg.ts",
+  "./src/runs/spike.pg.ts",
+] as const;
+
+/** The kinds the hypotheses run under: one per lock driver. */
+export const HYPOTHESIS_TRANSACTORS = ["bun-sql", "postgres-js"] as const;
+
+/** What one transactor kind runs: every suite, less the driver-only ones under `drizzle`. */
+export function suitesFor(kind: string, suites: readonly string[]): string[] {
+  if (kind !== "drizzle") return [...suites];
+  const skip = new Set<string>(DRIVER_ONLY_SUITES);
+  return suites.filter((s) => !skip.has(s));
+}
+
+/** Listed suites that no longer exist, so a rename cannot silently drop one from a list. */
+export function missingListed(suites: readonly string[]): string[] {
+  const found = new Set(suites);
+  return [...new Set([...DRIVER_ONLY_SUITES, ...HYPOTHESIS_SUITES])].filter((s) => !found.has(s));
+}
 
 const ROOT = `${import.meta.dir}/..`;
 
@@ -86,11 +133,21 @@ const live: { child: Bun.Subprocess | null; starting: boolean; exitCode: number 
   exitCode: null,
 };
 
-async function runSuites(url: string, kind: string, suites: string[]): Promise<string | null> {
+async function runSuites(
+  url: string,
+  kind: string,
+  suites: string[],
+  hypotheses: boolean,
+): Promise<string | null> {
   // process.execPath, never "bun" from PATH: the oldest-Bun job must run its own Bun.
   const proc = Bun.spawn([process.execPath, "test", ...suites], {
     cwd: ROOT,
-    env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: url, ROOTSTOCK_TEST_TRANSACTOR: kind },
+    env: {
+      ...process.env,
+      ROOTSTOCK_TEST_DATABASE_URL: url,
+      ROOTSTOCK_TEST_TRANSACTOR: kind,
+      ROOTSTOCK_HYPOTHESES: hypotheses ? "1" : "",
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -183,12 +240,22 @@ async function main(): Promise<number> {
     );
     return 1;
   }
-  const suites = await suitesUnder(ROOT);
-  if (suites.length === 0) {
+  const hypotheses = process.argv.includes("--hypotheses");
+  const all = await suitesUnder(ROOT);
+  if (all.length === 0) {
     out("test:db: no src/**/*.pg.ts suite found — refusing to pass empty");
     return 1;
   }
-  out(`test:db: Bun ${Bun.version}, suites: ${suites.join(" ")}`);
+  const missing = missingListed(all);
+  if (missing.length > 0) {
+    out(`test:db: listed suites not found — update scripts/test-db.ts: ${missing.join(" ")}`);
+    return 1;
+  }
+  const suites = hypotheses ? [...HYPOTHESIS_SUITES] : all;
+  const kinds: readonly string[] = hypotheses ? HYPOTHESIS_TRANSACTORS : TRANSACTORS;
+  out(
+    `test:db: Bun ${Bun.version}${hypotheses ? ", hypotheses" : ""}, suites: ${suites.join(" ")}`,
+  );
   const failures: string[] = [];
   for (const image of IMAGES) {
     const name = image.split("@")[0];
@@ -203,9 +270,10 @@ async function main(): Promise<number> {
       continue;
     }
     try {
-      for (const kind of TRANSACTORS) {
+      for (const kind of kinds) {
+        const own = hypotheses ? suites : suitesFor(kind, suites);
         out(`\n=== ${name} · ${kind} ===`);
-        const failure = await runSuites(await databaseFor(pg.url, kind), kind, suites);
+        const failure = await runSuites(await databaseFor(pg.url, kind), kind, own, hypotheses);
         if (failure !== null) failures.push(`${name} · ${kind}: ${failure}`);
       }
     } catch (err) {
@@ -218,7 +286,7 @@ async function main(): Promise<number> {
     out(`\ntest:db: FAILED\n${failures.map((f) => `  ${f}`).join("\n")}`);
     return 1;
   }
-  out(`\ntest:db: ${IMAGES.length * TRANSACTORS.length} runs passed`);
+  out(`\ntest:db: ${IMAGES.length * kinds.length} runs passed`);
   return 0;
 }
 

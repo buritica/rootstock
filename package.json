@@ -51,7 +51,8 @@
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:db": "bun scripts/test-db.ts"
+    "test:db": "bun scripts/test-db.ts",
+    "test:db:hypotheses": "bun scripts/test-db.ts --hypotheses"
   },
   "devDependencies": {
     "@better-auth/cimd": "1.7.17",

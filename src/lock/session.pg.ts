@@ -1,7 +1,8 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect } from "bun:test";
 import { bunSqlOptions, postgresJsOptions, type Sql } from "../db/index.ts";
 import { openSecond, type TestTransactor } from "../db/transactor.pg-support.ts";
 import {
+  hypothesis,
   killBackend,
   LOCK_CLIENT,
   lockDriver,
@@ -98,7 +99,7 @@ async function probe(sql: Sql): Promise<Probe> {
 
 describe("C-S1: a killed lock backend", () => {
   if (kind !== "drizzle") {
-    test("X1: on a max: 1 session the next query reconnects", async () => {
+    hypothesis("X1: on a max: 1 session the next query reconnects", async () => {
       const s = openDedicated();
       try {
         const [row] = await s.sql.unsafe<{ locked: boolean; pid: number }>(L1, ["alpha-sync"]);
@@ -140,35 +141,39 @@ describe("C-S1: a killed lock backend", () => {
     // see ECONNRESET wedged on the same-turn query. The code never relies on
     // it happening; the lock rests after any rejection (run-lock.pg.ts has
     // the no-settle kill case that goes red without that rest).
-    test("X1w: a query sent in the same turn as an ECONNRESET rejection wedges postgres.js", async () => {
-      const outcomes: string[] = [];
-      for (let attempt = 0; attempt < 10; attempt += 1) {
-        const s = openDedicated();
-        const [row] = await s.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
-        await killBackend(adminSql, Number(row?.pid));
-        const first = await probe(s.sql).then(
-          () => "resolved",
-          (err: unknown) => String((err as { code?: unknown }).code),
-        );
-        if (first === "ECONNRESET") {
-          const next = await Promise.race([
-            probe(s.sql).then(
-              () => "settled",
-              () => "settled",
-            ),
-            Bun.sleep(2_000).then(() => "never settled"),
-          ]);
-          outcomes.push(`ECONNRESET then ${next}`);
-        } else {
-          outcomes.push(first);
+    hypothesis(
+      "X1w: a query sent in the same turn as an ECONNRESET rejection wedges postgres.js",
+      async () => {
+        const outcomes: string[] = [];
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          const s = openDedicated();
+          const [row] = await s.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
+          await killBackend(adminSql, Number(row?.pid));
+          const first = await probe(s.sql).then(
+            () => "resolved",
+            (err: unknown) => String((err as { code?: unknown }).code),
+          );
+          if (first === "ECONNRESET") {
+            const next = await Promise.race([
+              probe(s.sql).then(
+                () => "settled",
+                () => "settled",
+              ),
+              Bun.sleep(2_000).then(() => "never settled"),
+            ]);
+            outcomes.push(`ECONNRESET then ${next}`);
+          } else {
+            outcomes.push(first);
+          }
+          s.close().catch(() => {});
         }
-        s.close().catch(() => {});
-      }
-      expect(outcomes).toHaveLength(10);
-      for (const o of outcomes.filter((o) => o.startsWith("ECONNRESET"))) {
-        expect(o).toBe("ECONNRESET then never settled");
-      }
-    }, 40_000);
+        expect(outcomes).toHaveLength(10);
+        for (const o of outcomes.filter((o) => o.startsWith("ECONNRESET"))) {
+          expect(o).toBe("ECONNRESET then never settled");
+        }
+      },
+      40_000,
+    );
   }
 
   if (kind === "bun-sql") {
@@ -176,7 +181,7 @@ describe("C-S1: a killed lock backend", () => {
     // rejects. Bun 1.4.2 says "connection must be a PostgresSQLConnection",
     // Bun 1.3.14 "Connection closed"; the claim pinned is that it never
     // recovers, whatever the message.
-    test("X2: a Bun.SQL pool.reserve() handle fails every later query", async () => {
+    hypothesis("X2: a Bun.SQL pool.reserve() handle fails every later query", async () => {
       const pool = openBunSqlClient(2);
       const reserved = await pool.reserve();
       try {
@@ -210,71 +215,83 @@ describe("C-S1: a killed lock backend", () => {
     // 'socket.write')` from its write path and the query never settles (the
     // child's watchdog exits 3); on Bun 1.3.14 the query rejects (exit 4).
     // The claim pinned is that the handle never answers on a fresh backend.
-    test("X3: a postgres.js pool.reserve() handle never answers after its backend is killed", async () => {
-      const child = Bun.spawn(
-        [process.execPath, `${import.meta.dir}/reserve-child.pg-support.ts`],
-        {
-          env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: testUrl() },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]);
-      expect(stdout).not.toBe("query resolved\n");
-      if (code === 3) {
-        expect(stdout).toBe("query never settled\n");
-        expect(stderr).toContain("TypeError");
-      } else {
-        expect(code).toBe(4);
-        expect(stdout).toStartWith("query rejected: ");
-      }
-    }, 15_000);
+    hypothesis(
+      "X3: a postgres.js pool.reserve() handle never answers after its backend is killed",
+      async () => {
+        const child = Bun.spawn(
+          [process.execPath, `${import.meta.dir}/reserve-child.pg-support.ts`],
+          {
+            env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: testUrl() },
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(stdout).not.toBe("query resolved\n");
+        if (code === 3) {
+          expect(stdout).toBe("query never settled\n");
+          expect(stderr).toContain("TypeError");
+        } else {
+          expect(code).toBe(4);
+          expect(stdout).toStartWith("query rejected: ");
+        }
+      },
+      15_000,
+    );
   }
 
   if (kind !== "drizzle") {
-    test("X4: close() on a killed backend is bounded, and a second close() calls no driver", async () => {
-      const { session, ends } = openCounted();
-      const [row] = await session.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
-      await killBackend(adminSql, Number(row?.pid));
-      const started = performance.now();
-      await session.close().catch(() => undefined);
-      expect(performance.now() - started).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
-      expect(ends()).toBe(1);
-      expect(await session.close()).toBeUndefined();
-      expect(ends()).toBe(1);
+    hypothesis(
+      "X4: close() on a killed backend is bounded, and a second close() calls no driver",
+      async () => {
+        const { session, ends } = openCounted();
+        const [row] = await session.sql.unsafe<{ pid: number }>(L1, ["alpha-sync"]);
+        await killBackend(adminSql, Number(row?.pid));
+        const started = performance.now();
+        await session.close().catch(() => undefined);
+        expect(performance.now() - started).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+        expect(ends()).toBe(1);
+        expect(await session.close()).toBeUndefined();
+        expect(ends()).toBe(1);
 
-      // A query that outlives the bound: close() still settles within it.
-      const busy = openCounted();
-      await busy.session.sql.unsafe("SELECT 1");
-      const sleeping = busy.session.sql.unsafe("SELECT pg_sleep(30)").catch(() => undefined);
-      await Bun.sleep(100);
-      const t0 = performance.now();
-      await busy.session.close().catch(() => undefined);
-      expect(performance.now() - t0).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
-      void sleeping;
-    }, 15_000);
+        // A query that outlives the bound: close() still settles within it.
+        const busy = openCounted();
+        await busy.session.sql.unsafe("SELECT 1");
+        const sleeping = busy.session.sql.unsafe("SELECT pg_sleep(30)").catch(() => undefined);
+        await Bun.sleep(100);
+        const t0 = performance.now();
+        await busy.session.close().catch(() => undefined);
+        expect(performance.now() - t0).toBeLessThan((SLICE.endTimeoutSeconds + 2) * 1000);
+        void sleeping;
+      },
+      15_000,
+    );
   }
 
-  test("X5: the driver-default idle timeout emits no key and keeps the session", async () => {
-    expect(Object.keys(postgresJsOptions(LOCK_CLIENT, "lock"))).not.toContain("idle_timeout");
-    expect(Object.keys(bunSqlOptions(LOCK_CLIENT, "lock"))).not.toContain("idleTimeout");
-    const s = openDedicated();
-    try {
-      const before = await probe(s.sql);
-      await Bun.sleep(3_000);
-      const after = await probe(s.sql);
-      expect(after.pid).toBe(before.pid);
-    } finally {
-      await s.close();
-    }
-  }, 10_000);
+  hypothesis(
+    "X5: the driver-default idle timeout emits no key and keeps the session",
+    async () => {
+      expect(Object.keys(postgresJsOptions(LOCK_CLIENT, "lock"))).not.toContain("idle_timeout");
+      expect(Object.keys(bunSqlOptions(LOCK_CLIENT, "lock"))).not.toContain("idleTimeout");
+      const s = openDedicated();
+      try {
+        const before = await probe(s.sql);
+        await Bun.sleep(3_000);
+        const after = await probe(s.sql);
+        expect(after.pid).toBe(before.pid);
+      } finally {
+        await s.close();
+      }
+    },
+    10_000,
+  );
 
   if (kind === "postgres-js") {
-    test("X6: the backoff expression's precedence", async () => {
+    hypothesis("X6: the backoff expression's precedence", async () => {
       const [row] = await adminSql.unsafe<{ a: number; b: number }>(
         "SELECT ('[1,5,30]'::jsonb ->> (least(0 + 1, 3) - 1))::int AS a, ('[1,5,30]'::jsonb ->> least(0, 3) - 1)::int AS b",
       );
