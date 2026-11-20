@@ -285,6 +285,66 @@ describe("record", () => {
     expect(env.events.map((e) => e.type)).toEqual(["runs.started", "runs.finished"]);
   });
 
+  test("recordOverride: on the running row at once, once; false and not held when the row is gone; refusals", async () => {
+    const env = await fresh();
+    const lock = await env.acquire("alpha-sync");
+    const run = await startRun(
+      sql,
+      env.runs,
+      { job: "alpha-sync", mode: "backfill", lock },
+      env.deps,
+    );
+    const onRow = async () =>
+      (
+        await sql.unsafe(`SELECT overrides::text AS o FROM ${env.R} WHERE id = $1::uuid`, [run.id])
+      )[0]?.o;
+    expect(await run.recordOverride("brake.alpha-archive")).toBe(true);
+    expect(await run.recordOverride("brake.alpha-archive")).toBe(true);
+    expect(await onRow()).toBe('["brake.alpha-archive"]');
+    // A bad flag rejects with the call's own name.
+    await expect(run.recordOverride("Bad Flag")).rejects.toThrow(/recordOverride\("Bad Flag"\)/);
+    // The row settled elsewhere: false, and the flag is not held for finish.
+    await sql.unsafe(
+      `UPDATE ${env.R} SET status = 'interrupted', finished_at = now() WHERE id = $1::uuid`,
+      [run.id],
+    );
+    expect(await run.recordOverride("brake.beta")).toBe(false);
+    await sql.unsafe(
+      `UPDATE ${env.R} SET status = 'running', finished_at = NULL WHERE id = $1::uuid`,
+      [run.id],
+    );
+    await run.finish("ok");
+    expect(await onRow()).toBe('["brake.alpha-archive"]');
+    // After settle: refused.
+    await expect(run.recordOverride("brake.gamma")).rejects.toThrow(/already finished/);
+  });
+
+  test("recordOverride: a database error rejects, emits runs.record_failed, and the flag is not held", async () => {
+    const env = await fresh();
+    const lock = await env.acquire("alpha-sync");
+    const run = await startRun(
+      sql,
+      env.runs,
+      { job: "alpha-sync", mode: "backfill", lock },
+      env.deps,
+    );
+    await sql.unsafe(`ALTER TABLE ${env.R} RENAME COLUMN overrides TO overrides_gone`);
+    try {
+      await expect(run.recordOverride("brake.alpha-archive")).rejects.toThrow();
+    } finally {
+      await sql.unsafe(`ALTER TABLE ${env.R} RENAME COLUMN overrides_gone TO overrides`);
+    }
+    expect(env.events.find((e) => e.type === "runs.record_failed")).toMatchObject({
+      operation: "override",
+    });
+    await run.finish("ok");
+    const [row] = await sql.unsafe(
+      `SELECT overrides::text AS o FROM ${env.R} WHERE id = $1::uuid`,
+      [run.id],
+    );
+    expect(row?.o).toBe("[]");
+  });
+
   test("RD2: settle — other holders' running rows under the lock, in id-text order", async () => {
     const env = await fresh();
     const b = await seed(env, {

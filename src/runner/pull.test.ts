@@ -100,6 +100,7 @@ describe("texts", () => {
         "rootstock runner: could not store the cursor on an empty listing: <why>",
       ],
       [{ kind: "threw", error: e }, "rootstock runner: run threw: <why>"],
+      [{ kind: "before-settle", error: e }, "rootstock runner: beforeSettle failed: <why>"],
       [{ kind: "identity" }, "rootstock runner: the buckets do not balance"],
     ];
     for (const [f, text] of cases) {
@@ -130,6 +131,7 @@ describe("runPull refusals, before any I/O", () => {
     ["mode", pullArgs({ mode: 3 })],
     ["describe", pullArgs({ describe: "x" })],
     ["reasonOf", pullArgs({ reasonOf: "x" })],
+    ["beforeSettle", pullArgs({ beforeSettle: "x" })],
     ["quota", pullArgs({ quota: { make: () => 1 } })],
   ])("%s", async (_name, a) => {
     expect(await code(runPull(a as never, deps))).toBe("ERR_ROOTSTOCK_RUNNER_INPUT");

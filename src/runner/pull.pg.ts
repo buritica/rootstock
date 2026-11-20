@@ -23,7 +23,7 @@ import {
   runRows,
 } from "./fixtures.pg-support.ts";
 import { planPull, runPull } from "./pull.ts";
-import type { PullArgs, PullFailure, PullReport } from "./types.ts";
+import type { BeforeSettleContext, PullArgs, PullFailure, PullReport } from "./types.ts";
 
 // R-D10 (contract §9): the pull runner against a real server, once per
 // transactor kind, each case in a schema of its own with rootstock's
@@ -90,6 +90,29 @@ const gatedLock = (real: RunLock, before: () => Promise<void> | void): RunLock =
   stopKeepalive: () => real.stopKeepalive(),
   release: () => real.release(),
 });
+
+/** A one-ref pull whose lock is lost at the first gate the hook itself makes. */
+async function hookLosesLock(
+  hook: (ctx: BeforeSettleContext) => void | Promise<void>,
+): Promise<{ env: RunnerEnv; report: PullReport }> {
+  const env = await fresh();
+  const real = await env.acquire("alpha-sync");
+  let inHook = false;
+  const lock = gatedLock(real, async () => {
+    if (inHook) {
+      await killLock(sql, "alpha-sync");
+      await env.acquire("alpha-sync");
+    }
+  });
+  const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+    lock,
+    beforeSettle: (ctx: BeforeSettleContext) => {
+      inHook = true;
+      return hook(ctx);
+    },
+  });
+  return { env, report };
+}
 
 const recs = (n: number, extra: Partial<Rec> = {}): Rec[] =>
   Array.from({ length: n }, (_, i) => ({ id: `r${i + 1}`, hash: `h${i + 1}`, ...extra }));
@@ -672,6 +695,266 @@ describe("the guard and the run record", () => {
       },
     });
     expect(seen).toEqual(["ok"]);
+  });
+
+  test("beforeSettle runs once on a clean run, gated, and its override and counter land on the row", async () => {
+    const env = await fresh();
+    const real = await env.acquire("alpha-sync");
+    let gates = 0;
+    const lock = gatedLock(real, () => {
+      gates += 1;
+    });
+    const seen: unknown[] = [];
+    let kept: BeforeSettleContext | undefined;
+    const report = await pull(env, memSource(env, main.transactor, recs(3)), {
+      lock,
+      beforeSettle: async (ctx: BeforeSettleContext) => {
+        const before = gates;
+        await ctx.ensureExclusive();
+        seen.push({
+          job: ctx.job,
+          mode: ctx.mode,
+          backfill: ctx.backfill,
+          listed: ctx.counts.listed,
+          written: ctx.counts.written,
+          gatedByHook: gates === before + 1,
+        });
+        // A repeated flag is recorded once, and is on the running row at once.
+        await ctx.override("brake.alpha-archive");
+        await ctx.override("brake.alpha-archive");
+        ctx.count("retracted", 4);
+        ctx.meter("model-a", 10, 20);
+        const [row] = await sql.unsafe(`SELECT status, overrides::text AS o FROM ${env.R}`);
+        seen.push(`${row?.status} ${row?.o}`);
+        kept = ctx;
+      },
+    });
+    expect(report.status).toBe("ok");
+    expect(seen).toEqual([
+      {
+        job: "alpha-sync",
+        mode: "incremental",
+        backfill: false,
+        listed: 3,
+        written: 3,
+        gatedByHook: true,
+      },
+      'running ["brake.alpha-archive"]',
+    ]);
+    const [row] = await sql.unsafe(
+      `SELECT status, phase, overrides::text AS overrides, counts->>'retracted' AS retracted, tokens->'model-a'->>'output' AS output FROM ${env.R}`,
+    );
+    expect(row).toMatchObject({
+      status: "ok",
+      phase: null,
+      overrides: '["brake.alpha-archive"]',
+      retracted: "4",
+      output: "20",
+    });
+    // The context refuses once the hook has returned.
+    expect(() => kept?.count("x")).toThrow(/ctx\.count\(\) called after the hook returned/);
+    await expect(kept?.override("x") as Promise<void>).rejects.toThrow(/after the hook returned/);
+    const bracket = env.events.filter((e) => e.type.startsWith("runner.before_settle"));
+    expect(bracket.map((e) => e.type)).toEqual([
+      "runner.before_settle_started",
+      "runner.before_settle_finished",
+    ]);
+    expect(bracket[1]).toMatchObject({ outcome: "ok" });
+  });
+
+  test("beforeSettle: an override outlives a row settled interrupted; once the row is gone, override refuses", async () => {
+    const env = await fresh();
+    let refused: unknown;
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      beforeSettle: async (ctx: BeforeSettleContext) => {
+        await ctx.override("brake.alpha-archive");
+        // What the next run does to a killed run's row: settles it interrupted.
+        await sql.unsafe(`UPDATE ${env.R} SET status = 'interrupted', finished_at = now()`);
+        refused = await ctx.override("brake.beta").then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      },
+    });
+    expect(String((refused as Error)?.message)).toContain("no longer running");
+    // A refused override fails the run even when the hook caught it.
+    expect(report.failure?.kind).toBe("before-settle");
+    expect(report.finish).toMatchObject({ written: false, why: "settled-elsewhere" });
+    const [row] = await sql.unsafe(`SELECT status, overrides::text AS o FROM ${env.R}`);
+    expect(row).toMatchObject({ status: "interrupted", o: '["brake.alpha-archive"]' });
+  });
+
+  test("beforeSettle: a throw settles before-settle, not rethrown; a bad flag is a throw", async () => {
+    const env = await fresh();
+    const report = await pull(env, memSource(env, main.transactor, recs(2)), {
+      beforeSettle: async (ctx: BeforeSettleContext) => {
+        await ctx.override("Not A Flag");
+      },
+    });
+    expect(report.status).toBe("failed");
+    expect(report.failure?.kind).toBe("before-settle");
+    expect(report.written).toBe(2);
+    const [row] = await sql.unsafe(`SELECT status, phase, written, reason FROM ${env.R}`);
+    expect(row).toMatchObject({ status: "failed", phase: "before-settle", written: 2 });
+    expect(String(row?.reason)).toStartWith("rootstock runner: beforeSettle failed: ");
+    const finished = env.events.find((e) => e.type === "runner.before_settle_finished");
+    expect(finished).toMatchObject({ outcome: "before-settle" });
+    expect(String((finished as { error?: Error }).error?.message)).toContain("Not A Flag");
+  });
+
+  test("beforeSettle: an override the hook never awaited still fails the run when it is refused", async () => {
+    const env = await fresh();
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      beforeSettle: (ctx: BeforeSettleContext) => {
+        void ctx.override("Not A Flag");
+      },
+    });
+    expect(report.failure?.kind).toBe("before-settle");
+    const [row] = await sql.unsafe(`SELECT status, phase FROM ${env.R}`);
+    expect(row).toMatchObject({ status: "failed", phase: "before-settle" });
+  });
+
+  test("beforeSettle is not called on a failed run, and sees backfill", async () => {
+    const env = await fresh();
+    let called = 0;
+    const failing = memSource(env, main.transactor, recs(2));
+    failing.list = async () => {
+      throw new Error("listing down");
+    };
+    const failed = await pull(env, failing, {
+      beforeSettle: () => {
+        called += 1;
+      },
+    });
+    expect(failed.failure?.kind).toBe("list");
+    // A quota trip on the listing's last ref: everything committed, still failed.
+    const tripped = await pull(
+      env,
+      memSource(
+        env,
+        main.transactor,
+        Array.from({ length: 5 }, (_, i) => ({ id: `q${i}`, hash: `${i}`, quota: true })),
+      ),
+      {
+        quota: {
+          make: (d: Parameters<typeof consecutiveBreaker>[2]) =>
+            consecutiveBreaker("alpha-quota", env.runs, d),
+          isQuota: (e: unknown) => e instanceof QuotaError,
+        },
+        beforeSettle: () => {
+          called += 1;
+        },
+      },
+    );
+    expect(tripped.failure?.kind).toBe("quota");
+    expect(called).toBe(0);
+    const backfills: boolean[] = [];
+    await pull(env, memSource(env, main.transactor, recs(1), { boundedBackfill: true }), {
+      since: new Date(0),
+      beforeSettle: (ctx: BeforeSettleContext) => {
+        backfills.push(ctx.backfill);
+      },
+    });
+    expect(backfills).toEqual([true]);
+  });
+
+  test("beforeSettle: the lock lost at the gate before the hook settles lost-lock and never calls it", async () => {
+    // A probe run counts the gates up to the hook: the last is the hook's own.
+    const probeEnv = await fresh();
+    const probeReal = await probeEnv.acquire("alpha-sync");
+    let probeGates = 0;
+    let atHook = 0;
+    await pull(probeEnv, memSource(probeEnv, main.transactor, recs(1)), {
+      lock: gatedLock(probeReal, () => {
+        probeGates += 1;
+      }),
+      beforeSettle: () => {
+        atHook = probeGates;
+      },
+    });
+    expect(atHook).toBeGreaterThan(1);
+    await probeReal.release();
+
+    const env = await fresh();
+    const real = await env.acquire("alpha-sync");
+    let called = 0;
+    let gates = 0;
+    const lock = gatedLock(real, async () => {
+      gates += 1;
+      if (gates === atHook) {
+        await killLock(sql, "alpha-sync");
+        await env.acquire("alpha-sync");
+      }
+    });
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      lock,
+      beforeSettle: () => {
+        called += 1;
+      },
+    });
+    expect(report.failure?.kind).toBe("lost-lock");
+    expect(report.written).toBe(1);
+    expect(called).toBe(0);
+  });
+
+  test("beforeSettle: the lock lost at the hook's own gate settles lost-lock, even when the hook rethrows something else", async () => {
+    const { env, report } = await hookLosesLock(async (ctx) => {
+      await ctx.ensureExclusive().catch(() => {
+        throw new Error("wrapped");
+      });
+    });
+    expect(report.failure?.kind).toBe("lost-lock");
+    const [row] = await runRows(sql, env);
+    expect(String(row?.reason)).toStartWith("rootstock runner: lost the run lock: ");
+  });
+
+  test("beforeSettle: a lock refusal the hook swallows still settles lost-lock", async () => {
+    const { report } = await hookLosesLock(async (ctx) => {
+      await ctx.ensureExclusive().catch(() => undefined);
+    });
+    expect(report.status).toBe("failed");
+    expect(report.failure?.kind).toBe("lost-lock");
+  });
+
+  test("beforeSettle: a gate the hook never awaited still settles lost-lock", async () => {
+    const { env, report } = await hookLosesLock((ctx) => {
+      void ctx.ensureExclusive().catch(() => undefined);
+    });
+    expect(report.failure?.kind).toBe("lost-lock");
+    const [row] = await sql.unsafe(`SELECT phase FROM ${env.R}`);
+    expect(row?.phase).toBe("before-settle");
+  });
+
+  test("beforeSettle: the counts are a frozen copy; the runner's own counters and a bad name refuse", async () => {
+    const env = await fresh();
+    const src = memSource(env, main.transactor, recs(1), {
+      excluded: [{ reason: "draft", count: 2 }],
+    });
+    const refusals: string[] = [];
+    const report = await pull(env, src, {
+      beforeSettle: (ctx: BeforeSettleContext) => {
+        const entry = ctx.counts.excludedReasons[0] as { count: number };
+        expect(() => {
+          entry.count = 999;
+        }).toThrow(TypeError);
+        for (const name of ["fetched", "repointed", "Bad Name"]) {
+          try {
+            ctx.count(name);
+          } catch (e) {
+            refusals.push(`${name}: ${String(runnerErrorCode(e) ?? (e as Error).name)}`);
+          }
+        }
+      },
+    });
+    expect(report.status).toBe("ok");
+    expect(report.excludedReasons).toEqual([{ reason: "draft", count: 2 }]);
+    expect(refusals).toEqual([
+      "fetched: ERR_ROOTSTOCK_RUNNER_INPUT",
+      "repointed: ERR_ROOTSTOCK_RUNNER_INPUT",
+      expect.stringMatching(/^Bad Name: /),
+    ]);
+    const [row] = await runRows(sql, env);
+    expect(JSON.parse(String(row?.counts))).toMatchObject({ fetched: 1 });
   });
 
   test("F2: a run record that cannot start is START, cause kept, nothing listed", async () => {
