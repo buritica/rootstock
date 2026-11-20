@@ -297,7 +297,7 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
           migrate: {},
           concurrency: { widths: { fetch: { default: 1, max: 1 } } },
           usage: {
-            callLog: { maxBuffered: 100, maxBatch: 10 },
+            callLog: { maxBuffered: 100, maxBatch: 10, retention: null },
             keepArgs: true,
             keepOutput: true,
             spend: { unit: "tokens", ceiling: 100, store: { kind: "rootstock" } },
@@ -379,6 +379,7 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
 
         const sql = main.transactor.sql;
         const sink = postgresCallLog({
+          retention: null,
           sql,
           table: callLog.table,
           maxBuffered: callLog.maxBuffered,

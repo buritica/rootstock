@@ -43,6 +43,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 100,
@@ -141,6 +142,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 1000,
@@ -185,6 +187,7 @@ describe("postgresCallLog", () => {
       await locked;
       const { log } = captureLog();
       const sink = postgresCallLog({
+        retention: null,
         sql,
         table: { schema: s, name: "mcp_calls" },
         maxBuffered: 10,
@@ -230,6 +233,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 100,
@@ -276,6 +280,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "no_such_table" },
       maxBuffered: 10,
@@ -295,6 +300,34 @@ describe("postgresCallLog", () => {
           failedBatches: 1,
         },
       },
+    ]);
+  });
+  test("retention deletes rows older than keepDays and keeps the rest", async () => {
+    const s = await migrated();
+    // Ages in days: three past a 30-day cutoff, two inside it.
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(days => d), 'c', 'aged-' || d, '{}'::jsonb, 1, true
+       FROM unnest(ARRAY[400, 90, 31, 29, 1]) AS d`,
+    );
+    const { log, events } = captureLog();
+    const sink = postgresCallLog({
+      sql,
+      table: { schema: s, name: "mcp_calls" },
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: { keepDays: 30 },
+      clock: manualClock(),
+      log,
+    });
+    sink.record(callRecord({ tool: "fresh" }));
+    await sink.idle();
+    const left = await sql.unsafe<{ tool: string }>(
+      `SELECT tool FROM "${s}".mcp_calls ORDER BY tool`,
+    );
+    expect(left.map((r) => r.tool)).toEqual(["aged-1", "aged-29", "fresh"]);
+    expect(events).toEqual([
+      { event: "usage.call_log_pruned", fields: { deleted: 3, keepDays: 30, more: false } },
     ]);
   });
 });
