@@ -640,7 +640,30 @@ process.on("SIGTERM", async () => {
   breaking): set `callLog.retention` in the usage slice (`null` keeps
   0.13's behavior, every row) and pass `retention` (plus `clock` when it is
   not null) to `postgresCallLog`; a printed config gains
-  `usage.callLog.retention`. Both
+  `usage.callLog.retention`.
+- **Alert on the table, not the process.** `callLogRetentionStatus({ sql,
+  table, retention })` reads both ends of `created_at` by the database clock
+  and says `overdue` once the oldest row was more than `keepDays` plus
+  `RETENTION_SLACK_DAYS` (2, or `slackDays`) old when the newest row over an
+  hour old was written. That lag sees every way pruning stops while rows
+  still land (refused
+  deletes, retention not wired, a sink that never prunes), where a process's
+  counters see only their own failures, and a quiet week (no calls, so no
+  pass) does not trip it, nor does the first call after one (its row
+  waits an hour before it counts, and its pass runs first). A first backlog
+  bigger than one pass reads overdue until it clears. When inserts fail
+  too the lag freezes; alert on `_failed_batches_total` for that. `renderCallLogMetrics({ prefix, table, counts:
+  sink, status })` renders the sink's four counters
+  (`<prefix>_call_log_dropped_total`, `_failed_batches_total`,
+  `_prune_failures_total`, `_pruned_rows_total`) and, with a status,
+  `<prefix>_call_log_retention_overdue` (0 or 1),
+  `_retention_lag_seconds`, `_oldest_row_age_seconds` and `_keep_seconds`.
+  Alert on `retention_overdue == 1`, so the slack lives in one place. Read
+  the status on every scrape beside the counters, not in a cached body; on a
+  database error render with `status: null`, so the counters stay, and
+  pair the rule with `absent(..._retention_overdue)`. A consumer without
+  Prometheus runs the status from a scheduled check instead. Added in
+  0.16.0. Both
   rootstock migrations (`mcp_calls`,
   `spend`) are additive and run with rootstock's own (`applyRootstockMigrations`
   or `migrateCli`).
