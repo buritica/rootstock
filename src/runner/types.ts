@@ -134,12 +134,17 @@ export interface PullArgs<R extends PullRef, D extends PullDoc, N> {
   mismatchReason?: (asked: string, got: unknown) => string;
   afterRun?: (row: RunRow) => void | Promise<void>;
   /**
-   * Work that belongs to the run and needs its whole listing, such as
+   * Work that belongs to the run and needs its listing to be over, such as
    * retracting what the source no longer lists. Called once, after every
    * batch committed and the buckets balance, with the lock gated just before,
-   * while the row is still running: what it records (an override, a counter)
-   * lands on this run's row. Not called on a failed run. A throw settles the
-   * run failed (`before-settle`); the error is not rethrown.
+   * while the row is still running: what it records (an override, a counter,
+   * tokens) lands on this run's row. Not called on a failed run. Called on an
+   * empty listing too, and on an incremental run whose listing started from a
+   * cursor: only the source knows whether its listing covered everything, so
+   * a hook that removes what was not listed checks that itself. The hook
+   * bounds its own time: one that never resolves keeps the row running and
+   * the lock held. A throw settles the run failed (`before-settle`); the
+   * error is not rethrown.
    */
   beforeSettle?: (ctx: BeforeSettleContext) => void | Promise<void>;
 }
@@ -151,19 +156,20 @@ export interface BeforeSettleContext {
   readonly runId: string;
   /** True on a backfill: the listing covered a window, not the whole source. */
   readonly backfill: boolean;
-  /** The run's buckets and counters as they will be settled. */
+  /** The run's buckets and counters as they will be settled: a frozen copy. */
   readonly counts: Readonly<PullCounts>;
   /** Records an override flag on the run row (`Run.override`). A bad flag throws. */
   override(flag: string): void;
   /**
    * Adds n (default 1) to a counter on the run row (`Run.count`). Unlike a
-   * load's `ctx.count`, a bad name or n throws: what the hook records is the
-   * reason it exists.
+   * load's `ctx.count`, a bad name or n throws, and so do the runner's own
+   * counters (`fetched`, `repointed`): what the hook records is the reason it
+   * exists.
    */
   count(name: string, n?: number): void;
   /** Adds tokens for a model to the run row (`Run.meter`). A bad call throws. */
   meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
-  /** The lock's gate. A refusal that escapes the hook settles the run `lost-lock`. */
+  /** The lock's gate. A refusal settles the run `lost-lock`, even when the hook catches it. */
   ensureExclusive(): Promise<void>;
 }
 
@@ -175,7 +181,7 @@ export type PullFailure =
   | { kind: "quota"; count: number; externalId: string }
   | { kind: "cursor"; error: unknown }
   | { kind: "threw"; error: unknown }
-  /** `beforeSettle` threw (a lock lost at its `ensureExclusive` is `lost-lock`). */
+  /** `beforeSettle` threw (a lock refused at its `ensureExclusive` is `lost-lock`). */
   | { kind: "before-settle"; error: unknown }
   /** Settled with no failure of the runner's own but the buckets do not balance; `runs` writes the reason. */
   | { kind: "identity" };

@@ -313,17 +313,23 @@ forward on 0.8.x only: an older line can never ship a migration there.
   breaker's limit the batch commits through that ref, the cursor lands on
   it, and the run settles `failed` (`quota`), even when that ref was the
   listing's last. Nothing already paid for is rolled back.
-- **Work that needs the whole listing goes in `beforeSettle`.** Retracting
-  what a source no longer lists can only run once the listing is complete.
-  `beforeSettle(ctx)` runs once, after every batch committed and the buckets
-  balance, with the lock gated just before and the row still `running`, so
-  `ctx.override(flag)` (a brake the operator lifted), `ctx.count(name, n)` and
-  `ctx.meter(...)` land on this run's row (`rootstock.runs.overrides`,
-  `counts`, `tokens`); unlike a load's context, a bad call throws. It is never
-  called on a failed run; `ctx.backfill` says the listing was a window. A
-  throw settles the run `failed` (`before-settle`, or `lost-lock` when
-  `ctx.ensureExclusive()` refused) and is not rethrown; the context refuses
-  calls after the hook returns.
+- **Work that needs the listing to be over goes in `beforeSettle`.**
+  Retracting what a source no longer lists can only run once the listing is
+  done. `beforeSettle(ctx)` runs once, after every batch committed and the
+  buckets balance, with the lock gated just before and the row still
+  `running`, so `ctx.override(flag)` (a brake the operator lifted),
+  `ctx.count(name, n)` and `ctx.meter(...)` land on this run's row
+  (`rootstock.runs.overrides`, `counts`, `tokens`); unlike a load's context,
+  a bad call throws, and so does a count of the runner's own `fetched` or
+  `repointed`. It is never called on a failed run. It is called on an empty
+  listing, and on an incremental run whose listing started from a cursor:
+  `ctx.backfill` flags a window, but only the source knows whether any other
+  listing covered everything, so a hook that removes what was not listed
+  checks that itself. A throw settles the run `failed` (`before-settle`) and
+  is not rethrown; a refusal from `ctx.ensureExclusive()` settles it
+  `lost-lock` even when the hook caught it. The hook bounds its own time
+  (one that never resolves keeps the row running and the lock held), and the
+  context refuses calls after the hook returns.
 - **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run
   at once. A refusal from `runs` emits `runner.settle_refused` and never
   fails the load. They are not undone when the batch rolls back.

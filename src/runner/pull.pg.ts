@@ -694,7 +694,6 @@ describe("the guard and the run record", () => {
           backfill: ctx.backfill,
           listed: ctx.counts.listed,
           written: ctx.counts.written,
-          gatedFirst: before > 0,
           gatedByHook: gates === before + 1,
         });
         // A repeated flag is recorded once.
@@ -716,7 +715,6 @@ describe("the guard and the run record", () => {
         backfill: false,
         listed: 3,
         written: 3,
-        gatedFirst: true,
         gatedByHook: true,
       },
       "running",
@@ -762,6 +760,26 @@ describe("the guard and the run record", () => {
       },
     });
     expect(failed.failure?.kind).toBe("list");
+    // A quota trip on the listing's last ref: everything committed, still failed.
+    const tripped = await pull(
+      env,
+      memSource(
+        env,
+        main.transactor,
+        Array.from({ length: 5 }, (_, i) => ({ id: `q${i}`, hash: `${i}`, quota: true })),
+      ),
+      {
+        quota: {
+          make: (d: Parameters<typeof consecutiveBreaker>[2]) =>
+            consecutiveBreaker("alpha-quota", env.runs, d),
+          isQuota: (e: unknown) => e instanceof QuotaError,
+        },
+        beforeSettle: () => {
+          called += 1;
+        },
+      },
+    );
+    expect(tripped.failure?.kind).toBe("quota");
     expect(called).toBe(0);
     const backfills: boolean[] = [];
     await pull(env, memSource(env, main.transactor, recs(1), { boundedBackfill: true }), {
@@ -832,6 +850,61 @@ describe("the guard and the run record", () => {
       },
     });
     expect(report.failure?.kind).toBe("lost-lock");
+    const [row] = await runRows(sql, env);
+    expect(String(row?.reason)).toStartWith("rootstock runner: lost the run lock: ");
+  });
+
+  test("beforeSettle: a lock refusal the hook swallows still settles lost-lock", async () => {
+    const env = await fresh();
+    const real = await env.acquire("alpha-sync");
+    let inHook = false;
+    const lock = gatedLock(real, async () => {
+      if (inHook) {
+        await killLock(sql, "alpha-sync");
+        await env.acquire("alpha-sync");
+      }
+    });
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      lock,
+      beforeSettle: async (ctx: BeforeSettleContext) => {
+        inHook = true;
+        await ctx.ensureExclusive().catch(() => undefined);
+      },
+    });
+    expect(report.status).toBe("failed");
+    expect(report.failure?.kind).toBe("lost-lock");
+  });
+
+  test("beforeSettle: the counts are a frozen copy; the runner's own counters and a bad name refuse", async () => {
+    const env = await fresh();
+    const src = memSource(env, main.transactor, recs(1), {
+      excluded: [{ reason: "draft", count: 2 }],
+    });
+    const refusals: string[] = [];
+    const report = await pull(env, src, {
+      beforeSettle: (ctx: BeforeSettleContext) => {
+        const entry = ctx.counts.excludedReasons[0] as { count: number };
+        expect(() => {
+          entry.count = 999;
+        }).toThrow(TypeError);
+        for (const name of ["fetched", "repointed", "Bad Name"]) {
+          try {
+            ctx.count(name);
+          } catch (e) {
+            refusals.push(`${name}: ${String(runnerErrorCode(e) ?? (e as Error).name)}`);
+          }
+        }
+      },
+    });
+    expect(report.status).toBe("ok");
+    expect(report.excludedReasons).toEqual([{ reason: "draft", count: 2 }]);
+    expect(refusals).toEqual([
+      "fetched: ERR_ROOTSTOCK_RUNNER_INPUT",
+      "repointed: ERR_ROOTSTOCK_RUNNER_INPUT",
+      expect.stringMatching(/^Bad Name: /),
+    ]);
+    const [row] = await runRows(sql, env);
+    expect(JSON.parse(String(row?.counts))).toMatchObject({ fetched: 1 });
   });
 
   test("F2: a run record that cannot start is START, cause kept, nothing listed", async () => {

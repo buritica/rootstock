@@ -741,7 +741,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       return settle({ kind: "lost-lock", error });
     }
     let open = true;
-    /** Set when the hook's own gate refused: the run settles lost-lock, as any other gate. */
+    /** Set when the hook's own gate refused: the run settles lost-lock, whatever the hook did with the refusal. */
     let lostInHook: { error: unknown } | undefined;
     const live = (call: string): void => {
       if (!open) {
@@ -756,13 +756,19 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       mode: args.mode,
       runId: run.id,
       backfill,
-      counts: Object.freeze(snapshotCounts(counts)),
+      counts: frozenCounts(counts),
       override(flag: string) {
         live("override");
         run.override(flag);
       },
       count(name: string, n?: number) {
         live("count");
+        if (RUNNER_COUNTERS.has(name)) {
+          throw new RootstockRunnerError(
+            "ERR_ROOTSTOCK_RUNNER_INPUT",
+            `beforeSettle(): ctx.count(${q(name)}): the runner writes that counter itself`,
+          );
+        }
         run.count(name, n);
       },
       meter(model: string, inTok: number, outTok: number, opts?: { estimated?: boolean }) {
@@ -779,26 +785,37 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
         }
       },
     });
+    let hookError: { error: unknown } | undefined;
     try {
       await args.beforeSettle(ctx);
     } catch (error) {
-      return settle(
-        lostInHook === undefined
-          ? { kind: "before-settle", error }
-          : { kind: "lost-lock", error: lostInHook.error },
-      );
+      hookError = { error };
     } finally {
       open = false;
     }
+    // A refused gate fails closed even when the hook caught it and returned.
+    if (lostInHook !== undefined) return settle({ kind: "lost-lock", error: lostInHook.error });
+    if (hookError !== undefined) return settle({ kind: "before-settle", error: hookError.error });
   }
   return settle();
 }
 
-/** A copy of the counts the caller cannot change. */
+/** The counters `settle` writes; a hook adding to them would inflate the runner's. */
+const RUNNER_COUNTERS: ReadonlySet<string> = new Set(["fetched", "repointed"]);
+
+/** A copy of the counts that shares nothing with the live ones. */
 const snapshotCounts = (c: PullCounts): PullCounts => ({
   ...c,
-  excludedReasons: [...c.excludedReasons],
+  excludedReasons: c.excludedReasons.map((e) => ({ ...e })),
 });
+
+/** A snapshot frozen all the way down, for the hook. */
+const frozenCounts = (c: PullCounts): Readonly<PullCounts> => {
+  const copy = snapshotCounts(c);
+  for (const e of copy.excludedReasons) Object.freeze(e);
+  Object.freeze(copy.excludedReasons);
+  return Object.freeze(copy);
+};
 
 /** The run's identity: everything listed is in exactly one bucket. */
 const balancedCounts = (c: PullCounts): boolean =>
