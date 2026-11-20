@@ -477,22 +477,22 @@ function pruneSql(steps: (number | Error)[] = [], gate = false) {
 const refused = (code: string) => Object.assign(new Error("SECRET-MESSAGE"), { code });
 
 describe("postgresCallLog retention", () => {
-  const make = (db: { sql: Sql }, clock = manualClock(), keepDays = 90) => {
+  const make = (db: { sql: Sql }, clock = manualClock(), keepDays = 90, maxBatch = 100) => {
     const { log, events } = captureLog();
     const sink = postgresCallLog({
       sql: db.sql,
       table: TABLE,
       maxBuffered: 100,
-      maxBatch: 100,
+      maxBatch,
       retention: { keepDays },
       clock,
       log,
     });
     return { sink, events, clock };
   };
-  const pruned = (deleted: number, more: boolean, keepDays = 90) => ({
+  const pruned = (deleted: number, steps: number, more: boolean, stopped = false) => ({
     event: "usage.call_log_pruned",
-    fields: { deleted, keepDays, more },
+    fields: { deleted, keepDays: 90, steps, ms: 0, more, stopped },
   });
 
   test("the prune statement: one bounded batch of the oldest rows past the cutoff, skipping locked rows, counted", () => {
@@ -502,15 +502,15 @@ describe("postgresCallLog retention", () => {
     expect(() => callLogPrune({ schema: 'x"; drop', name: "t" })).toThrow(/identifier/);
   });
 
-  test("the first record prunes after its insert; not again within the hour; again after it", async () => {
-    const db = pruneSql([3]);
+  test("the first record prunes after its insert and always logs; not again within the hour; again after it, silent when it deletes nothing", async () => {
+    const db = pruneSql([0, 0, 3]);
     const { sink, events, clock } = make(db);
     sink.record(callRecord());
     await until(() => events.length === 1);
     await sink.idle();
     expect(db.kinds()).toBe("insert,prune");
     expect(db.sent[1]?.params).toEqual([90, PRUNE_BATCH]);
-    expect(events).toEqual([pruned(3, false)]);
+    expect(events).toEqual([pruned(0, 1, false)]);
     clock.set(clock.monotonic() + PRUNE_EVERY_MS - 1);
     sink.record(callRecord());
     await sink.idle();
@@ -519,9 +519,12 @@ describe("postgresCallLog retention", () => {
     sink.record(callRecord());
     await until(() => db.prunes() === 2);
     await sink.idle();
-    expect(db.kinds()).toBe("insert,prune,insert,insert,prune");
-    // A pass that deleted nothing logs nothing.
     expect(events.length).toBe(1);
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS);
+    sink.record(callRecord());
+    await until(() => events.length === 2);
+    expect(events[1]).toEqual(pruned(3, 1, false));
+    expect([sink.pruned(), sink.pruneFailures()]).toEqual([3, 0]);
   });
 
   test("a full batch takes another step; a pass stops at PRUNE_STEPS and the next is due PRUNE_SOON_MS later", async () => {
@@ -530,7 +533,7 @@ describe("postgresCallLog retention", () => {
     sink.record(callRecord());
     await until(() => events.length === 1);
     expect(db.prunes()).toBe(PRUNE_STEPS);
-    expect(events).toEqual([pruned(PRUNE_BATCH * PRUNE_STEPS, true)]);
+    expect(events).toEqual([pruned(PRUNE_BATCH * PRUNE_STEPS, PRUNE_STEPS, true)]);
     // Not back to back: a record at once queues nothing.
     sink.record(callRecord());
     await sink.idle();
@@ -539,14 +542,14 @@ describe("postgresCallLog retention", () => {
     sink.record(callRecord());
     await until(() => events.length === 2);
     expect(db.prunes()).toBe(PRUNE_STEPS + 2);
-    expect(events[1]).toEqual(pruned(PRUNE_BATCH, false));
+    expect(events[1]).toEqual(pruned(PRUNE_BATCH, 2, false));
+    expect(sink.pruned()).toBe(PRUNE_BATCH * (PRUNE_STEPS + 1));
   });
 
-  test("steady traffic cannot starve a pass: inserts and steps take turns", async () => {
+  test("steady traffic cannot starve a pass: one row a statement, inserts and steps take turns", async () => {
     const db = pruneSql([PRUNE_BATCH, PRUNE_BATCH, PRUNE_BATCH, 0], true);
     const { sink, events } = make(db);
     sink.record(callRecord());
-    // A row lands during every statement, so the buffer is never empty.
     for (let i = 0; i < 8; i++) {
       await until(() => db.sent.length === i + 1);
       sink.record(callRecord());
@@ -554,7 +557,25 @@ describe("postgresCallLog retention", () => {
     }
     expect(db.kinds()).toBe("insert,prune,insert,prune,insert,prune,insert,prune");
     await until(() => events.length === 1);
-    expect(events).toEqual([pruned(PRUNE_BATCH * 3, false)]);
+    expect(events).toEqual([pruned(PRUNE_BATCH * 3, 4, false)]);
+  });
+
+  test("between two steps every row buffered during the first is written, not one batch", async () => {
+    const db = pruneSql([PRUNE_BATCH, 0], true);
+    const { sink, events } = make(db, manualClock(), 90, 2);
+    sink.record(callRecord());
+    await until(() => db.sent.length === 1);
+    db.release();
+    await until(() => db.kinds() === "insert,prune");
+    // Five rows land during the step: three batches of at most 2 before the next.
+    for (let i = 0; i < 5; i++) sink.record(callRecord());
+    for (let i = 0; i < 4; i++) {
+      db.release();
+      await until(() => db.sent.length === i + 3);
+    }
+    db.release();
+    expect(db.kinds()).toBe("insert,prune,insert,insert,insert,prune");
+    await until(() => events.length === 1);
   });
 
   test("idle drops a pending pass after its step in flight, and writes rows recorded meanwhile", async () => {
@@ -576,35 +597,71 @@ describe("postgresCallLog retention", () => {
     db.release();
     await idle;
     expect(db.kinds()).toBe("insert,prune,insert");
-    expect(events).toEqual([pruned(PRUNE_BATCH, true)]);
+    expect(events).toEqual([pruned(PRUNE_BATCH, 1, true, true)]);
   });
 
-  test("a refused step ends its pass with what it deleted, never throws, and the next pass waits the hour", async () => {
-    const db = pruneSql([PRUNE_BATCH, refused("57014")]);
+  test("a refused step ends its pass with what it deleted and the streak, never throws, and the next pass waits the hour", async () => {
+    const db = pruneSql([PRUNE_BATCH, refused("57014"), refused("57014"), 0]);
     const { sink, events, clock } = make(db);
     sink.record(callRecord());
     await until(() => events.length === 1);
     expect(events).toEqual([
       {
         event: "usage.call_log_prune_failed",
-        fields: { keepDays: 90, deleted: PRUNE_BATCH, errorClass: "57014" },
+        fields: {
+          keepDays: 90,
+          deleted: PRUNE_BATCH,
+          steps: 1,
+          errorClass: "57014",
+          failedPasses: 1,
+        },
       },
     ]);
     expect(JSON.stringify(events)).not.toContain("SECRET");
     sink.record(callRecord());
     await sink.idle();
     expect(db.kinds()).toBe("insert,prune,prune,insert");
-    expect(sink.failedBatches()).toBe(0);
+    expect([sink.failedBatches(), sink.pruneFailures(), sink.pruned()]).toEqual([
+      0,
+      1,
+      PRUNE_BATCH,
+    ]);
     clock.set(clock.monotonic() + PRUNE_EVERY_MS - 1);
     sink.record(callRecord());
     await sink.idle();
     expect(db.prunes()).toBe(2);
     clock.set(clock.monotonic() + 1);
     sink.record(callRecord());
-    await until(() => db.prunes() === 3);
+    await until(() => events.length === 2);
+    expect(events[1]?.fields.failedPasses).toBe(2);
+    // A pass that ends cleanly resets the streak; it deleted nothing, so it is silent.
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS);
+    sink.record(callRecord());
+    await until(() => db.prunes() === 4);
+    await sink.idle();
+    expect(events.length).toBe(2);
+    expect(sink.pruneFailures()).toBe(2);
   });
 
-  test("a throwing clock is logged, record does not throw, and the row is still written", async () => {
+  test("a count the driver does not answer is a refused step, not a silent zero", async () => {
+    const { log, events } = captureLog();
+    const unsafe = async (text: string) => (text.startsWith("insert") ? [] : [{}]);
+    const sql = Object.assign(() => Promise.resolve([]), { unsafe }) as unknown as Sql;
+    const sink = postgresCallLog({
+      sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: { keepDays: 30 },
+      clock: manualClock(),
+      log,
+    });
+    sink.record(callRecord());
+    await until(() => events.length === 1);
+    expect(events[0]?.event).toBe("usage.call_log_prune_failed");
+  });
+
+  test("a throwing clock is logged once, record does not throw, and rows are still written", async () => {
     const db = pruneSql();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
@@ -620,10 +677,10 @@ describe("postgresCallLog retention", () => {
       },
       log,
     });
-    expect(sink.record(callRecord())).toBeUndefined();
+    for (let i = 0; i < 3; i++) expect(sink.record(callRecord())).toBeUndefined();
     await sink.idle();
     expect(db.kinds()).toBe("insert");
-    expect(events.map((e) => e.event)).toEqual(["usage.call_log_prune_failed"]);
+    expect(events.map((e) => e.event)).toEqual(["usage.call_log_prune_clock_failed"]);
   });
 
   test("retention null never prunes", async () => {

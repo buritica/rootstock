@@ -595,18 +595,27 @@ process.on("SIGTERM", async () => {
 - **The call log prunes itself.** Pass the usage slice's
   `callLog.retention` and a `clock` to `postgresCallLog`: with
   `{ keepDays }` the same writer deletes rows older than that, a pass an
-  hour, 1,000 rows a step and at most 20 steps a pass, taking turns with
-  inserts so neither starves the other. A pass that stops at the cap with
-  rows left makes the next one due a minute later, so turning retention on
-  over a large table works the backlog off a pass a minute, never back to
-  back. Processes pruning one table skip each other's locked rows, and
-  `idle()` drops a pending pass after its step in flight, so shutdown waits
-  for one delete at most (`usage.call_log_pruned`,
-  `usage.call_log_prune_failed`). A table you name needs a unique `id` and
-  `created_at`. Added in 0.14.0 (required, breaking): set
-  `callLog.retention` in the usage slice (`null` keeps 0.13's behavior,
-  every row) and pass `retention` (plus `clock` when it is not null) to
-  `postgresCallLog`; a printed config gains `usage.callLog.retention`. Both
+  hour, 1,000 rows a step and at most 20 steps a pass. Between two steps it
+  writes every row buffered during the first, so a pass costs inserts one
+  delete's wait and traffic cannot starve the pass; a burst larger than
+  `maxBuffered` during one delete still drops. A pass that stops at the cap
+  with rows left makes the next one due a minute later, so turning retention
+  on over a large table works the backlog off a pass a minute, never back
+  to back (watch autovacuum that first day: freed space is reused, not
+  returned to the OS). Processes pruning one table skip each other's locked
+  rows. `idle()` drops a pending pass after its step in flight, so shutdown
+  waits for one delete at most. `usage.call_log_pruned` {deleted, keepDays,
+  steps, ms, more, stopped} logs each pass that deleted rows and the sink's
+  first pass always, so a deploy shows retention is wired;
+  `usage.call_log_prune_failed` {keepDays, deleted, steps, errorClass,
+  failedPasses} logs a refused step, and the next pass waits the hour.
+  Put `pruned()` and `pruneFailures()` on your metrics beside `dropped()`
+  and `failedBatches()`. A table you name needs a unique `id` and an index
+  on `created_at`, or every step scans it. Added in 0.14.0 (required,
+  breaking): set `callLog.retention` in the usage slice (`null` keeps
+  0.13's behavior, every row) and pass `retention` (plus `clock` when it is
+  not null) to `postgresCallLog`; a printed config gains
+  `usage.callLog.retention`. Both
   rootstock migrations (`mcp_calls`,
   `spend`) are additive and run with rootstock's own (`applyRootstockMigrations`
   or `migrateCli`).

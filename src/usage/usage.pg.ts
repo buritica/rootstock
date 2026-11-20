@@ -328,7 +328,10 @@ describe("postgresCallLog", () => {
     );
     expect(left.map((r) => r.tool)).toEqual(["aged-1", "aged-29", "fresh"]);
     expect(events).toEqual([
-      { event: "usage.call_log_pruned", fields: { deleted: 3, keepDays: 30, more: false } },
+      {
+        event: "usage.call_log_pruned",
+        fields: { deleted: 3, keepDays: 30, steps: 1, ms: 0, more: false, stopped: false },
+      },
     ]);
   });
 });
@@ -376,6 +379,7 @@ describe("postgresCallLog retention across steps and processes", () => {
       for (const { sink } of sinks) await sink.idle();
       const all = sinks.flatMap(({ events }) => events);
       expect(all.every((e) => e.event === "usage.call_log_pruned")).toBe(true);
+      expect(sinks.reduce((n, { sink }) => n + sink.pruned(), 0)).toBe(aged);
       const left = await sql.unsafe<{ tool: string; n: number }>(
         `SELECT tool, count(*)::int AS n FROM "${s}".mcp_calls GROUP BY tool`,
       );

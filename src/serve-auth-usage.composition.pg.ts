@@ -620,8 +620,21 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
           "spend",
         ]);
         expect(rows.find((r) => r.result_ids === '["hello"]')?.caller_kind).toBe("bearer");
-        // No call log or spend write failed; the one usage line is the refusal.
+        // No call log or spend write failed: the usage lines are the
+        // retention's first pass (wired from the slice, nothing old to
+        // delete) and the refusal.
         expect(log.lines.filter(([event]) => event.startsWith("usage."))).toEqual([
+          [
+            "usage.call_log_pruned",
+            {
+              deleted: 0,
+              keepDays: 30,
+              steps: 1,
+              ms: expect.any(Number),
+              more: false,
+              stopped: false,
+            },
+          ],
           ["usage.spend_refused", { caller: "agent-1", ceiling: 100, unit: "tokens", used: 120 }],
         ]);
 
