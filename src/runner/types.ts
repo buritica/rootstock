@@ -165,7 +165,8 @@ export interface BeforeSettleContext {
    * Records an override flag and writes it to the running row at once
    * (`Run.recordOverride`), so a run killed mid-hook still shows it. Await it
    * before the act the flag allows. Rejects on a bad flag, a database error,
-   * or a row no longer running: then do not act.
+   * or a row no longer running: then do not act. A rejected override fails
+   * the run (`before-settle`) even when the hook catches it or never awaits it.
    */
   override(flag: string): Promise<void>;
   /**

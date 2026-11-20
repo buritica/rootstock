@@ -777,7 +777,8 @@ describe("the guard and the run record", () => {
       },
     });
     expect(String((refused as Error)?.message)).toContain("no longer running");
-    expect(report.failure).toBeUndefined();
+    // A refused override fails the run even when the hook caught it.
+    expect(report.failure?.kind).toBe("before-settle");
     expect(report.finish).toMatchObject({ written: false, why: "settled-elsewhere" });
     const [row] = await sql.unsafe(`SELECT status, overrides::text AS o FROM ${env.R}`);
     expect(row).toMatchObject({ status: "interrupted", o: '["brake.alpha-archive"]' });
@@ -799,6 +800,18 @@ describe("the guard and the run record", () => {
     const finished = env.events.find((e) => e.type === "runner.before_settle_finished");
     expect(finished).toMatchObject({ outcome: "before-settle" });
     expect(String((finished as { error?: Error }).error?.message)).toContain("Not A Flag");
+  });
+
+  test("beforeSettle: an override the hook never awaited still fails the run when it is refused", async () => {
+    const env = await fresh();
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      beforeSettle: (ctx: BeforeSettleContext) => {
+        void ctx.override("Not A Flag");
+      },
+    });
+    expect(report.failure?.kind).toBe("before-settle");
+    const [row] = await sql.unsafe(`SELECT status, phase FROM ${env.R}`);
+    expect(row).toMatchObject({ status: "failed", phase: "before-settle" });
   });
 
   test("beforeSettle is not called on a failed run, and sees backfill", async () => {

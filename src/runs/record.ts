@@ -626,15 +626,25 @@ function makeRun(
     override: addOverride,
     async recordOverride(flag: string): Promise<boolean> {
       checkOverride(flag, "recordOverride");
+      // Held before the write, so a finish built while it is in flight keeps
+      // it; taken back when the row did not take it.
+      const added = !overrides.includes(flag);
+      if (added) overrides.push(flag);
+      const takeBack = () => {
+        if (added && settling === null) overrides.splice(overrides.indexOf(flag), 1);
+      };
       let rows: Row[];
       try {
         rows = await sql.unsafe(statements.overrides, [id, holder, flag]);
       } catch (error) {
+        takeBack();
         emit({ type: "runs.record_failed", id, job, operation: "override", ...failure(error) });
         throw error;
       }
-      if (rows.length === 0) return false;
-      if (!overrides.includes(flag)) overrides.push(flag);
+      if (rows.length === 0) {
+        takeBack();
+        return false;
+      }
       return true;
     },
     scope(value: unknown, excluded?: unknown) {

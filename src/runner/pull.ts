@@ -781,6 +781,7 @@ async function runBeforeSettle(
   /** The hook's gates and override writes, awaited or not: all settle before the run does. */
   const pending: Promise<void>[] = [];
   let lost: { error: unknown } | undefined;
+  let overrideFailed: { error: unknown } | undefined;
   const live = (call: string): void => {
     if (!open) {
       throw new RootstockRunnerError(
@@ -805,8 +806,13 @@ async function runBeforeSettle(
           );
         }
       })();
-      // Settled before the run is: a write the hook did not await still lands first.
-      pending.push(p.catch(() => undefined));
+      // Settled before the run is: a write the hook did not await still lands
+      // first, and its refusal fails the run as if the hook had thrown it.
+      pending.push(
+        p.catch((error: unknown) => {
+          overrideFailed ??= { error };
+        }),
+      );
       return p;
     },
     count(name: string, n?: number) {
@@ -848,8 +854,8 @@ async function runBeforeSettle(
   const failure: PullFailure | undefined =
     lost !== undefined
       ? { kind: "lost-lock", error: lost.error }
-      : threw !== undefined
-        ? { kind: "before-settle", error: threw.error }
+      : (threw ?? overrideFailed) !== undefined
+        ? { kind: "before-settle", error: (threw ?? overrideFailed)?.error }
         : undefined;
   a.emit({
     type: "runner.before_settle_finished",
