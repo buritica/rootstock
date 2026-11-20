@@ -13,6 +13,7 @@ import {
 } from "../runs/index.ts";
 import { checkTransactor, input, isFn, RootstockRunnerError } from "./errors.ts";
 import type {
+  BeforeSettleContext,
   Exclusion,
   LoadContext,
   PlanAction,
@@ -103,6 +104,8 @@ export function defaultReason(
       return `rootstock runner: could not store the cursor on an empty listing: ${d(f.error)}`;
     case "threw":
       return `rootstock runner: run threw: ${d(f.error)}`;
+    case "before-settle":
+      return `rootstock runner: beforeSettle failed: ${d(f.error)}`;
     case "identity":
       return "rootstock runner: the buckets do not balance";
   }
@@ -299,6 +302,9 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
   if (args.afterRun !== undefined && !isFn(args.afterRun)) {
     throw input(fn, "afterRun", "must be a function when given", args.afterRun);
   }
+  if (args.beforeSettle !== undefined && !isFn(args.beforeSettle)) {
+    throw input(fn, "beforeSettle", "must be a function when given", args.beforeSettle);
+  }
   const quota = args.quota as Partial<NonNullable<PullArgs<R, D, N>["quota"]>> | undefined;
   if (quota !== undefined && (!isFn(quota?.make) || !isFn(quota?.isQuota))) {
     throw input(fn, "quota", "must be { make, isQuota } when given", args.quota);
@@ -365,8 +371,7 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
     );
     guarded("count", () => run.count("fetched", counts.fetched));
     guarded("count", () => run.count("repointed", counts.repointed));
-    const balanced =
-      counts.listed === counts.written + counts.unchanged + counts.quarantined + counts.excluded;
+    const balanced = balancedCounts(counts);
     const f: PullFailure | undefined = failure ?? (balanced ? undefined : { kind: "identity" });
     const status = f === undefined ? "ok" : "failed";
     const reason = f === undefined || f.kind === "identity" ? undefined : reasonOf(f);
@@ -730,8 +735,54 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
   }
 
   // P9
+  if (args.beforeSettle !== undefined && balancedCounts(counts)) {
+    try {
+      await gate();
+    } catch (error) {
+      return settle({ kind: "lost-lock", error });
+    }
+    let open = true;
+    const live = (call: string): void => {
+      if (!open) {
+        throw new RootstockRunnerError(
+          "ERR_ROOTSTOCK_RUNNER_INPUT",
+          `beforeSettle(): ctx.${call}() called after the hook returned`,
+        );
+      }
+    };
+    const ctx: BeforeSettleContext = Object.freeze({
+      job: source.job,
+      mode: args.mode,
+      runId: run.id,
+      backfill,
+      counts: Object.freeze({ ...counts, excludedReasons: [...counts.excludedReasons] }),
+      override(flag: string) {
+        live("override");
+        run.override(flag);
+      },
+      count(name: string, n?: number) {
+        live("count");
+        run.count(name, n);
+      },
+      ensureExclusive() {
+        live("ensureExclusive");
+        return gate();
+      },
+    });
+    try {
+      await args.beforeSettle(ctx);
+    } catch (error) {
+      return settle({ kind: "before-settle", error });
+    } finally {
+      open = false;
+    }
+  }
   return settle();
 }
+
+/** The run's identity: everything listed is in exactly one bucket. */
+const balancedCounts = (c: PullCounts): boolean =>
+  c.listed === c.written + c.unchanged + c.quarantined + c.excluded;
 
 const ACTIONS: readonly PlanAction[] = [
   "unchanged",

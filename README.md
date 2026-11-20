@@ -39,7 +39,7 @@ import { runGoldenCli, type GoldenSuite } from "@buritica/rootstock/golden";
 | `golden` | v0.0.1 | Golden snapshots that prove a refactor or extraction changed nothing: canonical JSON, capture/check, a recording `fetch`, seeded vectors and throwaway Postgres |
 | `golden/bun-test` | v0.0.1 | Registers golden suites as `bun test` cases |
 | `retrieval` | v0.9.0 | Hybrid search pieces: `bm25Query` builds a top-K BM25 statement for a `lakebase_bm25` index (the `lakebase_text` Postgres extension), with an optional candidate `budget` (a `set local` run first, since the index caps candidates before SQL `limit`), and `reciprocalRankFusion` merges ranked lists whose scores are not comparable. The database needs the extension and a `lakebase_bm25` index built after the table is populated |
-| `runner` | v0.11.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record), plan mode (`planPull`) and the queue drain (`drainQueue`) |
+| `runner` | v0.14.0 | The pull runner (`runPull`: fetch outside the transaction, a batch transaction per batch with its cursor, quarantine, a quota breaker, a run record, a `beforeSettle` hook for work that needs the whole listing), plan mode (`planPull`) and the queue drain (`drainQueue`) |
 | `serve` | v0.13.1 | An MCP server behind one `handle(req)`: `createMcpService` runs auth, Host/Origin checks, body limits, the refusal and serving buckets and a deadline in front of the SDK's entry, with every response byte that differs between servers named in a profile; one `registerTool` seam checks scopes, charges the per-tool buckets, concurrency groups and turn budget, and records every call; `installSeams` does the same for a stdio server; liveness, cached readiness probes and a draining shutdown; `serveSlice` for config |
 | `serve/auth` | v0.12.0 | `defineAuth`: one Better Auth instance as an MCP OAuth resource server (JWT, the MCP and CIMD plugins, magic link or Google sign-in, listed redirects, its rate limiter always on), the routes `serve` mounts, `verify` for the MCP path and `assertStoreReady` for startup |
 | `usage` | v0.14.0 | What a tool call cost and who made it: `postgresCallLog` batches call records into a table you name (rootstock's migration creates `rootstock.mcp_calls`) without ever delaying a call and prunes it to the slice's `callLog.retention` (0.14.0), `prometheusToolMetrics` counts handler calls, `createSpendCeiling` keeps a daily per-caller total (tokens or dollars) and refuses past it, `usageWiring` binds pricing (the `runs` price table) and error classes into `serve`; `usageSlice` for config |
@@ -313,6 +313,15 @@ forward on 0.8.x only: an older line can never ship a migration there.
   breaker's limit the batch commits through that ref, the cursor lands on
   it, and the run settles `failed` (`quota`), even when that ref was the
   listing's last. Nothing already paid for is rolled back.
+- **Work that needs the whole listing goes in `beforeSettle`.** Retracting
+  what a source no longer lists can only run once the listing is complete.
+  `beforeSettle(ctx)` runs once, after every batch committed and the buckets
+  balance, with the lock gated just before and the row still `running`, so
+  `ctx.override(flag)` (a brake the operator lifted) and `ctx.count(name, n)`
+  land on this run's row (`rootstock.runs.overrides`, `counts`). It is never
+  called on a failed run; `ctx.backfill` says the listing was a window. A
+  throw settles the run `failed` (`before-settle`) and is not rethrown; the
+  context refuses calls after the hook returns.
 - **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run
   at once. A refusal from `runs` emits `runner.settle_refused` and never
   fails the load. They are not undone when the batch rolls back.

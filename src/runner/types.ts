@@ -133,6 +133,32 @@ export interface PullArgs<R extends PullRef, D extends PullDoc, N> {
   /** The quarantine reason for a fetched doc carrying another id; default rootstock's text. */
   mismatchReason?: (asked: string, got: unknown) => string;
   afterRun?: (row: RunRow) => void | Promise<void>;
+  /**
+   * Work that belongs to the run and needs its whole listing, such as
+   * retracting what the source no longer lists. Called once, after every
+   * batch committed and the buckets balance, with the lock gated just before,
+   * while the row is still running: what it records (an override, a counter)
+   * lands on this run's row. Not called on a failed run. A throw settles the
+   * run failed (`before-settle`); the error is not rethrown.
+   */
+  beforeSettle?: (ctx: BeforeSettleContext) => void | Promise<void>;
+}
+
+/** What `beforeSettle` may read and record. Its calls refuse once the hook has returned. */
+export interface BeforeSettleContext {
+  readonly job: string;
+  readonly mode: string;
+  readonly runId: string;
+  /** True on a backfill: the listing covered a window, not the whole source. */
+  readonly backfill: boolean;
+  /** The run's buckets and counters as they will be settled. */
+  readonly counts: Readonly<PullCounts>;
+  /** Records an override flag on the run row (`Run.override`). A bad flag throws. */
+  override(flag: string): void;
+  /** Adds n (default 1) to a counter on the run row (`Run.count`). A bad name or n throws. */
+  count(name: string, n?: number): void;
+  /** The lock's gate: throws when the lock is no longer held. */
+  ensureExclusive(): Promise<void>;
 }
 
 export type PullFailure =
@@ -143,6 +169,8 @@ export type PullFailure =
   | { kind: "quota"; count: number; externalId: string }
   | { kind: "cursor"; error: unknown }
   | { kind: "threw"; error: unknown }
+  /** `beforeSettle` threw (or the lock was lost inside it). */
+  | { kind: "before-settle"; error: unknown }
   /** Settled with no failure of the runner's own but the buckets do not balance; `runs` writes the reason. */
   | { kind: "identity" };
 
