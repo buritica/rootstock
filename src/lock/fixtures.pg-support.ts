@@ -2,7 +2,14 @@ import { test } from "bun:test";
 import { SQL } from "bun";
 import postgres from "postgres";
 import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/index.ts";
-import { required, testDatabaseUrlFor, testTransactorKind } from "../db/test-client.pg-support.ts";
+import {
+  HYPOTHESES_ENV,
+  type LockDriver,
+  lockDriverOf,
+  required,
+  testDatabaseUrlFor,
+  testTransactorKind,
+} from "../db/test-client.pg-support.ts";
 
 /**
  * Lock-session fixtures for the lock DB suites. Under kind `bun-sql` the lock
@@ -10,7 +17,7 @@ import { required, testDatabaseUrlFor, testTransactorKind } from "../db/test-cli
  * a postgres.js `max: 1` client (contract §3). Every value is synthetic.
  */
 
-export type LockDriver = "postgres-js" | "bun-sql";
+export type { LockDriver };
 
 export function testUrl(): string {
   return required("ROOTSTOCK_TEST_DATABASE_URL");
@@ -21,7 +28,7 @@ export const testKind = testTransactorKind;
 
 /** The driver the lock session uses under the kind under test. */
 export function lockDriver(): LockDriver {
-  return testKind() === "bun-sql" ? "bun-sql" : "postgres-js";
+  return lockDriverOf(testKind());
 }
 
 /**
@@ -119,13 +126,17 @@ export function otherDatabaseUrl(database: string): string {
   return testDatabaseUrlFor(database);
 }
 
-/**
- * Whether the D-S1 / C-S1 hypothesis tests run: only under
- * `bun run test:db:hypotheses` (scripts/test-db.ts `--hypotheses`). They
- * measure Postgres and driver behaviour, which moves only with a Postgres,
- * Bun or driver change, so the per-PR matrix skips them.
- */
-export const HYPOTHESES = Bun.env.ROOTSTOCK_HYPOTHESES === "1";
+const HYPOTHESES = process.env[HYPOTHESES_ENV] === "1";
 
-/** A hypothesis test: `test`, on only when {@link HYPOTHESES} is. */
+/**
+ * A D-S1 / C-S1 hypothesis test: a measurement of Postgres or driver
+ * behaviour, not of rootstock code. Runs only under `bun run
+ * test:db:hypotheses` (why: `.github/workflows/hypotheses.yml`); a suite that
+ * uses it carries the `hypotheses` marker (`SUITE_MARKERS`).
+ */
 export const hypothesis = test.if(HYPOTHESES);
+
+/** {@link hypothesis}, further gated on `condition` (a Bun-version cell). */
+export function hypothesisIf(condition: boolean): typeof test {
+  return test.if(HYPOTHESES && condition);
+}

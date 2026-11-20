@@ -1,3 +1,4 @@
+// rootstock-test: driver-only
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Socket } from "bun";
 import type { Sql } from "../db/index.ts";

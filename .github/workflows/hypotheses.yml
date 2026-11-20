@@ -3,7 +3,7 @@
 # They measure Postgres and driver behaviour, not rootstock code, so their
 # result moves only when Postgres, Bun or a driver does. The per-PR matrix in
 # ci.yml skips them; this workflow runs them on the changes that can move them
-# (dependencies, the pinned images in scripts/test-db.ts, the Bun pin, the
+# (the lockfile, the pinned images in scripts/test-db.ts, the Bun pin, the
 # suites and their support modules) and weekly, so a quiet month cannot let the
 # job rot unseen. Not part of `ci-pass`: a red run here names an assumption to
 # re-check, not a broken build.
@@ -12,7 +12,6 @@ name: Hypotheses
 on:
   pull_request:
     paths:
-      - "package.json"
       - "bun.lock"
       - "scripts/test-db.ts"
       - "src/lock/block.pg.ts"

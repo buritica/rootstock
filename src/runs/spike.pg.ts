@@ -1,3 +1,4 @@
+// rootstock-test: hypotheses
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { pgCode, type Sql } from "../db/index.ts";
 import {

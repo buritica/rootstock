@@ -1,3 +1,5 @@
+// rootstock-test: driver-only
+// rootstock-test: hypotheses
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { pgCode, type Row, type Sql } from "../db/index.ts";
 import {
@@ -10,8 +12,8 @@ import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
 import {
-  HYPOTHESES,
   hypothesis,
+  hypothesisIf,
   lateBunSqlDestroy,
   lockDriver,
   openBunSqlClient,
@@ -242,7 +244,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H10: destroy() ends the client at once while B2 is in flight; B2 rejects; nothing is unhandled; the server hears the FIN at once",
     async () => {
       const unhandled: unknown[] = [];
@@ -276,7 +278,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H10 contrast: close({ timeout: 1 }) waits out the timeout with B2 in flight before it sends the FIN",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
@@ -298,7 +300,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H6a: with client_connection_check_interval 1000ms, a destroyed waiter is ended within about 1 s, before it is granted",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -317,7 +319,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H6b: without it, a destroyed waiter stays blocked until granted, then exits when its reply fails; a second waiter is granted at once",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "0");
@@ -340,7 +342,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H6c (LB3's second bound): released just after the destroy, a second waiter is granted within checkIntervalMs + 200 ms",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -360,7 +362,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && !late)(
+  hypothesisIf(!late)(
     "H6d: through close() bounded by endTimeoutSeconds, the ghost window is endTimeoutSeconds + checkIntervalMs",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -380,7 +382,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.if(HYPOTHESES && late)(
+  hypothesisIf(late)(
     "A38 (Bun.SQL before 1.4.4): destroy() waits for B2, which ends at lock_timeout; then the backend leaves and the holder keeps the lock",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter(
