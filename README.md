@@ -640,7 +640,20 @@ process.on("SIGTERM", async () => {
   breaking): set `callLog.retention` in the usage slice (`null` keeps
   0.13's behavior, every row) and pass `retention` (plus `clock` when it is
   not null) to `postgresCallLog`; a printed config gains
-  `usage.callLog.retention`. Both
+  `usage.callLog.retention`.
+- **Alert on the table, not the process.** `callLogRetentionStatus({ sql,
+  table, retention })` reads the oldest row's age by the database clock and
+  says `overdue` once it passes `keepDays` plus `RETENTION_SLACK_DAYS` (2,
+  or `slackDays`): one indexed read that sees every way pruning stops
+  (refused deletes, retention not wired, no pass for days), where a
+  process's counters see only their own failures. `renderCallLogMetrics({
+  prefix, table, counts: sink, status })` renders the sink's four counters
+  (`<prefix>_call_log_dropped_total`, `_failed_batches_total`,
+  `_prune_failures_total`, `_pruned_rows_total`) and, with a status,
+  `<prefix>_call_log_oldest_row_age_seconds` and `_keep_seconds`, so a rule
+  reads `oldest_row_age_seconds > keep_seconds + 2 * 86400` with no number
+  copied in. A consumer without Prometheus runs the status from a scheduled
+  check instead. Added in 0.16.0. Both
   rootstock migrations (`mcp_calls`,
   `spend`) are additive and run with rootstock's own (`applyRootstockMigrations`
   or `migrateCli`).

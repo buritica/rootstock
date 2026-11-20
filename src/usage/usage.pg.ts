@@ -6,6 +6,7 @@ import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
 import { PRUNE_BATCH, postgresCallLog } from "./call-log.ts";
+import { callLogRetentionStatus } from "./call-log-health.ts";
 import { callRecord, captureLog, manualClock } from "./fixtures.test-support.ts";
 import { createSpendCeiling, postgresSpendStore, type SpendStore } from "./spend.ts";
 
@@ -302,6 +303,34 @@ describe("postgresCallLog", () => {
       },
     ]);
   });
+  test("callLogRetentionStatus reads the oldest row by the server's clock", async () => {
+    const s = await migrated();
+    const table = { schema: s, name: "mcp_calls" };
+    const retention = { keepDays: 30 };
+    expect(await callLogRetentionStatus({ sql, table, retention })).toEqual({
+      keepDays: 30,
+      oldestAgeSeconds: null,
+      overdue: false,
+    });
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       VALUES (now() - make_interval(days => 31), 'c', 't', '{}'::jsonb, 1, true)`,
+    );
+    const inSlack = await callLogRetentionStatus({ sql, table, retention });
+    expect(inSlack.overdue).toBe(false);
+    expect(inSlack.oldestAgeSeconds).toBeGreaterThanOrEqual(31 * 86_400);
+    expect(inSlack.oldestAgeSeconds).toBeLessThan(31 * 86_400 + 60);
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       VALUES (now() - make_interval(days => 33), 'c', 't', '{}'::jsonb, 1, true)`,
+    );
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    expect((await callLogRetentionStatus({ sql, table, retention: null })).overdue).toBe(false);
+    expect((await callLogRetentionStatus({ sql, table, retention, slackDays: 5 })).overdue).toBe(
+      false,
+    );
+  });
+
   test("retention deletes rows older than keepDays and keeps the rest", async () => {
     const s = await migrated();
     // Ages in days: three past a 30-day cutoff, two inside it.
