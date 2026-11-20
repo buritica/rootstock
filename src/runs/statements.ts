@@ -80,7 +80,7 @@ SELECT EXISTS (SELECT 1 FROM ins) AS inserted,
   reason = $19::text
 WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status = 'running'
 RETURNING ${P}::text AS row`,
-    overrides: `UPDATE ${R} SET overrides = CASE WHEN overrides ? $3::text THEN overrides
+    overrides: `UPDATE ${R} SET overrides = CASE WHEN jsonb_exists(overrides, $3::text) THEN overrides
     ELSE overrides || jsonb_build_array($3::text) END
 WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,
     discard: `DELETE FROM ${R} WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,

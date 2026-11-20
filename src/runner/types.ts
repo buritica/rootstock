@@ -143,8 +143,11 @@ export interface PullArgs<R extends PullRef, D extends PullDoc, N> {
    * cursor: only the source knows whether its listing covered everything, so
    * a hook that removes what was not listed checks that itself. The hook
    * bounds its own time: one that never resolves keeps the row running and
-   * the lock held. A throw settles the run failed (`before-settle`); the
-   * error is not rethrown.
+   * the lock held, and so does a gate or override it started and never
+   * awaited (they settle before the run does). A throw settles the run
+   * failed (`before-settle`), a refused `ctx.ensureExclusive()` settles it
+   * `lost-lock`; neither is rethrown. The gate before the hook does not fence
+   * the hook's own writes: see `ensureExclusive`.
    */
   beforeSettle?: (ctx: BeforeSettleContext) => void | Promise<void>;
 }

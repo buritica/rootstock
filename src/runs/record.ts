@@ -82,11 +82,13 @@ export interface Run {
    */
   override(flag: string): void;
   /**
-   * `override(flag)`, then writes the run's overrides to its running row at
-   * once, so a run killed before it settles still shows the flag (an
+   * Writes this flag to the running row at once (no duplicate), then holds it
+   * like `override`, so a run killed before it settles still shows it (an
    * interrupted row keeps it). Call it before the act the flag allows.
-   * Resolves false when the row is no longer running (settled elsewhere):
-   * the caller should not act. A database error rejects.
+   * Resolves false when the row is no longer running (settled elsewhere): the
+   * flag is not recorded and the caller should not act. Rejects on a bad flag,
+   * a run already settling, or a database error (emitting
+   * `runs.record_failed`); the flag is then not held either.
    */
   recordOverride(flag: string): Promise<boolean>;
   /** The scope this run covered, for the next run's scope guard. */
@@ -565,11 +567,14 @@ function makeRun(
     return { written: true, ...settled };
   };
 
-  function addOverride(flag: string, call = "override"): void {
+  function checkOverride(flag: string, call: string): void {
     open(call);
     if (typeof flag !== "string" || !COUNTER.test(flag)) {
       throw input(`${call}(${q(flag)}): flag must match [a-z0-9_.:-]{1,64}`);
     }
+  }
+  function addOverride(flag: string): void {
+    checkOverride(flag, "override");
     if (!overrides.includes(flag)) overrides.push(flag);
   }
 
@@ -620,7 +625,7 @@ function makeRun(
     },
     override: addOverride,
     async recordOverride(flag: string): Promise<boolean> {
-      addOverride(flag, "recordOverride");
+      checkOverride(flag, "recordOverride");
       let rows: Row[];
       try {
         rows = await sql.unsafe(statements.overrides, [id, holder, flag]);
@@ -628,7 +633,9 @@ function makeRun(
         emit({ type: "runs.record_failed", id, job, operation: "override", ...failure(error) });
         throw error;
       }
-      return rows.length > 0;
+      if (rows.length === 0) return false;
+      if (!overrides.includes(flag)) overrides.push(flag);
+      return true;
     },
     scope(value: unknown, excluded?: unknown) {
       open("scope");

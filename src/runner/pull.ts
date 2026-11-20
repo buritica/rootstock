@@ -778,7 +778,8 @@ async function runBeforeSettle(
 ): Promise<PullFailure | undefined> {
   const { run, job } = a;
   let open = true;
-  const gates: Promise<void>[] = [];
+  /** The hook's gates and override writes, awaited or not: all settle before the run does. */
+  const pending: Promise<void>[] = [];
   let lost: { error: unknown } | undefined;
   const live = (call: string): void => {
     if (!open) {
@@ -794,14 +795,19 @@ async function runBeforeSettle(
     runId: run.id,
     backfill: a.backfill,
     counts: frozenCounts(a.counts),
-    async override(flag: string) {
-      live("override");
-      if (!(await run.recordOverride(flag))) {
-        throw new RootstockRunnerError(
-          "ERR_ROOTSTOCK_RUNNER_NOT_RUNNING",
-          `beforeSettle(): ctx.override(${q(flag)}): the run's row is no longer running`,
-        );
-      }
+    override(flag: string) {
+      const p = (async () => {
+        live("override");
+        if (!(await run.recordOverride(flag))) {
+          throw new RootstockRunnerError(
+            "ERR_ROOTSTOCK_RUNNER_NOT_RUNNING",
+            `beforeSettle(): ctx.override(${q(flag)}): the run's row is no longer running`,
+          );
+        }
+      })();
+      // Settled before the run is: a write the hook did not await still lands first.
+      pending.push(p.catch(() => undefined));
+      return p;
     },
     count(name: string, n?: number) {
       live("count");
@@ -823,7 +829,7 @@ async function runBeforeSettle(
         lost ??= { error };
         throw error;
       });
-      gates.push(g.catch(() => undefined));
+      pending.push(g.catch(() => undefined));
       return g;
     },
   });
@@ -837,8 +843,8 @@ async function runBeforeSettle(
   } finally {
     open = false;
   }
-  // A gate the hook did not await still counts.
-  await Promise.all(gates);
+  // A gate or override the hook did not await still counts.
+  await Promise.all(pending);
   const failure: PullFailure | undefined =
     lost !== undefined
       ? { kind: "lost-lock", error: lost.error }
