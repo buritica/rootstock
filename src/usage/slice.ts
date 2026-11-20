@@ -3,6 +3,8 @@ import {
   bounded,
   identifier,
   isRecord,
+  KEEP_DAYS_MAX,
+  KEEP_DAYS_MIN,
   own,
   sliceBrand,
   sliceRefusals,
@@ -65,9 +67,7 @@ const CALL_LOG_KEYS: ReadonlySet<string> = new Set([
   "retention",
 ]);
 const RETENTION_KEYS: ReadonlySet<string> = new Set(["keepDays"]);
-/** The call log's retention bounds, the runs slice's. */
-export const KEEP_DAYS_MIN = 7;
-export const KEEP_DAYS_MAX = 3_650;
+
 const SPEND_KEYS: ReadonlySet<string> = new Set(["unit", "ceiling", "store"]);
 const ROOTSTOCK_STORE_KEYS: ReadonlySet<string> = new Set(["kind", "schema"]);
 const DAY_USER_FIELDS = ["schema", "table", "day", "user", "used"] as const;

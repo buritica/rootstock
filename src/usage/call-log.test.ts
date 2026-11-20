@@ -477,7 +477,7 @@ describe("postgresCallLog retention", () => {
 
   test("the prune statement: one bounded batch of the oldest rows past the cutoff, counted", () => {
     expect(callLogPrune(TABLE)).toBe(
-      'with d as (delete from "rootstock"."mcp_calls" where id in (select id from "rootstock"."mcp_calls" where created_at < clock_timestamp() - make_interval(days => $1::int) order by created_at limit $2::int) returning 1) select count(*)::int as deleted from d',
+      'with d as (delete from "rootstock"."mcp_calls" where id in (select id from "rootstock"."mcp_calls" where created_at < now() - make_interval(days => $1::int) order by created_at limit $2::int) returning 1) select count(*)::int as deleted from d',
     );
     expect(() => callLogPrune({ schema: 'x"; drop', name: "t" })).toThrow(/identifier/);
   });

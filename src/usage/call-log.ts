@@ -1,10 +1,18 @@
 import type { Sql } from "../db/index.ts";
-import { cut, INT4_MAX, intIn, q, quoteTable } from "../internal/slice.ts";
+import {
+  cut,
+  INT4_MAX,
+  intIn,
+  KEEP_DAYS_MAX,
+  KEEP_DAYS_MIN,
+  q,
+  quoteTable,
+} from "../internal/slice.ts";
 import type { CallRecord, CallSink, Clock, LogEvent } from "../serve/types.ts";
 import { errorClassOf } from "./error-class.ts";
 import { configError } from "./errors.ts";
 import { guardedLog } from "./log.ts";
-import { KEEP_DAYS_MAX, KEEP_DAYS_MIN, MAX_BUFFERED } from "./slice.ts";
+import { MAX_BUFFERED } from "./slice.ts";
 
 /** Column → the type `jsonb_to_recordset` reads it as. Fixed names, no column map. */
 const COLUMNS: readonly (readonly [string, string])[] = [
@@ -49,12 +57,14 @@ export const PRUNE_EVERY_MS = 60 * 60 * 1000;
 
 /**
  * One prune step: up to `$2` of the oldest rows created more than `$1` days
- * ago, by the server's clock, answering `deleted`. The `created_at` index
- * finds them; `id` keys the delete.
+ * ago, by the server's clock, answering `deleted`. `now()`, not
+ * `clock_timestamp()`: a volatile cutoff cannot bound the `created_at` index
+ * scan, so a pass that finds nothing would read the whole table. `id` keys
+ * the delete.
  */
 export function callLogPrune(table: { schema: string; name: string }): string {
   const t = quoteTable(table);
-  return `with d as (delete from ${t} where id in (select id from ${t} where created_at < clock_timestamp() - make_interval(days => $1::int) order by created_at limit $2::int) returning 1) select count(*)::int as deleted from d`;
+  return `with d as (delete from ${t} where id in (select id from ${t} where created_at < now() - make_interval(days => $1::int) order by created_at limit $2::int) returning 1) select count(*)::int as deleted from d`;
 }
 
 /** A tool name as stored and logged: the client names it on a rejected call, so it is capped. */
@@ -193,7 +203,7 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
       `postgresCallLog: maxBatch must be an integer from 1 to maxBuffered — got ${q(o.maxBatch)}`,
     );
   }
-  const retention = o.retention;
+  const { retention } = o;
   if (retention !== null) {
     if (typeof retention !== "object" || !intIn(retention.keepDays, KEEP_DAYS_MIN, KEEP_DAYS_MAX)) {
       throw configError(
@@ -208,6 +218,9 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   const log = guardedLog(o.log);
   const statement = callLogInsert(o.table);
   const pruneStatement = callLogPrune(o.table);
+  // Both null without a retention; the checks above make the clock present with one.
+  const keepDays = retention === null ? null : retention.keepDays;
+  const clock = retention === null ? null : (o.clock as Pick<Clock, "monotonic">);
   // When the last pass started (null: due now), and the pass queued or running.
   let lastPruneAt: number | null = null;
   let pass: { steps: number; deleted: number } | null = null;
@@ -227,8 +240,8 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   const drain = async (): Promise<void> => {
     try {
       while (buffer.length > 0 || pass !== null) {
-        if (buffer.length === 0 && pass !== null && retention !== null) {
-          await pruneStep(pass, retention.keepDays);
+        if (buffer.length === 0 && pass !== null) {
+          await pruneStep(pass);
           continue;
         }
         const batch = buffer.splice(0, maxBatch);
@@ -264,10 +277,10 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
 
   // One step of the pass; ends the pass (null) on a short step, the cap, or
   // a refusal. Never throws.
-  const pruneStep = async (p: { steps: number; deleted: number }, keepDays: number) => {
+  const pruneStep = async (p: { steps: number; deleted: number }) => {
     try {
-      const [row] = await sql.unsafe(pruneStatement, [keepDays, PRUNE_BATCH]);
-      const n = Number((row as { deleted?: unknown } | undefined)?.deleted ?? 0);
+      const [row] = await sql.unsafe<{ deleted: number }>(pruneStatement, [keepDays, PRUNE_BATCH]);
+      const n = Number(row?.deleted ?? 0);
       p.steps += 1;
       p.deleted += n;
       const more = n >= PRUNE_BATCH;
@@ -288,8 +301,8 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
 
   // Queues a pass when one is due; `record` calls it before its row is buffered.
   const maybePrune = (): void => {
-    if (retention === null || pass !== null || o.clock === undefined) return;
-    const now = o.clock.monotonic();
+    if (clock === null || pass !== null) return;
+    const now = clock.monotonic();
     if (lastPruneAt !== null && now - lastPruneAt < PRUNE_EVERY_MS) return;
     lastPruneAt = now;
     pass = { steps: 0, deleted: 0 };
