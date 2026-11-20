@@ -644,11 +644,15 @@ process.on("SIGTERM", async () => {
 - **Alert on the table, not the process.** `callLogRetentionStatus({ sql,
   table, retention })` reads both ends of `created_at` by the database clock
   and says `overdue` once the oldest row was more than `keepDays` plus
-  `RETENTION_SLACK_DAYS` (2, or `slackDays`) old when the newest was
-  written. That lag sees every way pruning stops while calls arrive (refused
+  `RETENTION_SLACK_DAYS` (2, or `slackDays`) old when the newest row over an
+  hour old was written. That lag sees every way pruning stops while rows
+  still land (refused
   deletes, retention not wired, a sink that never prunes), where a process's
   counters see only their own failures, and a quiet week (no calls, so no
-  pass) does not trip it. `renderCallLogMetrics({ prefix, table, counts:
+  pass) does not trip it, nor does the first call after one (its row
+  waits an hour before it counts, and its pass runs first). A first backlog
+  bigger than one pass reads overdue until it clears. When inserts fail
+  too the lag freezes; alert on `_failed_batches_total` for that. `renderCallLogMetrics({ prefix, table, counts:
   sink, status })` renders the sink's four counters
   (`<prefix>_call_log_dropped_total`, `_failed_batches_total`,
   `_prune_failures_total`, `_pruned_rows_total`) and, with a status,

@@ -31,12 +31,12 @@ const counts = (n: Partial<Record<keyof CallLogCounts, number>> = {}): CallLogCo
 });
 
 describe("callLogRetentionStatus", () => {
-  test("reads both ends of created_at in the quoted table, with no parameters", async () => {
+  test("reads the oldest and newest settled created_at of the quoted table, with no parameters", async () => {
     const { sql, sent } = fakeSql({ age: 10, lag: 5 });
     await callLogRetentionStatus({ sql, table, retention: { keepDays: 90 } });
     expect(sent).toEqual([{ statement: callLogRetentionRead(table), params: [] }]);
     expect(callLogRetentionRead(table)).toBe(
-      'select extract(epoch from (now() - min(created_at)))::float8 as age, extract(epoch from (max(created_at) - min(created_at)))::float8 as lag from "rootstock"."mcp_calls"',
+      'select extract(epoch from (now() - lo))::float8 as age, extract(epoch from (hi - lo))::float8 as lag from (select (select min(created_at) from "rootstock"."mcp_calls") as lo, (select max(created_at) from "rootstock"."mcp_calls" where created_at <= now() - make_interval(secs => 3600)) as hi) as ends',
     );
   });
 

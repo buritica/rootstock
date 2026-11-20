@@ -307,10 +307,10 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const table = { schema: s, name: "mcp_calls" };
     const retention = { keepDays: 30 };
-    const insertAgo = (days: number) =>
+    const insertAgo = (hours: number) =>
       sql.unsafe(
         `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
-         VALUES (now() - make_interval(days => ${days}), 'c', 't', '{}'::jsonb, 1, true)`,
+         VALUES (now() - make_interval(hours => ${hours}), 'c', 't', '{}'::jsonb, 1, true)`,
       );
     expect(await callLogRetentionStatus({ sql, table, retention })).toEqual({
       keepDays: 30,
@@ -318,25 +318,72 @@ describe("postgresCallLog", () => {
       lagSeconds: null,
       overdue: false,
     });
-    // Quiet: one row 40 days old and nothing since. Old, but no lag.
-    await insertAgo(40);
+    // Quiet: rows 40 and 39 days old and nothing since. Old, little lag.
+    await insertAgo(40 * 24);
+    await insertAgo(39 * 24);
     const quiet = await callLogRetentionStatus({ sql, table, retention });
     expect(quiet.overdue).toBe(false);
-    expect(quiet.lagSeconds).toBe(0);
+    expect(quiet.lagSeconds).toBeCloseTo(86_400, 0);
     expect(quiet.oldestAgeSeconds).toBeGreaterThanOrEqual(40 * 86_400);
     expect(quiet.oldestAgeSeconds).toBeLessThan(40 * 86_400 + 60);
-    // A call 9 days ago, so the lag is 31 days: within the slack.
-    await insertAgo(9);
-    const inSlack = await callLogRetentionStatus({ sql, table, retention });
-    expect(inSlack.overdue).toBe(false);
-    expect(inSlack.lagSeconds).toBeCloseTo(31 * 86_400, 0);
-    // A call now: the lag is 40 days, past 30 plus 2.
+    // The first call after the quiet spell, before its pass: not yet counted.
     await insertAgo(0);
-    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(false);
+    // Nor is a row dated in the future.
+    await insertAgo(-24 * 365);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(false);
+    // A call two hours ago that did not prune: the lag is 40 days, past 30 + 2.
+    await insertAgo(2);
+    const behind = await callLogRetentionStatus({ sql, table, retention });
+    expect(behind.overdue).toBe(true);
+    expect(behind.lagSeconds).toBeCloseTo(40 * 86_400 - 7_200, 0);
     expect((await callLogRetentionStatus({ sql, table, retention: null })).overdue).toBe(false);
     expect((await callLogRetentionStatus({ sql, table, retention, slackDays: 15 })).overdue).toBe(
       false,
     );
+  });
+
+  test("a sink's own pass clears overdue; a sink with deletes refused leaves it", async () => {
+    const s = await migrated();
+    const table = { schema: s, name: "mcp_calls" };
+    const retention = { keepDays: 30 };
+    // Calls kept arriving (one 2h ago) while nothing pruned a 400-day row.
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(hours => h), 'c', 't', '{}'::jsonb, 1, true
+       FROM unnest(ARRAY[400 * 24, 20 * 24, 2]) AS h`,
+    );
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    const run = async (client: Sql) => {
+      const { log, events } = captureLog();
+      const sink = postgresCallLog({
+        sql: client,
+        table,
+        maxBuffered: 10,
+        maxBatch: 10,
+        retention,
+        clock: manualClock(),
+        log,
+      });
+      sink.record(callRecord({ tool: "fresh" }));
+      await eventually(() => events.length === 1);
+      await sink.idle();
+      return sink;
+    };
+    // Deletes refused: the pass fails and the table still reads overdue.
+    const refusing = {
+      unsafe: (statement: string, params?: unknown[]) =>
+        /delete/i.test(statement)
+          ? Promise.reject(new Error("permission denied"))
+          : sql.unsafe(statement, params as never[]),
+    } as unknown as Sql;
+    expect((await run(refusing)).pruneFailures()).toBe(1);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    // A working sink's pass deletes the old row and the verdict clears.
+    expect((await run(sql)).pruned()).toBe(1);
+    const after = await callLogRetentionStatus({ sql, table, retention });
+    expect(after.overdue).toBe(false);
+    expect(after.lagSeconds).toBeCloseTo(20 * 86_400 - 7_200, 0);
   });
 
   test("retention deletes rows older than keepDays and keeps the rest", async () => {

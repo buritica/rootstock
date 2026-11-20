@@ -3,14 +3,25 @@ import { intIn, KEEP_DAYS_MAX, KEEP_DAYS_MIN, q, quoteTable } from "../internal/
 import { configError } from "./errors.ts";
 
 /**
- * Days past `keepDays` the retention may lag before it counts as behind. A
- * pass runs at most hourly and takes at most `PRUNE_STEPS` steps, so a
- * working retention keeps the lag within an hour or so of `keepDays` once a
- * backlog is cleared; two days leaves room for a large first backlog and a
- * failed pass, and is well short of a day of hourly failures.
+ * Days the lag may run past `keepDays` before the retention counts as
+ * behind, so a stall is seen about this long after it starts (while calls
+ * arrive). A working retention keeps the lag within an hour of `keepDays`;
+ * the slack covers a pass that failed and a backlog that takes a few passes
+ * to clear. A first backlog bigger than that (months of rows on a table
+ * that never pruned) reads overdue until it is cleared, at up to
+ * `PRUNE_STEPS` x `PRUNE_BATCH` rows a pass and one pass an hour while calls
+ * arrive.
  */
 export const RETENTION_SLACK_DAYS = 2;
 
+/**
+ * Rows newer than this are not yet a reference for the lag. A recorded call
+ * is inserted before the pass it queues deletes anything, so the first call
+ * after a quiet spell would otherwise read overdue until its pass finished.
+ * An hour is a pass interval; it also leaves out a `created_at` set in the
+ * future, which would pin the reference.
+ */
+const SETTLE_SECONDS = 3_600;
 const DAY_SECONDS = 86_400;
 const SLACK_DAYS_MAX = 365;
 
@@ -24,10 +35,11 @@ export interface CallLogRetentionStatus {
   /** Seconds since the oldest row was created; null for an empty table. */
   readonly oldestAgeSeconds: number | null;
   /**
-   * How old the oldest row was when the newest was written: the newest
-   * `created_at` minus the oldest; null for an empty table. A pass only runs
-   * when a call is recorded, so a quiet week ages the oldest row but leaves
-   * the lag alone, and only a retention that fails while calls arrive grows it.
+   * How old the oldest row was when the newest settled row was written: the
+   * newest `created_at` at least an hour old, minus the oldest; null while
+   * no row is that old. A pass only runs when a call is recorded, so a quiet
+   * week ages the oldest row but leaves the lag alone, and only a retention
+   * that fails while calls arrive grows it.
    */
   readonly lagSeconds: number | null;
   /**
@@ -39,11 +51,13 @@ export interface CallLogRetentionStatus {
 }
 
 /**
- * The one statement: `min` and `max` of `created_at` read the two ends of its
- * index (after a large prune, the old end walks dead entries until vacuum).
+ * The one statement: the oldest `created_at` and the newest settled one, each
+ * read from one end of the `created_at` index (after a large prune, the old
+ * end walks dead entries until vacuum).
  */
 export function callLogRetentionRead(table: Table): string {
-  return `select extract(epoch from (now() - min(created_at)))::float8 as age, extract(epoch from (max(created_at) - min(created_at)))::float8 as lag from ${quoteTable(table)}`;
+  const t = quoteTable(table);
+  return `select extract(epoch from (now() - lo))::float8 as age, extract(epoch from (hi - lo))::float8 as lag from (select (select min(created_at) from ${t}) as lo, (select max(created_at) from ${t} where created_at <= now() - make_interval(secs => ${SETTLE_SECONDS})) as hi) as ends`;
 }
 
 function seconds(raw: number | string | null | undefined, what: string): number | null {
@@ -57,11 +71,12 @@ function seconds(raw: number | string | null | undefined, what: string): number 
 
 /**
  * Whether the call log's retention is keeping up, from the table itself:
- * the lag between its oldest and newest rows against `keepDays` plus
+ * the lag between its oldest and newest settled rows against `keepDays` plus
  * `slackDays` (`RETENTION_SLACK_DAYS` unless given). It sees every way
- * pruning stops while calls arrive (refused deletes, retention not wired, a
- * sink that never runs a pass), not only the ones a process counts, and a
- * quiet spell does not trip it, so it is the check to alert on. Pass the same
+ * pruning stops while rows still land (refused deletes, retention not wired,
+ * a sink that never runs a pass), not only the ones a process counts, and a
+ * quiet spell does not trip it, so it is the check to alert on. When inserts
+ * fail too, the lag freezes: `failed_batches_total` is that alert. Pass the same
  * `retention` the sink got. One read; a database error rejects, so a caller
  * that renders metrics catches it and renders the counters without a status.
  */
@@ -160,7 +175,7 @@ export function renderCallLogMetrics(o: {
       `# TYPE ${p}_retention_overdue gauge`,
       `${p}_retention_overdue ${status.overdue ? 1 : 0}`,
       "",
-      `# HELP ${p}_retention_lag_seconds Age of the oldest call-log row when the newest was written (0 when the table is empty)`,
+      `# HELP ${p}_retention_lag_seconds Age of the oldest call-log row when the newest row over an hour old was written (0 when there is none)`,
       `# TYPE ${p}_retention_lag_seconds gauge`,
       `${p}_retention_lag_seconds ${status.lagSeconds ?? 0}`,
       "",
