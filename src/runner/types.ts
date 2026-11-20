@@ -158,8 +158,13 @@ export interface BeforeSettleContext {
   readonly backfill: boolean;
   /** The run's buckets and counters as they will be settled: a frozen copy. */
   readonly counts: Readonly<PullCounts>;
-  /** Records an override flag on the run row (`Run.override`). A bad flag throws. */
-  override(flag: string): void;
+  /**
+   * Records an override flag and writes it to the running row at once
+   * (`Run.recordOverride`), so a run killed mid-hook still shows it. Await it
+   * before the act the flag allows. Rejects on a bad flag, a database error,
+   * or a row no longer running: then do not act.
+   */
+  override(flag: string): Promise<void>;
   /**
    * Adds n (default 1) to a counter on the run row (`Run.count`). Unlike a
    * load's `ctx.count`, a bad name or n throws, and so do the runner's own
@@ -169,7 +174,12 @@ export interface BeforeSettleContext {
   count(name: string, n?: number): void;
   /** Adds tokens for a model to the run row (`Run.meter`). A bad call throws. */
   meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
-  /** The lock's gate. A refusal settles the run `lost-lock`, even when the hook catches it. */
+  /**
+   * The lock's gate. A refusal settles the run `lost-lock`, even when the hook
+   * catches it or never awaits it. The gate before the hook does not fence
+   * the hook's own writes: call this inside the hook's transaction, just
+   * before it commits, as the runner does for a batch.
+   */
   ensureExclusive(): Promise<void>;
 }
 
@@ -404,6 +414,16 @@ export type RunnerEvent =
       runId: string;
       call: "account" | "count" | "meter";
       error: unknown;
+    }
+  | { type: "runner.before_settle_started"; job: string; runId: string }
+  | {
+      type: "runner.before_settle_finished";
+      job: string;
+      runId: string;
+      outcome: "ok" | "before-settle" | "lost-lock";
+      ms: number;
+      /** What the hook threw, also when the lock's refusal decided the outcome. */
+      error?: unknown;
     }
   | {
       type: "runner.pull_finished";

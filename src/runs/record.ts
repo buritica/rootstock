@@ -77,6 +77,14 @@ export interface Run {
   account(a: Accounting): void;
   /** Records an override flag given for this run (e.g. a brake allowed). Deduplicated, in call order. */
   override(flag: string): void;
+  /**
+   * `override(flag)`, then writes the run's overrides to its running row at
+   * once, so a run killed before it settles still shows the flag (an
+   * interrupted row keeps it). Call it before the act the flag allows.
+   * Resolves false when the row is no longer running (settled elsewhere):
+   * the caller should not act. A database error rejects.
+   */
+  recordOverride(flag: string): Promise<boolean>;
   /** The scope this run covered, for the next run's scope guard. */
   scope(value: unknown, excluded?: unknown): void;
   /** Deletes the running row. For a run that turned out to have nothing to do. */
@@ -553,6 +561,14 @@ function makeRun(
     return { written: true, ...settled };
   };
 
+  function addOverride(flag: string, call = "override"): void {
+    open(call);
+    if (typeof flag !== "string" || !COUNTER.test(flag)) {
+      throw input(`${call}(${q(flag)}): flag must match [a-z0-9_.:-]{1,64}`);
+    }
+    if (!overrides.includes(flag)) overrides.push(flag);
+  }
+
   return Object.freeze({
     ...ids,
     count(name: string, n: number = 1) {
@@ -598,12 +614,11 @@ function makeRun(
       if (!decl.reconciles) throw input(`account(): ${job} is declared reconciles: false`);
       accounting = checkAccounting(a, job, slice.maxScopeBytes);
     },
-    override(flag: string) {
-      open("override");
-      if (typeof flag !== "string" || !COUNTER.test(flag)) {
-        throw input(`override(${q(flag)}): flag must match [a-z0-9_.:-]{1,64}`);
-      }
-      if (!overrides.includes(flag)) overrides.push(flag);
+    override: addOverride,
+    async recordOverride(flag: string): Promise<boolean> {
+      addOverride(flag, "recordOverride");
+      const rows = await sql.unsafe(statements.overrides, [id, holder, JSON.stringify(overrides)]);
+      return rows.length > 0;
     },
     scope(value: unknown, excluded?: unknown) {
       open("scope");

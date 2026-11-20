@@ -317,18 +317,26 @@ forward on 0.8.x only: an older line can never ship a migration there.
   Retracting what a source no longer lists can only run once the listing is
   done. `beforeSettle(ctx)` runs once, after every batch committed and the
   buckets balance, with the lock gated just before and the row still
-  `running`, so `ctx.override(flag)` (a brake the operator lifted),
-  `ctx.count(name, n)` and `ctx.meter(...)` land on this run's row
-  (`rootstock.runs.overrides`, `counts`, `tokens`); unlike a load's context,
-  a bad call throws, and so does a count of the runner's own `fetched` or
-  `repointed`. It is never called on a failed run. It is called on an empty
+  `running`. `await ctx.override(flag)` (a brake the operator lifted) writes
+  the flag to the running row at once (`Run.recordOverride`), so a run killed
+  mid-hook still shows it once settled `interrupted`: call it before the act
+  the flag allows, and do not act if it rejects (the row is no longer
+  running). `ctx.count(name, n)` and `ctx.meter(...)` land on the row when it
+  settles (`counts`, `tokens`); unlike a load's context, a bad call throws,
+  and so does a count of the runner's own `fetched` or `repointed`.
+- **The hook is not called on a failed run.** It is called on an empty
   listing, and on an incremental run whose listing started from a cursor:
   `ctx.backfill` flags a window, but only the source knows whether any other
   listing covered everything, so a hook that removes what was not listed
-  checks that itself. A throw settles the run `failed` (`before-settle`) and
-  is not rethrown; a refusal from `ctx.ensureExclusive()` settles it
-  `lost-lock` even when the hook caught it. The hook bounds its own time
-  (one that never resolves keeps the row running and the lock held), and the
+  checks that itself.
+- **The hook fences its own writes.** The gate before it does not cover
+  them: call `ctx.ensureExclusive()` inside the hook's transaction, just
+  before it commits. A refusal settles the run `lost-lock`, even when the
+  hook caught it or never awaited it; any other throw settles it
+  `before-settle` and is not rethrown. Either way the row's `phase` is
+  `before-settle`, and `runner.before_settle_started`/`_finished` (outcome,
+  ms, the hook's error) bracket the hook. The hook bounds its own time (one
+  that never resolves keeps the row running and the lock held), and the
   context refuses calls after the hook returns.
 - **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run
   at once. A refusal from `runs` emits `runner.settle_refused` and never

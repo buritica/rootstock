@@ -357,7 +357,7 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
     }
   };
 
-  const settle = async (failure?: PullFailure): Promise<PullReport> => {
+  const settle = async (failure?: PullFailure, phase?: string): Promise<PullReport> => {
     // P9 (F19): account first, then each count, each guarded.
     guarded("account", () =>
       run.account({
@@ -375,7 +375,15 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
     const f: PullFailure | undefined = failure ?? (balanced ? undefined : { kind: "identity" });
     const status = f === undefined ? "ok" : "failed";
     const reason = f === undefined || f.kind === "identity" ? undefined : reasonOf(f);
-    const finish = await run.finish(status, reason === undefined ? undefined : { reason });
+    const finish = await run.finish(
+      status,
+      reason === undefined && phase === undefined
+        ? undefined
+        : {
+            ...(reason === undefined ? {} : { reason }),
+            ...(phase === undefined ? {} : { phase }),
+          },
+    );
     emit({
       type: "runner.pull_finished",
       job: source.job,
@@ -396,9 +404,9 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
   };
 
   let settled = false;
-  const settleOnce = (failure?: PullFailure): Promise<PullReport> => {
+  const settleOnce = (failure?: PullFailure, phase?: string): Promise<PullReport> => {
     settled = true;
-    return settle(failure);
+    return settle(failure, phase);
   };
   try {
     return await pullLocked(args, deps, run, counts, settleOnce, emit, guarded, describe);
@@ -420,7 +428,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
   deps: PullDeps,
   run: Run,
   counts: PullCounts,
-  settle: (failure?: PullFailure) => Promise<PullReport>,
+  settle: (failure?: PullFailure, phase?: string) => Promise<PullReport>,
   emit: (e: RunnerEvent) => void,
   guarded: (call: "account" | "count" | "meter", f: () => void) => void,
   describe: (err: unknown) => string,
@@ -740,64 +748,120 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
     } catch (error) {
       return settle({ kind: "lost-lock", error });
     }
-    let open = true;
-    /** Set when the hook's own gate refused: the run settles lost-lock, whatever the hook did with the refusal. */
-    let lostInHook: { error: unknown } | undefined;
-    const live = (call: string): void => {
-      if (!open) {
-        throw new RootstockRunnerError(
-          "ERR_ROOTSTOCK_RUNNER_INPUT",
-          `beforeSettle(): ctx.${call}() called after the hook returned`,
-        );
-      }
-    };
-    const ctx: BeforeSettleContext = Object.freeze({
+    const outcome = await runBeforeSettle(args.beforeSettle, {
+      run,
+      gate,
       job: source.job,
       mode: args.mode,
-      runId: run.id,
       backfill,
-      counts: frozenCounts(counts),
-      override(flag: string) {
-        live("override");
-        run.override(flag);
-      },
-      count(name: string, n?: number) {
-        live("count");
-        if (RUNNER_COUNTERS.has(name)) {
-          throw new RootstockRunnerError(
-            "ERR_ROOTSTOCK_RUNNER_INPUT",
-            `beforeSettle(): ctx.count(${q(name)}): the runner writes that counter itself`,
-          );
-        }
-        run.count(name, n);
-      },
-      meter(model: string, inTok: number, outTok: number, opts?: { estimated?: boolean }) {
-        live("meter");
-        run.meter(model, inTok, outTok, opts);
-      },
-      async ensureExclusive() {
-        live("ensureExclusive");
-        try {
-          await gate();
-        } catch (error) {
-          lostInHook = { error };
-          throw error;
-        }
-      },
+      counts,
+      emit,
+      now: deps.runs.now,
     });
-    let hookError: { error: unknown } | undefined;
-    try {
-      await args.beforeSettle(ctx);
-    } catch (error) {
-      hookError = { error };
-    } finally {
-      open = false;
-    }
-    // A refused gate fails closed even when the hook caught it and returned.
-    if (lostInHook !== undefined) return settle({ kind: "lost-lock", error: lostInHook.error });
-    if (hookError !== undefined) return settle({ kind: "before-settle", error: hookError.error });
+    if (outcome !== undefined) return settle(outcome, BEFORE_SETTLE_PHASE);
   }
   return settle();
+}
+
+/** The row's phase for a run the hook failed, so it reads apart from a batch's lost lock. */
+const BEFORE_SETTLE_PHASE = "before-settle";
+
+/**
+ * Calls the hook with its context and answers the failure to settle with, or
+ * undefined. A gate the hook started and that refused, awaited or not, is
+ * `lost-lock` whatever the hook did; else a throw is `before-settle`.
+ */
+async function runBeforeSettle(
+  hook: NonNullable<PullArgs<PullRef, PullDoc, unknown>["beforeSettle"]>,
+  a: {
+    run: Run;
+    gate: () => Promise<void>;
+    job: string;
+    mode: string;
+    backfill: boolean;
+    counts: PullCounts;
+    emit: (e: RunnerEvent) => void;
+    now: () => number;
+  },
+): Promise<PullFailure | undefined> {
+  const { run, job } = a;
+  let open = true;
+  const gates: Promise<void>[] = [];
+  let lost: { error: unknown } | undefined;
+  const live = (call: string): void => {
+    if (!open) {
+      throw new RootstockRunnerError(
+        "ERR_ROOTSTOCK_RUNNER_INPUT",
+        `beforeSettle(): ctx.${call}() called after the hook returned`,
+      );
+    }
+  };
+  const ctx: BeforeSettleContext = Object.freeze({
+    job,
+    mode: a.mode,
+    runId: run.id,
+    backfill: a.backfill,
+    counts: frozenCounts(a.counts),
+    async override(flag: string) {
+      live("override");
+      if (!(await run.recordOverride(flag))) {
+        throw new RootstockRunnerError(
+          "ERR_ROOTSTOCK_RUNNER_INPUT",
+          `beforeSettle(): ctx.override(${q(flag)}): the run's row is no longer running`,
+        );
+      }
+    },
+    count(name: string, n?: number) {
+      live("count");
+      if (RUNNER_COUNTERS.has(name)) {
+        throw new RootstockRunnerError(
+          "ERR_ROOTSTOCK_RUNNER_INPUT",
+          `beforeSettle(): ctx.count(${q(name)}): the runner writes that counter itself`,
+        );
+      }
+      run.count(name, n);
+    },
+    meter(model: string, inTok: number, outTok: number, opts?: { estimated?: boolean }) {
+      live("meter");
+      run.meter(model, inTok, outTok, opts);
+    },
+    ensureExclusive() {
+      live("ensureExclusive");
+      const g = a.gate().catch((error: unknown) => {
+        lost ??= { error };
+        throw error;
+      });
+      gates.push(g.catch(() => undefined));
+      return g;
+    },
+  });
+  const started = a.now();
+  a.emit({ type: "runner.before_settle_started", job, runId: run.id });
+  let threw: { error: unknown } | undefined;
+  try {
+    await hook(ctx);
+  } catch (error) {
+    threw = { error };
+  } finally {
+    open = false;
+  }
+  // A gate the hook did not await still counts.
+  await Promise.all(gates);
+  const failure: PullFailure | undefined =
+    lost !== undefined
+      ? { kind: "lost-lock", error: lost.error }
+      : threw !== undefined
+        ? { kind: "before-settle", error: threw.error }
+        : undefined;
+  a.emit({
+    type: "runner.before_settle_finished",
+    job,
+    runId: run.id,
+    outcome: failure?.kind ?? "ok",
+    ms: Math.max(0, a.now() - started),
+    ...(threw === undefined ? {} : { error: threw.error }),
+  });
+  return failure;
 }
 
 /** The counters `settle` writes; a hook adding to them would inflate the runner's. */
