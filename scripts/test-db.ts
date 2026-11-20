@@ -1,6 +1,11 @@
 import { hostname } from "node:os";
 import { SQL } from "bun";
-import { TEST_TRANSACTOR_KINDS } from "../src/db/test-client.pg-support.ts";
+import {
+  HYPOTHESES_ENV,
+  lockDriverOf,
+  SUITE_MARKERS,
+  TEST_TRANSACTOR_KINDS,
+} from "../src/db/test-client.pg-support.ts";
 import {
   GOLDEN_LABELS,
   startThrowawayPostgres,
@@ -10,6 +15,9 @@ import {
 /**
  * The DB test matrix: every `src/**\/*.pg.ts` suite, once per transactor kind,
  * against each digest-pinned Postgres image, on the Bun running this script.
+ * Suites marked driver-only skip `drizzle` ({@link suitesFor}). `--hypotheses`
+ * runs only the suites marked hypotheses, with the hypothesis tests switched
+ * on, under one kind per lock driver (see .github/workflows/hypotheses.yml).
  *
  * Red, never empty: it fails when docker is missing, when no suite is found,
  * when a container will not start, when any run exits non-zero, and when any
@@ -23,6 +31,64 @@ export const IMAGES = [
 ] as const;
 
 export const TRANSACTORS = TEST_TRANSACTOR_KINDS;
+
+/** The kinds `--hypotheses` runs under: one per lock driver, never `drizzle`. */
+export const HYPOTHESIS_TRANSACTORS = TRANSACTORS.filter((k) => lockDriverOf(k) === k);
+
+/** A suite and the markers its header lines carry ({@link SUITE_MARKERS}). */
+export interface Suite {
+  path: string;
+  driverOnly: boolean;
+  hypotheses: boolean;
+  /** `hypothesisIf` calls: the most hypothesis tests a hypotheses run may skip. */
+  conditional: number;
+}
+
+/** The markers in a suite's leading `//` lines. */
+function headerOf(text: string): string[] {
+  const header: string[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("//")) break;
+    header.push(line.trim());
+  }
+  return header;
+}
+
+export function markersOf(text: string): { driverOnly: boolean; hypotheses: boolean } {
+  const header = headerOf(text);
+  return {
+    driverOnly: header.includes(SUITE_MARKERS.driverOnly),
+    hypotheses: header.includes(SUITE_MARKERS.hypotheses),
+  };
+}
+
+/**
+ * A marker that disagrees with the suite's code: a suite calling `hypothesis`
+ * or `hypothesisIf` without the hypotheses marker would never run them, and
+ * the marker on a suite with none would run it for nothing.
+ */
+export function markerProblem(path: string, text: string): string | null {
+  const known = new Set<string>(Object.values(SUITE_MARKERS));
+  const unknown = headerOf(text).find((l) => l.startsWith("// rootstock-test:") && !known.has(l));
+  if (unknown !== undefined) return `${path} has an unknown marker "${unknown}"`;
+  const calls = /^\s*hypothesis(?:If\(.*?\))?\(/m.test(text);
+  const marked = markersOf(text).hypotheses;
+  if (calls && !marked) return `${path} calls hypothesis() but lacks "${SUITE_MARKERS.hypotheses}"`;
+  if (marked && !calls) return `${path} is marked hypotheses but calls no hypothesis()`;
+  return null;
+}
+
+/**
+ * What one run covers. Normally every suite, less the driver-only ones under
+ * `drizzle`, whose lock session maps to postgres.js and so repeats the
+ * `postgres-js` run. With `--hypotheses`, only the hypotheses suites.
+ */
+export function suitesFor(kind: string, suites: readonly Suite[], hypotheses: boolean): string[] {
+  const keep = hypotheses
+    ? (s: Suite) => s.hypotheses
+    : (s: Suite) => kind !== "drizzle" || !s.driverOnly;
+  return suites.filter(keep).map((s) => s.path);
+}
 
 const ROOT = `${import.meta.dir}/..`;
 
@@ -43,6 +109,23 @@ export async function suitesUnder(root: string): Promise<string[]> {
   return found.sort();
 }
 
+/** Each suite with its markers, and every marker that disagrees with its suite. */
+export async function readSuites(
+  root: string,
+  paths: readonly string[],
+): Promise<{ suites: Suite[]; problems: string[] }> {
+  const suites: Suite[] = [];
+  const problems: string[] = [];
+  for (const path of paths) {
+    const text = await Bun.file(`${root}/${path}`).text();
+    const conditional = text.match(/^\s*hypothesisIf\(/gm)?.length ?? 0;
+    suites.push({ path, ...markersOf(text), conditional });
+    const problem = markerProblem(path, text);
+    if (problem !== null) problems.push(problem);
+  }
+  return { suites, problems };
+}
+
 /**
  * How many tests a `bun test` run reports as passed, or 0 when it reports none.
  * Skipped and todo tests are not passes. The last summary wins, so a test that
@@ -50,6 +133,13 @@ export async function suitesUnder(root: string): Promise<string[]> {
  */
 export function testsPassed(output: string): number {
   const counts = [...output.matchAll(/^\s*(\d+) pass$/gm)];
+  const last = counts.at(-1);
+  return last ? Number(last[1]) : 0;
+}
+
+/** How many tests a `bun test` run reports as skipped, or 0. The last summary wins. */
+export function testsSkipped(output: string): number {
+  const counts = [...output.matchAll(/^\s*(\d+) skip$/gm)];
   const last = counts.at(-1);
   return last ? Number(last[1]) : 0;
 }
@@ -86,11 +176,22 @@ const live: { child: Bun.Subprocess | null; starting: boolean; exitCode: number 
   exitCode: null,
 };
 
-async function runSuites(url: string, kind: string, suites: string[]): Promise<string | null> {
+async function runSuites(
+  url: string,
+  kind: string,
+  suites: string[],
+  hypotheses: boolean,
+  maxSkips: number,
+): Promise<string | null> {
   // process.execPath, never "bun" from PATH: the oldest-Bun job must run its own Bun.
   const proc = Bun.spawn([process.execPath, "test", ...suites], {
     cwd: ROOT,
-    env: { ...process.env, ROOTSTOCK_TEST_DATABASE_URL: url, ROOTSTOCK_TEST_TRANSACTOR: kind },
+    env: {
+      ...process.env,
+      ROOTSTOCK_TEST_DATABASE_URL: url,
+      ROOTSTOCK_TEST_TRANSACTOR: kind,
+      [HYPOTHESES_ENV]: hypotheses ? "1" : "",
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -103,6 +204,12 @@ async function runSuites(url: string, kind: string, suites: string[]): Promise<s
   live.child = null;
   if (code !== 0) return `exited ${code}${proc.signalCode ? ` (${proc.signalCode})` : ""}`;
   if (testsPassed(stdout + stderr) === 0) return "reported 0 passing tests";
+  // A hypotheses run that skips more than its Bun-version cells allow did not
+  // get the switch: the plain tests in its suites would pass it anyway.
+  const skipped = testsSkipped(stdout + stderr);
+  if (hypotheses && skipped > maxSkips) {
+    return `skipped ${skipped} tests, at most ${maxSkips} expected — were the hypotheses switched on?`;
+  }
   return null;
 }
 
@@ -183,12 +290,19 @@ async function main(): Promise<number> {
     );
     return 1;
   }
-  const suites = await suitesUnder(ROOT);
-  if (suites.length === 0) {
+  const hypotheses = process.argv.includes("--hypotheses");
+  const all = await suitesUnder(ROOT);
+  if (all.length === 0) {
     out("test:db: no src/**/*.pg.ts suite found — refusing to pass empty");
     return 1;
   }
-  out(`test:db: Bun ${Bun.version}, suites: ${suites.join(" ")}`);
+  const { suites, problems } = await readSuites(ROOT, all);
+  if (problems.length > 0) {
+    out(`test:db: suite markers disagree with their code:\n  ${problems.join("\n  ")}`);
+    return 1;
+  }
+  const kinds: readonly string[] = hypotheses ? HYPOTHESIS_TRANSACTORS : TRANSACTORS;
+  out(`test:db: Bun ${Bun.version}${hypotheses ? ", hypotheses" : ""}, kinds: ${kinds.join(" ")}`);
   const failures: string[] = [];
   for (const image of IMAGES) {
     const name = image.split("@")[0];
@@ -203,9 +317,19 @@ async function main(): Promise<number> {
       continue;
     }
     try {
-      for (const kind of TRANSACTORS) {
-        out(`\n=== ${name} · ${kind} ===`);
-        const failure = await runSuites(await databaseFor(pg.url, kind), kind, suites);
+      for (const kind of kinds) {
+        const own = suitesFor(kind, suites, hypotheses);
+        out(`\n=== ${name} · ${kind}: ${own.join(" ")} ===`);
+        // No file arguments would make `bun test` run the whole repo.
+        if (own.length === 0) {
+          failures.push(`${name} · ${kind}: no suite selected`);
+          continue;
+        }
+        const maxSkips = suites
+          .filter((s) => own.includes(s.path))
+          .reduce((n, s) => n + s.conditional, 0);
+        const url = await databaseFor(pg.url, kind);
+        const failure = await runSuites(url, kind, own, hypotheses, maxSkips);
         if (failure !== null) failures.push(`${name} · ${kind}: ${failure}`);
       }
     } catch (err) {
@@ -218,7 +342,7 @@ async function main(): Promise<number> {
     out(`\ntest:db: FAILED\n${failures.map((f) => `  ${f}`).join("\n")}`);
     return 1;
   }
-  out(`\ntest:db: ${IMAGES.length * TRANSACTORS.length} runs passed`);
+  out(`\ntest:db: ${IMAGES.length * kinds.length} runs passed`);
   return 0;
 }
 

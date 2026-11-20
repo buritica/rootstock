@@ -1,7 +1,15 @@
+import { test } from "bun:test";
 import { SQL } from "bun";
 import postgres from "postgres";
 import { bunSqlOptions, clientSlice, postgresJsOptions, type Sql } from "../db/index.ts";
-import { required, testDatabaseUrlFor, testTransactorKind } from "../db/test-client.pg-support.ts";
+import {
+  HYPOTHESES_ENV,
+  type LockDriver,
+  lockDriverOf,
+  required,
+  testDatabaseUrlFor,
+  testTransactorKind,
+} from "../db/test-client.pg-support.ts";
 
 /**
  * Lock-session fixtures for the lock DB suites. Under kind `bun-sql` the lock
@@ -9,7 +17,7 @@ import { required, testDatabaseUrlFor, testTransactorKind } from "../db/test-cli
  * a postgres.js `max: 1` client (contract §3). Every value is synthetic.
  */
 
-export type LockDriver = "postgres-js" | "bun-sql";
+export type { LockDriver };
 
 export function testUrl(): string {
   return required("ROOTSTOCK_TEST_DATABASE_URL");
@@ -20,7 +28,7 @@ export const testKind = testTransactorKind;
 
 /** The driver the lock session uses under the kind under test. */
 export function lockDriver(): LockDriver {
-  return testKind() === "bun-sql" ? "bun-sql" : "postgres-js";
+  return lockDriverOf(testKind());
 }
 
 /**
@@ -117,3 +125,18 @@ export function openRaw(max = 1): { sql: Sql; end: () => Promise<void> } {
 export function otherDatabaseUrl(database: string): string {
   return testDatabaseUrlFor(database);
 }
+
+const HYPOTHESES = process.env[HYPOTHESES_ENV] === "1";
+
+/** A hypothesis test, further gated on `condition` (a Bun-version cell). */
+export function hypothesisIf(condition: boolean): typeof test {
+  return test.if(HYPOTHESES && condition);
+}
+
+/**
+ * A D-S1 / C-S1 hypothesis test: a measurement of Postgres or driver
+ * behaviour, not of rootstock code. Runs only under `bun run
+ * test:db:hypotheses` (why: `.github/workflows/hypotheses.yml`); a suite that
+ * uses it carries the `hypotheses` marker (`SUITE_MARKERS`).
+ */
+export const hypothesis = hypothesisIf(true);
