@@ -22,8 +22,9 @@ export interface UsageSliceInput {
     maxBuffered: number;
     maxBatch: number;
     /**
-     * Rows older than `keepDays` (7 to 3650) are deleted by the sink's
-     * writer; null keeps every row. Required, so each consumer decides.
+     * Rows older than `keepDays` (7 to 3650) are deleted by
+     * `postgresCallLog`'s writer when the app passes this to it; null keeps
+     * every row. Required, so each consumer decides.
      */
     retention: { keepDays: number } | null;
   } | null;

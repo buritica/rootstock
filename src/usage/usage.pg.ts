@@ -5,7 +5,7 @@ import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-sup
 import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
-import { postgresCallLog } from "./call-log.ts";
+import { PRUNE_BATCH, postgresCallLog } from "./call-log.ts";
 import { callRecord, captureLog, manualClock } from "./fixtures.test-support.ts";
 import { createSpendCeiling, postgresSpendStore, type SpendStore } from "./spend.ts";
 
@@ -321,6 +321,7 @@ describe("postgresCallLog", () => {
       log,
     });
     sink.record(callRecord({ tool: "fresh" }));
+    await eventually(() => events.length === 1);
     await sink.idle();
     const left = await sql.unsafe<{ tool: string }>(
       `SELECT tool FROM "${s}".mcp_calls ORDER BY tool`,
@@ -329,6 +330,59 @@ describe("postgresCallLog", () => {
     expect(events).toEqual([
       { event: "usage.call_log_pruned", fields: { deleted: 3, keepDays: 30, more: false } },
     ]);
+  });
+});
+
+/** Waits (real time, at most 5 s) until `cond` holds, then asserts it. */
+async function eventually(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !cond(); i++) await Bun.sleep(10);
+  expect(cond()).toBe(true);
+}
+
+describe("postgresCallLog retention across steps and processes", () => {
+  test("two sinks on one table work off a multi-step backlog oldest first, without failing or overlapping", async () => {
+    const s = await migrated();
+    const aged = PRUNE_BATCH * 3 + 7;
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(days => 40, secs => i), 'c', 'aged', '{}'::jsonb, 1, true
+       FROM generate_series(1, ${aged}) AS i`,
+    );
+    const second = openSecondClient();
+    const secondSql = (second.kind === "drizzle"
+      ? second.client.$client
+      : second.client) as unknown as Sql;
+    try {
+      const sinks = [sql, secondSql].map((client) => {
+        const { log, events } = captureLog();
+        const sink = postgresCallLog({
+          sql: client,
+          table: { schema: s, name: "mcp_calls" },
+          maxBuffered: 10,
+          maxBatch: 10,
+          retention: { keepDays: 30 },
+          clock: manualClock(),
+          log,
+        });
+        return { sink, events };
+      });
+      for (const { sink } of sinks) sink.record(callRecord({ tool: "fresh" }));
+      const counted = () =>
+        sinks.reduce(
+          (n, { events }) => n + events.reduce((m, e) => m + Number(e.fields.deleted ?? 0), 0),
+          0,
+        );
+      await eventually(() => counted() === aged);
+      for (const { sink } of sinks) await sink.idle();
+      const all = sinks.flatMap(({ events }) => events);
+      expect(all.every((e) => e.event === "usage.call_log_pruned")).toBe(true);
+      const left = await sql.unsafe<{ tool: string; n: number }>(
+        `SELECT tool, count(*)::int AS n FROM "${s}".mcp_calls GROUP BY tool`,
+      );
+      expect(left).toEqual([{ tool: "fresh", n: 2 }]);
+    } finally {
+      await second.close();
+    }
   });
 });
 

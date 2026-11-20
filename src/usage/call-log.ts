@@ -49,22 +49,26 @@ export function callLogInsert(table: { schema: string; name: string }): string {
 }
 
 /** Rows one prune step deletes. */
-export const PRUNE_BATCH = 5_000;
-/** Steps one prune pass takes at most; a pass that reaches it is due again at once. */
-export const PRUNE_STEPS = 10;
-/** How long after a pass starts the next one is due. */
+export const PRUNE_BATCH = 1_000;
+/** Steps one prune pass takes at most. */
+export const PRUNE_STEPS = 20;
+/** How long after a pass is queued the next one is due. */
 export const PRUNE_EVERY_MS = 60 * 60 * 1000;
+/** How long after a pass that stopped at `PRUNE_STEPS` with rows left the next one is due. */
+export const PRUNE_SOON_MS = 60 * 1000;
 
 /**
  * One prune step: up to `$2` of the oldest rows created more than `$1` days
  * ago, by the server's clock, answering `deleted`. `now()`, not
  * `clock_timestamp()`: a volatile cutoff cannot bound the `created_at` index
- * scan, so a pass that finds nothing would read the whole table. `id` keys
- * the delete.
+ * scan, so a pass that finds nothing would read the whole table. `skip
+ * locked`: processes pruning one table at once take disjoint rows instead of
+ * waiting on each other's. The table needs a unique `id` and `created_at`
+ * (rootstock's `mcp_calls` has both).
  */
 export function callLogPrune(table: { schema: string; name: string }): string {
   const t = quoteTable(table);
-  return `with d as (delete from ${t} where id in (select id from ${t} where created_at < now() - make_interval(days => $1::int) order by created_at limit $2::int) returning 1) select count(*)::int as deleted from d`;
+  return `with d as (delete from ${t} where id in (select id from ${t} where created_at < now() - make_interval(days => $1::int) order by created_at limit $2::int for update skip locked) returning 1) select count(*)::int as deleted from d`;
 }
 
 /** A tool name as stored and logged: the client names it on a rejected call, so it is capped. */
@@ -140,8 +144,9 @@ export interface PostgresCallLogOptions {
   /** Rows per INSERT. */
   readonly maxBatch: number;
   /**
-   * Deletes rows older than `keepDays` (7 to 3650), at most once an hour;
-   * null keeps every row. The usage slice's `callLog.retention`.
+   * Deletes rows older than `keepDays` (7 to 3650), a pass an hour (a minute
+   * while a backlog lasts); null keeps every row. Pass the usage slice's
+   * `callLog.retention`.
    */
   readonly retention: { readonly keepDays: number } | null;
   /** Times the prune passes (`monotonic`). Required with a retention. */
@@ -153,7 +158,9 @@ export type PostgresCallLog = CallSink & {
   /**
    * Resolves once the buffer is empty and the writer has stopped, so only
    * once intake has stopped: rows recorded meanwhile are written first. A
-   * hung insert hangs it too: shutdown bounds the wait (serve's `flushMs`).
+   * prune pass is dropped after its step in flight, so shutdown waits for at
+   * most one delete. A hung insert or delete hangs it too: shutdown bounds
+   * the wait (serve's `flushMs`).
    */
   idle(): Promise<void>;
   /** Rows dropped on a full buffer since this sink was made. */
@@ -177,20 +184,23 @@ export type PostgresCallLog = CallSink & {
  * `usage.call_log_recovered_insert` {failedBatches, rows}. Neither `record`
  * nor the writer ever throws or rejects: a throwing `log` is swallowed.
  *
- * With a `retention`, the same writer prunes: a record made when a pass is
- * due (the first one, then an hour after the last pass started) queues one,
- * which deletes the rows older than `keepDays` in steps of `PRUNE_BATCH`,
- * inserting any buffered rows before each step, until a step comes back
- * short or `PRUNE_STEPS` steps have run (the rest is then due at once). A
- * pass that deleted rows logs `usage.call_log_pruned` {deleted, keepDays,
- * more}; a refused step ends its pass with `usage.call_log_prune_failed`
- * {keepDays, deleted, errorClass}, and the next pass waits the hour. No
- * traffic, no pass: no new rows either. Deletes are idempotent, so several
- * processes on one table may prune at once.
+ * With a `retention`, the same writer prunes. A record made when a pass is
+ * due (the first one, then `PRUNE_EVERY_MS` after the last pass was queued)
+ * queues one, which deletes the rows older than `keepDays` in steps of
+ * `PRUNE_BATCH`, at most one INSERT between two steps (so steady traffic
+ * cannot starve a pass, nor a pass the inserts), until a step comes back
+ * short or `PRUNE_STEPS` steps have run. A pass that stopped at the cap with
+ * rows left makes the next one due `PRUNE_SOON_MS` after it ends, so a
+ * backlog (say, retention turned on over months of rows) is worked off a
+ * pass a minute, never back to back. A pass that deleted rows logs
+ * `usage.call_log_pruned` {deleted, keepDays, more}; a refused step ends its
+ * pass with `usage.call_log_prune_failed` {keepDays, deleted, errorClass}
+ * and the next pass waits the hour. No traffic, no pass: no new rows either.
+ * Processes pruning one table at once skip each other's locked rows.
  *
  * The sink sets no timeout on an insert or a prune step (the driver's or the
  * server's statement timeout applies); serve's `flushMs` bounds the wait at
- * shutdown, where `idle()` also waits for a pass in flight.
+ * shutdown.
  */
 export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   if (!intIn(o.maxBuffered, 1, MAX_BUFFERED)) {
@@ -221,9 +231,11 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   // Both null without a retention; the checks above make the clock present with one.
   const keepDays = retention === null ? null : retention.keepDays;
   const clock = retention === null ? null : (o.clock as Pick<Clock, "monotonic">);
-  // When the last pass started (null: due now), and the pass queued or running.
-  let lastPruneAt: number | null = null;
+  // When the next pass is due (null: now), the pass queued or running, and
+  // how many idle() calls are waiting (a pending pass is dropped meanwhile).
+  let nextPruneAt: number | null = null;
   let pass: { steps: number; deleted: number } | null = null;
+  let idling = 0;
   const buffer: { tool: string; json: string }[] = [];
   let writer: Promise<void> | null = null;
   let streak = 0;
@@ -233,17 +245,23 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
   let failStreakRows = 0;
   let failedTotal = 0;
 
-  // Clears `writer` in the same synchronous step that sees the buffer empty,
-  // so no row is stranded between "nothing left" and "writer gone"; the
-  // `finally` clears it on any other way out too, so a later record starts a
-  // fresh writer. Every insert error is caught inside.
+  // Clears `writer` in the same synchronous step that sees the buffer empty
+  // and no pass to run, so no row is stranded between "nothing left" and
+  // "writer gone"; the `finally` clears it on any other way out too, so a
+  // later record starts a fresh writer. Every insert and prune error is
+  // caught inside. A pending pass and the buffer take turns.
   const drain = async (): Promise<void> => {
+    let insertedSinceStep = false;
     try {
-      while (buffer.length > 0 || pass !== null) {
-        if (buffer.length === 0 && pass !== null) {
+      for (;;) {
+        if (pass !== null && idling > 0) endPass(pass, true);
+        if (pass !== null && (buffer.length === 0 || insertedSinceStep)) {
+          insertedSinceStep = false;
           await pruneStep(pass);
           continue;
         }
+        if (buffer.length === 0) break;
+        insertedSinceStep = true;
         const batch = buffer.splice(0, maxBatch);
         try {
           await sql.unsafe(statement, [`[${batch.map((r) => r.json).join(",")}]`]);
@@ -275,9 +293,15 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
     }
   };
 
-  // One step of the pass; ends the pass (null) on a short step, the cap, or
-  // a refusal. Never throws.
-  const pruneStep = async (p: { steps: number; deleted: number }) => {
+  // Ends the pass, logging what it deleted. `more`: rows may be left.
+  const endPass = (p: { steps: number; deleted: number }, more: boolean): void => {
+    pass = null;
+    if (p.deleted > 0) log("usage.call_log_pruned", { deleted: p.deleted, keepDays, more });
+  };
+
+  // One step of the pass; ends it on a short step, the cap, or a refusal.
+  // Never throws.
+  const pruneStep = async (p: { steps: number; deleted: number }): Promise<void> => {
     try {
       const [row] = await sql.unsafe<{ deleted: number }>(pruneStatement, [keepDays, PRUNE_BATCH]);
       const n = Number(row?.deleted ?? 0);
@@ -285,10 +309,8 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
       p.deleted += n;
       const more = n >= PRUNE_BATCH;
       if (more && p.steps < PRUNE_STEPS) return;
-      pass = null;
-      // A capped pass leaves the rest due at once.
-      if (more) lastPruneAt = null;
-      if (p.deleted > 0) log("usage.call_log_pruned", { deleted: p.deleted, keepDays, more });
+      if (more && clock !== null) nextPruneAt = clock.monotonic() + PRUNE_SOON_MS;
+      endPass(p, more);
     } catch (err) {
       pass = null;
       log("usage.call_log_prune_failed", {
@@ -299,13 +321,18 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
     }
   };
 
-  // Queues a pass when one is due; `record` calls it before its row is buffered.
+  // Queues a pass when one is due; `record` calls it after buffering its row.
+  // A throwing clock queues nothing and is logged, never thrown.
   const maybePrune = (): void => {
     if (clock === null || pass !== null) return;
-    const now = clock.monotonic();
-    if (lastPruneAt !== null && now - lastPruneAt < PRUNE_EVERY_MS) return;
-    lastPruneAt = now;
-    pass = { steps: 0, deleted: 0 };
+    try {
+      const now = clock.monotonic();
+      if (nextPruneAt !== null && now < nextPruneAt) return;
+      nextPruneAt = now + PRUNE_EVERY_MS;
+      pass = { steps: 0, deleted: 0 };
+    } catch (err) {
+      log("usage.call_log_prune_failed", { keepDays, deleted: 0, errorClass: errorClassOf(err) });
+    }
   };
 
   return {
@@ -344,7 +371,12 @@ export function postgresCallLog(o: PostgresCallLogOptions): PostgresCallLog {
         .then(undefined, () => undefined);
     },
     async idle() {
-      while (writer) await writer;
+      idling += 1;
+      try {
+        while (writer) await writer;
+      } finally {
+        idling -= 1;
+      }
     },
     dropped: () => droppedTotal,
     failedBatches: () => failedTotal,

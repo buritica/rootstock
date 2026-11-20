@@ -95,7 +95,7 @@ export function sliceBrand<T extends object>(type: string, parser: string): Bran
 /** The largest Postgres `integer` (int4). */
 export const INT4_MAX = 2_147_483_647;
 
-/** The `retention.keepDays` bounds every slice with a retention shares (runs, the call log). */
+/** The `retention.keepDays` bounds shared by every slice with a retention (runs, the call log). */
 export const KEEP_DAYS_MIN = 7;
 export const KEEP_DAYS_MAX = 3_650;
 

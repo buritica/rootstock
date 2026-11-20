@@ -385,13 +385,14 @@ import {
   type ServeSlice,
 } from "@buritica/rootstock/serve";
 import { checkAuthSecret, defineAuth } from "@buritica/rootstock/serve/auth";
-import { postgresCallLog, usageWiring } from "@buritica/rootstock/usage";
+import { postgresCallLog, type UsageSlice, usageWiring } from "@buritica/rootstock/usage";
 import * as z from "zod/v4";
 
 declare const sql: SQL; // the app's own client
 declare const authPool: unknown; // the pg Pool (or drizzleAdapter) Better Auth reads
 declare const PROFILE: ServeProfile; // every request-handling choice, spelled out
 declare const s: ServeSlice; // config.serve: the numbers the config golden prints
+declare const usage: UsageSlice & { callLog: NonNullable<UsageSlice["callLog"]> }; // config.usage
 declare const withBusyText: (g: ServeSlice["limits"]["concurrency"]) => Limits["concurrency"];
 declare const withExhaustedText: (t: ServeSlice["limits"]["turnBudget"]) => Limits["turnBudget"];
 declare const sendMail: (to: string, url: string) => Promise<void>;
@@ -459,10 +460,10 @@ const limits = {
 
 const callLog = postgresCallLog({
   sql,
-  table: { schema: "rootstock", name: "mcp_calls" },
-  maxBuffered: 1000,
-  maxBatch: 100,
-  retention: { keepDays: 90 }, // or null to keep every row
+  table: usage.callLog.table,
+  maxBuffered: usage.callLog.maxBuffered,
+  maxBatch: usage.callLog.maxBatch,
+  retention: usage.callLog.retention, // null keeps every row
   clock,
   log,
 });
@@ -590,11 +591,23 @@ process.on("SIGTERM", async () => {
   start on a store without them.
 - **The call log never slows a call.** `postgresCallLog` writes in batches
   from one background writer; a full buffer drops and counts
-  (`usage.call_log_dropped`). With `retention: { keepDays }` (the usage
-  slice's `callLog.retention`, required, null keeps every row) the same
-  writer deletes rows older than that, at most once an hour, in batches of
-  5,000 and at most 10 a pass, inserting buffered rows between batches
-  (`usage.call_log_pruned`, `usage.call_log_prune_failed`). Both rootstock migrations (`mcp_calls`,
+  (`usage.call_log_dropped`).
+- **The call log prunes itself.** Pass the usage slice's
+  `callLog.retention` and a `clock` to `postgresCallLog`: with
+  `{ keepDays }` the same writer deletes rows older than that, a pass an
+  hour, 1,000 rows a step and at most 20 steps a pass, taking turns with
+  inserts so neither starves the other. A pass that stops at the cap with
+  rows left makes the next one due a minute later, so turning retention on
+  over a large table works the backlog off a pass a minute, never back to
+  back. Processes pruning one table skip each other's locked rows, and
+  `idle()` drops a pending pass after its step in flight, so shutdown waits
+  for one delete at most (`usage.call_log_pruned`,
+  `usage.call_log_prune_failed`). A table you name needs a unique `id` and
+  `created_at`. Added in 0.14.0 (required, breaking): set
+  `callLog.retention` in the usage slice (`null` keeps 0.13's behavior,
+  every row) and pass `retention` (plus `clock` when it is not null) to
+  `postgresCallLog`; a printed config gains `usage.callLog.retention`. Both
+  rootstock migrations (`mcp_calls`,
   `spend`) are additive and run with rootstock's own (`applyRootstockMigrations`
   or `migrateCli`).
 - **The spend ceiling is checked only where you ask.** `createSpendCeiling`

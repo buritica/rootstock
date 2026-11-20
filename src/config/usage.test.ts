@@ -72,6 +72,14 @@ describe("the usage slice in a config", () => {
     });
   });
 
+  test("a null retention prints as null", () => {
+    const c = defineRootstockConfig({
+      ...BASE,
+      usage: { ...USAGE, callLog: { maxBuffered: 10, maxBatch: 10, retention: null } },
+    });
+    expect(JSON.parse(printRootstockConfig(c)).usage.callLog.retention).toBeNull();
+  });
+
   test("usage-spend-prices: dollars need the runs slice's prices", () => {
     const usd = { ...USAGE, spend: { ...USAGE.spend, unit: "usd", ceiling: 5 } } as const;
     expect(() => defineRootstockConfig({ ...BASE, usage: usd })).toThrow(
