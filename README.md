@@ -317,11 +317,13 @@ forward on 0.8.x only: an older line can never ship a migration there.
   what a source no longer lists can only run once the listing is complete.
   `beforeSettle(ctx)` runs once, after every batch committed and the buckets
   balance, with the lock gated just before and the row still `running`, so
-  `ctx.override(flag)` (a brake the operator lifted) and `ctx.count(name, n)`
-  land on this run's row (`rootstock.runs.overrides`, `counts`). It is never
+  `ctx.override(flag)` (a brake the operator lifted), `ctx.count(name, n)` and
+  `ctx.meter(...)` land on this run's row (`rootstock.runs.overrides`,
+  `counts`, `tokens`); unlike a load's context, a bad call throws. It is never
   called on a failed run; `ctx.backfill` says the listing was a window. A
-  throw settles the run `failed` (`before-settle`) and is not rethrown; the
-  context refuses calls after the hook returns.
+  throw settles the run `failed` (`before-settle`, or `lost-lock` when
+  `ctx.ensureExclusive()` refused) and is not rethrown; the context refuses
+  calls after the hook returns.
 - **Meter from the load.** `ctx.meter` and `ctx.count` forward to the run
   at once. A refusal from `runs` emits `runner.settle_refused` and never
   fails the load. They are not undone when the batch rolls back.

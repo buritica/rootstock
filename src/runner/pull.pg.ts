@@ -23,7 +23,7 @@ import {
   runRows,
 } from "./fixtures.pg-support.ts";
 import { planPull, runPull } from "./pull.ts";
-import type { PullArgs, PullFailure, PullReport } from "./types.ts";
+import type { BeforeSettleContext, PullArgs, PullFailure, PullReport } from "./types.ts";
 
 // R-D10 (contract §9): the pull runner against a real server, once per
 // transactor kind, each case in a schema of its own with rootstock's
@@ -90,16 +90,6 @@ const gatedLock = (real: RunLock, before: () => Promise<void> | void): RunLock =
   stopKeepalive: () => real.stopKeepalive(),
   release: () => real.release(),
 });
-
-/** Runs `f` and returns what it threw (undefined when it did not). */
-const captureThrow = (f: () => unknown): unknown => {
-  try {
-    f();
-  } catch (e) {
-    return e;
-  }
-  return undefined;
-};
 
 const recs = (n: number, extra: Partial<Rec> = {}): Rec[] =>
   Array.from({ length: n }, (_, i) => ({ id: `r${i + 1}`, hash: `h${i + 1}`, ...extra }));
@@ -692,19 +682,10 @@ describe("the guard and the run record", () => {
       gates += 1;
     });
     const seen: unknown[] = [];
-    let kept: { override(flag: string): void } | undefined;
+    let kept: BeforeSettleContext | undefined;
     const report = await pull(env, memSource(env, main.transactor, recs(3)), {
       lock,
-      beforeSettle: async (ctx: {
-        job: string;
-        mode: string;
-        runId: string;
-        backfill: boolean;
-        counts: { listed: number; written: number };
-        override(flag: string): void;
-        count(name: string, n?: number): void;
-        ensureExclusive(): Promise<void>;
-      }) => {
+      beforeSettle: async (ctx: BeforeSettleContext) => {
         const before = gates;
         await ctx.ensureExclusive();
         seen.push({
@@ -716,9 +697,11 @@ describe("the guard and the run record", () => {
           gatedFirst: before > 0,
           gatedByHook: gates === before + 1,
         });
+        // A repeated flag is recorded once.
         ctx.override("brake.alpha-archive");
         ctx.override("brake.alpha-archive");
         ctx.count("retracted", 4);
+        ctx.meter("model-a", 10, 20);
         // Still running: the hook acts before the settle.
         const [row] = await runRows(sql, env);
         seen.push(row?.status);
@@ -739,23 +722,22 @@ describe("the guard and the run record", () => {
       "running",
     ]);
     const [row] = await sql.unsafe(
-      `SELECT status, overrides::text AS overrides, counts->>'retracted' AS retracted FROM ${env.R}`,
+      `SELECT status, overrides::text AS overrides, counts->>'retracted' AS retracted, tokens->'model-a'->>'output' AS output FROM ${env.R}`,
     );
     expect(row).toMatchObject({
       status: "ok",
       overrides: '["brake.alpha-archive"]',
       retracted: "4",
+      output: "20",
     });
     // The context refuses once the hook has returned.
-    expect(runnerErrorCode(captureThrow(() => kept?.override("x")))).toBe(
-      "ERR_ROOTSTOCK_RUNNER_INPUT",
-    );
+    expect(() => kept?.override("x")).toThrow(/ctx\.override\(\) called after the hook returned/);
   });
 
   test("beforeSettle: a throw settles before-settle, not rethrown; a bad flag is a throw", async () => {
     const env = await fresh();
     const report = await pull(env, memSource(env, main.transactor, recs(2)), {
-      beforeSettle: (ctx: { override(flag: string): void }) => {
+      beforeSettle: (ctx: BeforeSettleContext) => {
         ctx.override("Not A Flag");
       },
     });
@@ -784,7 +766,7 @@ describe("the guard and the run record", () => {
     const backfills: boolean[] = [];
     await pull(env, memSource(env, main.transactor, recs(1), { boundedBackfill: true }), {
       since: new Date(0),
-      beforeSettle: (ctx: { backfill: boolean }) => {
+      beforeSettle: (ctx: BeforeSettleContext) => {
         backfills.push(ctx.backfill);
       },
     });
@@ -828,6 +810,28 @@ describe("the guard and the run record", () => {
     expect(report.failure?.kind).toBe("lost-lock");
     expect(report.written).toBe(1);
     expect(called).toBe(0);
+  });
+
+  test("beforeSettle: the lock lost at the hook's own gate settles lost-lock, even when the hook rethrows something else", async () => {
+    const env = await fresh();
+    const real = await env.acquire("alpha-sync");
+    let inHook = false;
+    const lock = gatedLock(real, async () => {
+      if (inHook) {
+        await killLock(sql, "alpha-sync");
+        await env.acquire("alpha-sync");
+      }
+    });
+    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+      lock,
+      beforeSettle: async (ctx: BeforeSettleContext) => {
+        inHook = true;
+        await ctx.ensureExclusive().catch(() => {
+          throw new Error("wrapped");
+        });
+      },
+    });
+    expect(report.failure?.kind).toBe("lost-lock");
   });
 
   test("F2: a run record that cannot start is START, cause kept, nothing listed", async () => {

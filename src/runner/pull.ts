@@ -389,8 +389,7 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
       mode,
       runId: run.id,
       status,
-      ...counts,
-      excludedReasons: [...counts.excludedReasons],
+      ...snapshotCounts(counts),
       ...(f === undefined ? {} : { failure: f }),
       finish,
     };
@@ -742,6 +741,8 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       return settle({ kind: "lost-lock", error });
     }
     let open = true;
+    /** Set when the hook's own gate refused: the run settles lost-lock, as any other gate. */
+    let lostInHook: { error: unknown } | undefined;
     const live = (call: string): void => {
       if (!open) {
         throw new RootstockRunnerError(
@@ -755,7 +756,7 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
       mode: args.mode,
       runId: run.id,
       backfill,
-      counts: Object.freeze({ ...counts, excludedReasons: [...counts.excludedReasons] }),
+      counts: Object.freeze(snapshotCounts(counts)),
       override(flag: string) {
         live("override");
         run.override(flag);
@@ -764,21 +765,40 @@ async function pullLocked<R extends PullRef, D extends PullDoc, N>(
         live("count");
         run.count(name, n);
       },
-      ensureExclusive() {
+      meter(model: string, inTok: number, outTok: number, opts?: { estimated?: boolean }) {
+        live("meter");
+        run.meter(model, inTok, outTok, opts);
+      },
+      async ensureExclusive() {
         live("ensureExclusive");
-        return gate();
+        try {
+          await gate();
+        } catch (error) {
+          lostInHook = { error };
+          throw error;
+        }
       },
     });
     try {
       await args.beforeSettle(ctx);
     } catch (error) {
-      return settle({ kind: "before-settle", error });
+      return settle(
+        lostInHook === undefined
+          ? { kind: "before-settle", error }
+          : { kind: "lost-lock", error: lostInHook.error },
+      );
     } finally {
       open = false;
     }
   }
   return settle();
 }
+
+/** A copy of the counts the caller cannot change. */
+const snapshotCounts = (c: PullCounts): PullCounts => ({
+  ...c,
+  excludedReasons: [...c.excludedReasons],
+});
 
 /** The run's identity: everything listed is in exactly one bucket. */
 const balancedCounts = (c: PullCounts): boolean =>

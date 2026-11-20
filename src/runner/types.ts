@@ -155,9 +155,15 @@ export interface BeforeSettleContext {
   readonly counts: Readonly<PullCounts>;
   /** Records an override flag on the run row (`Run.override`). A bad flag throws. */
   override(flag: string): void;
-  /** Adds n (default 1) to a counter on the run row (`Run.count`). A bad name or n throws. */
+  /**
+   * Adds n (default 1) to a counter on the run row (`Run.count`). Unlike a
+   * load's `ctx.count`, a bad name or n throws: what the hook records is the
+   * reason it exists.
+   */
   count(name: string, n?: number): void;
-  /** The lock's gate: throws when the lock is no longer held. */
+  /** Adds tokens for a model to the run row (`Run.meter`). A bad call throws. */
+  meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
+  /** The lock's gate. A refusal that escapes the hook settles the run `lost-lock`. */
   ensureExclusive(): Promise<void>;
 }
 
@@ -169,7 +175,7 @@ export type PullFailure =
   | { kind: "quota"; count: number; externalId: string }
   | { kind: "cursor"; error: unknown }
   | { kind: "threw"; error: unknown }
-  /** `beforeSettle` threw (or the lock was lost inside it). */
+  /** `beforeSettle` threw (a lock lost at its `ensureExclusive` is `lost-lock`). */
   | { kind: "before-settle"; error: unknown }
   /** Settled with no failure of the runner's own but the buckets do not balance; `runs` writes the reason. */
   | { kind: "identity" };
