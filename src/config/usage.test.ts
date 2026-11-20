@@ -39,7 +39,7 @@ const WITH_RUNS: RootstockConfigInput = {
 };
 
 const USAGE = {
-  callLog: { maxBuffered: 1000, maxBatch: 100 },
+  callLog: { maxBuffered: 1000, maxBatch: 100, retention: { keepDays: 90 } },
   keepArgs: true,
   keepOutput: true,
   spend: { unit: "tokens", ceiling: 2_000_000, store: { kind: "rootstock" } },
@@ -60,11 +60,24 @@ describe("the usage slice in a config", () => {
     expect(Object.isFrozen(c.usage?.spend)).toBe(true);
     const printed = JSON.parse(printRootstockConfig(c));
     expect(printed.usage).toEqual({
-      callLog: { maxBatch: 100, maxBuffered: 1000, table: { name: "mcp_calls", schema: "app_rs" } },
+      callLog: {
+        maxBatch: 100,
+        maxBuffered: 1000,
+        retention: { keepDays: 90 },
+        table: { name: "mcp_calls", schema: "app_rs" },
+      },
       keepArgs: true,
       keepOutput: true,
       spend: { ceiling: 2_000_000, store: { kind: "rootstock", schema: "app_rs" }, unit: "tokens" },
     });
+  });
+
+  test("a null retention prints as null", () => {
+    const c = defineRootstockConfig({
+      ...BASE,
+      usage: { ...USAGE, callLog: { maxBuffered: 10, maxBatch: 10, retention: null } },
+    });
+    expect(JSON.parse(printRootstockConfig(c)).usage.callLog.retention).toBeNull();
   });
 
   test("usage-spend-prices: dollars need the runs slice's prices", () => {

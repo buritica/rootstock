@@ -3,6 +3,8 @@ import {
   bounded,
   identifier,
   isRecord,
+  KEEP_DAYS_MAX,
+  KEEP_DAYS_MIN,
   own,
   sliceBrand,
   sliceRefusals,
@@ -531,7 +533,13 @@ export function runsSlice(input: RunsSliceInput, defaults?: { schema?: string })
   }));
   const r = fields("retention", own(f, "retention"), new Set(RETENTION_KEYS), RETENTION_KEYS);
   const retention = Object.freeze({
-    keepDays: bounded(refuse, "retention.keepDays", own(r, "keepDays"), 7, 3_650),
+    keepDays: bounded(
+      refuse,
+      "retention.keepDays",
+      own(r, "keepDays"),
+      KEEP_DAYS_MIN,
+      KEEP_DAYS_MAX,
+    ),
   });
   const maxCountKeys = bounded(refuse, "maxCountKeys", own(f, "maxCountKeys"), 1, 500);
   const maxReasonChars = bounded(refuse, "maxReasonChars", own(f, "maxReasonChars"), 64, 10_000);

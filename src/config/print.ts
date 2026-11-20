@@ -126,6 +126,7 @@ function usageView(usage: NonNullable<RootstockConfig["usage"]>): unknown {
         : {
             maxBatch: callLog.maxBatch,
             maxBuffered: callLog.maxBuffered,
+            retention: callLog.retention === null ? null : { keepDays: callLog.retention.keepDays },
             table: table(callLog.table),
           },
     keepArgs: usage.keepArgs,
