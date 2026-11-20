@@ -75,7 +75,11 @@ export interface Run {
   meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
   /** Sets the four buckets; the last call wins. Only for a reconciling job. */
   account(a: Accounting): void;
-  /** Records an override flag given for this run (e.g. a brake allowed). Deduplicated, in call order. */
+  /**
+   * Records an override flag given for this run (e.g. a brake allowed).
+   * Deduplicated, in call order. Held in memory until the run settles: a run
+   * killed first loses it. Use `recordOverride` before an act the flag allows.
+   */
   override(flag: string): void;
   /**
    * `override(flag)`, then writes the run's overrides to its running row at
@@ -617,7 +621,13 @@ function makeRun(
     override: addOverride,
     async recordOverride(flag: string): Promise<boolean> {
       addOverride(flag, "recordOverride");
-      const rows = await sql.unsafe(statements.overrides, [id, holder, JSON.stringify(overrides)]);
+      let rows: Row[];
+      try {
+        rows = await sql.unsafe(statements.overrides, [id, holder, flag]);
+      } catch (error) {
+        emit({ type: "runs.record_failed", id, job, operation: "override", ...failure(error) });
+        throw error;
+      }
       return rows.length > 0;
     },
     scope(value: unknown, excluded?: unknown) {

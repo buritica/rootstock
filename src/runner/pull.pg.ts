@@ -91,6 +91,29 @@ const gatedLock = (real: RunLock, before: () => Promise<void> | void): RunLock =
   release: () => real.release(),
 });
 
+/** A one-ref pull whose lock is lost at the first gate the hook itself makes. */
+async function hookLosesLock(
+  hook: (ctx: BeforeSettleContext) => void | Promise<void>,
+): Promise<{ env: RunnerEnv; report: PullReport }> {
+  const env = await fresh();
+  const real = await env.acquire("alpha-sync");
+  let inHook = false;
+  const lock = gatedLock(real, async () => {
+    if (inHook) {
+      await killLock(sql, "alpha-sync");
+      await env.acquire("alpha-sync");
+    }
+  });
+  const report = await pull(env, memSource(env, main.transactor, recs(1)), {
+    lock,
+    beforeSettle: (ctx: BeforeSettleContext) => {
+      inHook = true;
+      return hook(ctx);
+    },
+  });
+  return { env, report };
+}
+
 const recs = (n: number, extra: Partial<Rec> = {}): Rec[] =>
   Array.from({ length: n }, (_, i) => ({ id: `r${i + 1}`, hash: `h${i + 1}`, ...extra }));
 
@@ -862,23 +885,10 @@ describe("the guard and the run record", () => {
   });
 
   test("beforeSettle: the lock lost at the hook's own gate settles lost-lock, even when the hook rethrows something else", async () => {
-    const env = await fresh();
-    const real = await env.acquire("alpha-sync");
-    let inHook = false;
-    const lock = gatedLock(real, async () => {
-      if (inHook) {
-        await killLock(sql, "alpha-sync");
-        await env.acquire("alpha-sync");
-      }
-    });
-    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
-      lock,
-      beforeSettle: async (ctx: BeforeSettleContext) => {
-        inHook = true;
-        await ctx.ensureExclusive().catch(() => {
-          throw new Error("wrapped");
-        });
-      },
+    const { env, report } = await hookLosesLock(async (ctx) => {
+      await ctx.ensureExclusive().catch(() => {
+        throw new Error("wrapped");
+      });
     });
     expect(report.failure?.kind).toBe("lost-lock");
     const [row] = await runRows(sql, env);
@@ -886,42 +896,16 @@ describe("the guard and the run record", () => {
   });
 
   test("beforeSettle: a lock refusal the hook swallows still settles lost-lock", async () => {
-    const env = await fresh();
-    const real = await env.acquire("alpha-sync");
-    let inHook = false;
-    const lock = gatedLock(real, async () => {
-      if (inHook) {
-        await killLock(sql, "alpha-sync");
-        await env.acquire("alpha-sync");
-      }
-    });
-    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
-      lock,
-      beforeSettle: async (ctx: BeforeSettleContext) => {
-        inHook = true;
-        await ctx.ensureExclusive().catch(() => undefined);
-      },
+    const { report } = await hookLosesLock(async (ctx) => {
+      await ctx.ensureExclusive().catch(() => undefined);
     });
     expect(report.status).toBe("failed");
     expect(report.failure?.kind).toBe("lost-lock");
   });
 
   test("beforeSettle: a gate the hook never awaited still settles lost-lock", async () => {
-    const env = await fresh();
-    const real = await env.acquire("alpha-sync");
-    let inHook = false;
-    const lock = gatedLock(real, async () => {
-      if (inHook) {
-        await killLock(sql, "alpha-sync");
-        await env.acquire("alpha-sync");
-      }
-    });
-    const report = await pull(env, memSource(env, main.transactor, recs(1)), {
-      lock,
-      beforeSettle: (ctx: BeforeSettleContext) => {
-        inHook = true;
-        void ctx.ensureExclusive().catch(() => undefined);
-      },
+    const { env, report } = await hookLosesLock((ctx) => {
+      void ctx.ensureExclusive().catch(() => undefined);
     });
     expect(report.failure?.kind).toBe("lost-lock");
     const [row] = await sql.unsafe(`SELECT phase FROM ${env.R}`);

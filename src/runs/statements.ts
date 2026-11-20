@@ -25,8 +25,9 @@ export interface RunsStatements {
   readonly start: string;
   /** R2 finish, params [id, holder, status, phase, listed, written, unchanged, quarantined, excluded, reconciled, excludedReasonsJson, countsJson, tokensJson, costUsd, costNote, scopeJson, scopeExcludedJson, overridesJson, reason]. */
   readonly finish: string;
-  /** R3 discard, params [id, holder]. */
+  /** R2c: adds one override flag to the running row (no duplicate), params [id, holder, flag]. */
   readonly overrides: string;
+  /** R3 discard, params [id, holder]. */
   readonly discard: string;
   /** R2b: this run's own row once settled, read back after a retried R2 (§20 A25). */
   readonly settledOwn: string;
@@ -79,7 +80,9 @@ SELECT EXISTS (SELECT 1 FROM ins) AS inserted,
   reason = $19::text
 WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status = 'running'
 RETURNING ${P}::text AS row`,
-    overrides: `UPDATE ${R} SET overrides = $3::text::jsonb WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,
+    overrides: `UPDATE ${R} SET overrides = CASE WHEN overrides ? $3::text THEN overrides
+    ELSE overrides || jsonb_build_array($3::text) END
+WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,
     discard: `DELETE FROM ${R} WHERE id = $1::uuid AND holder = $2::uuid AND status = 'running' RETURNING 1 AS ok`,
     settledOwn: `SELECT ${P}::text AS row FROM ${R} r WHERE r.id = $1::uuid AND r.holder = $2::uuid AND r.status <> 'running'`,
     snapshot: `SELECT j.job,

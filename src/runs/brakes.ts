@@ -31,7 +31,9 @@ export function declared<T>(
  * The proportional brake `name` of the slice (contract §6.1). `judge` answers
  * whether archiving `planned` of `held` items is over the cap; `assert` also
  * refuses BRAKE when it is and no override was given. Neither records the
- * override: the caller calls `run.override(<flag>)`.
+ * override: the caller awaits `run.recordOverride(<flag>)` before the act it
+ * allows, so a run killed mid-act still shows it (`run.override` holds the
+ * flag in memory until the run settles).
  */
 export function proportionalBrake(
   name: string,

@@ -4,6 +4,8 @@ const CODES = [
   "ERR_ROOTSTOCK_RUNNER_INPUT",
   "ERR_ROOTSTOCK_RUNNER_BACKFILL",
   "ERR_ROOTSTOCK_RUNNER_START",
+  /** A beforeSettle call found the run's row no longer running (settled elsewhere). */
+  "ERR_ROOTSTOCK_RUNNER_NOT_RUNNING",
 ] as const;
 export type RunnerErrorCode = (typeof CODES)[number];
 const CODE_SET: ReadonlySet<RunnerErrorCode> = new Set(CODES);

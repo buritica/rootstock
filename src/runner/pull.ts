@@ -375,15 +375,7 @@ export async function runPull<R extends PullRef, D extends PullDoc, N>(
     const f: PullFailure | undefined = failure ?? (balanced ? undefined : { kind: "identity" });
     const status = f === undefined ? "ok" : "failed";
     const reason = f === undefined || f.kind === "identity" ? undefined : reasonOf(f);
-    const finish = await run.finish(
-      status,
-      reason === undefined && phase === undefined
-        ? undefined
-        : {
-            ...(reason === undefined ? {} : { reason }),
-            ...(phase === undefined ? {} : { phase }),
-          },
-    );
+    const finish = await run.finish(status, { reason, phase });
     emit({
       type: "runner.pull_finished",
       job: source.job,
@@ -806,7 +798,7 @@ async function runBeforeSettle(
       live("override");
       if (!(await run.recordOverride(flag))) {
         throw new RootstockRunnerError(
-          "ERR_ROOTSTOCK_RUNNER_INPUT",
+          "ERR_ROOTSTOCK_RUNNER_NOT_RUNNING",
           `beforeSettle(): ctx.override(${q(flag)}): the run's row is no longer running`,
         );
       }
