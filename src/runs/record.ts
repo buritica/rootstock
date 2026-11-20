@@ -445,6 +445,10 @@ function makeRun(
   const counts = new Map<string, number>();
   const tokens = new Map<string, { input: number; output: number }>();
   const overrides: string[] = [];
+  /** Flags held for good: given to override() or written by recordOverride. */
+  const kept = new Set<string>();
+  /** recordOverride writes in flight, per flag. */
+  const inflight = new Map<string, number>();
   let estimated = false;
   let accounting: Accounting | null = null;
   let scopeJson: string | null = null;
@@ -575,6 +579,7 @@ function makeRun(
   }
   function addOverride(flag: string): void {
     checkOverride(flag, "override");
+    kept.add(flag);
     if (!overrides.includes(flag)) overrides.push(flag);
   }
 
@@ -627,25 +632,29 @@ function makeRun(
     async recordOverride(flag: string): Promise<boolean> {
       checkOverride(flag, "recordOverride");
       // Held before the write, so a finish built while it is in flight keeps
-      // it; taken back when the row did not take it.
-      const added = !overrides.includes(flag);
-      if (added) overrides.push(flag);
-      const takeBack = () => {
-        if (added && settling === null) overrides.splice(overrides.indexOf(flag), 1);
+      // it; let go only when no override() or confirmed write holds it and
+      // no other write of it is still in flight.
+      if (!overrides.includes(flag)) overrides.push(flag);
+      inflight.set(flag, (inflight.get(flag) ?? 0) + 1);
+      const settle = (taken: boolean) => {
+        const left = (inflight.get(flag) ?? 1) - 1;
+        if (left === 0) inflight.delete(flag);
+        else inflight.set(flag, left);
+        if (taken) kept.add(flag);
+        else if (left === 0 && !kept.has(flag) && settling === null) {
+          overrides.splice(overrides.indexOf(flag), 1);
+        }
       };
       let rows: Row[];
       try {
         rows = await sql.unsafe(statements.overrides, [id, holder, flag]);
       } catch (error) {
-        takeBack();
+        settle(false);
         emit({ type: "runs.record_failed", id, job, operation: "override", ...failure(error) });
         throw error;
       }
-      if (rows.length === 0) {
-        takeBack();
-        return false;
-      }
-      return true;
+      settle(rows.length > 0);
+      return rows.length > 0;
     },
     scope(value: unknown, excluded?: unknown) {
       open("scope");

@@ -863,7 +863,7 @@ async function runBeforeSettle(
     runId: run.id,
     outcome: failure?.kind ?? "ok",
     ms: Math.max(0, a.now() - started),
-    ...(threw === undefined ? {} : { error: threw.error }),
+    ...((threw ?? overrideFailed) === undefined ? {} : { error: (threw ?? overrideFailed)?.error }),
   });
   return failure;
 }
