@@ -87,23 +87,38 @@ jobs:
   # The DB matrix (scripts/test-db.ts): every src/**/*.pg.ts suite per
   # transactor kind against digest-pinned pg17 and pg18 throwaway containers.
   # Hosted runners ship docker. It fails red when no suite or no test runs.
+  # One job per image and transactor, in parallel (CI audit 2026-11-20): run
+  # in series the six combinations took ~6 min a job; hosted minutes are free
+  # on this public repo, so parallel costs nothing and the wait drops to one
+  # combination's. Keep the lists here in step with IMAGES and TRANSACTORS:
+  # test-db.ts refuses a value it doesn't know, so a stale entry fails red.
   test-db:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [pg17, pg18]
+        transactor: [bun-sql, postgres-js, drizzle]
     uses: ./.github/workflows/reusable-setup.yml
     with:
-      command: "bun run test:db"
+      command: "bun run test:db --image ${{ matrix.image }} --transactor ${{ matrix.transactor }}"
 
   # Same matrix on the oldest supported Bun; the runner spawns process.execPath,
   # so the suites really run on 1.3.14.
   test-db-oldest-bun:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [pg17, pg18]
+        transactor: [bun-sql, postgres-js, drizzle]
     uses: ./.github/workflows/reusable-setup.yml
     with:
       bun-version: "1.3.14"
       install-args: "--no-save"
-      command: "bun run test:db"
+      command: "bun run test:db --image ${{ matrix.image }} --transactor ${{ matrix.transactor }}"
 
   # Enforcement aggregator (spec.md pattern 2). Needs EVERY job, including the
   # gate: a failed gate makes downstream jobs report `skipped`, which would
