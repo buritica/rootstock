@@ -16,6 +16,35 @@ import postgres from "postgres";
 export const TEST_TRANSACTOR_KINDS = ["bun-sql", "postgres-js", "drizzle"] as const;
 export type TestTransactorKind = (typeof TEST_TRANSACTOR_KINDS)[number];
 
+/** The driver a lock session runs on. */
+export type LockDriver = Extract<TestTransactorKind, "postgres-js" | "bun-sql">;
+
+/**
+ * The lock session's driver under a transactor kind: `drizzle` sits on
+ * postgres.js, so its lock session is a postgres.js client.
+ */
+export function lockDriverOf(kind: TestTransactorKind): LockDriver {
+  return kind === "bun-sql" ? "bun-sql" : "postgres-js";
+}
+
+/**
+ * Set to "1" by `scripts/test-db.ts --hypotheses`; turns the hypothesis
+ * tests on (`hypothesis` in `lock/fixtures.pg-support.ts`).
+ */
+export const HYPOTHESES_ENV = "ROOTSTOCK_HYPOTHESES";
+
+/**
+ * Header lines a DB suite declares itself with, read by `scripts/test-db.ts`:
+ * `driver-only` = its code under test talks to Postgres only through the lock
+ * session's driver (the transactor only creates and drops its schema), so a
+ * `drizzle` run would repeat `postgres-js` and is skipped; `hypotheses` = it
+ * holds `hypothesis` tests.
+ */
+export const SUITE_MARKERS = {
+  driverOnly: "// rootstock-test: driver-only",
+  hypotheses: "// rootstock-test: hypotheses",
+} as const;
+
 export type TestClient =
   | { kind: "bun-sql"; client: SQL; close: () => Promise<void> }
   | { kind: "postgres-js"; client: postgres.Sql; close: () => Promise<void> }

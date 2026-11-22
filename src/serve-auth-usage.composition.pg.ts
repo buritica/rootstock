@@ -622,21 +622,27 @@ describe("serve, serve/auth and usage composed (W5 R-O1)", () => {
         expect(rows.find((r) => r.result_ids === '["hello"]')?.caller_kind).toBe("bearer");
         // No call log or spend write failed: the usage lines are the
         // retention's first pass (wired from the slice, nothing old to
-        // delete) and the refusal.
-        expect(log.lines.filter(([event]) => event.startsWith("usage."))).toEqual([
-          [
-            "usage.call_log_pruned",
-            {
-              deleted: 0,
-              keepDays: 30,
-              steps: 1,
-              ms: expect.any(Number),
-              more: false,
-              stopped: false,
-            },
-          ],
-          ["usage.spend_refused", { caller: "agent-1", ceiling: 100, unit: "tokens", used: 120 }],
-        ]);
+        // delete) and the refusal. The first pass is queued by the first
+        // record and runs in the sink's background loop, so it can log before
+        // or after the refusal: order is not part of the contract.
+        const usageLines = log.lines.filter(([event]) => event.startsWith("usage."));
+        expect(usageLines).toHaveLength(2);
+        expect(usageLines).toEqual(
+          expect.arrayContaining([
+            [
+              "usage.call_log_pruned",
+              {
+                deleted: 0,
+                keepDays: 30,
+                steps: 1,
+                ms: expect.any(Number),
+                more: false,
+                stopped: false,
+              },
+            ],
+            ["usage.spend_refused", { caller: "agent-1", ceiling: 100, unit: "tokens", used: 120 }],
+          ]),
+        );
 
         // Readiness over the same database: rootstock's migrations are current.
         const ready = readiness({

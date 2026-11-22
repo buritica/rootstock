@@ -1,3 +1,5 @@
+// rootstock-test: driver-only
+// rootstock-test: hypotheses
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { pgCode, type Row, type Sql } from "../db/index.ts";
 import {
@@ -10,6 +12,8 @@ import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
 import {
+  hypothesis,
+  hypothesisIf,
   lateBunSqlDestroy,
   lockDriver,
   openBunSqlClient,
@@ -181,60 +185,66 @@ afterAll(async () => {
 });
 
 describe("D-S1 block-mode hypotheses (§14)", () => {
-  test("H5: both settings are user-settable, B1 is accepted for an ordinary role, B0 reads them back normalised, B3 restores", async () => {
-    const contexts = await adminSql.unsafe(
-      "SELECT name, context FROM pg_settings WHERE name IN ('lock_timeout', 'client_connection_check_interval') ORDER BY name",
-    );
-    expect(contexts).toEqual([
-      { name: "client_connection_check_interval", context: "user" },
-      { name: "lock_timeout", context: "user" },
-    ]);
-    const role = `rs_ds1_plain_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
-    await adminSql.unsafe(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER`);
-    const w = await openWaiter();
-    try {
-      await w.sql.unsafe(`SET ROLE "${role}"`);
-      const [who] = await w.sql.unsafe(
-        "SELECT current_user AS u, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS su",
+  hypothesis(
+    "H5: both settings are user-settable, B1 is accepted for an ordinary role, B0 reads them back normalised, B3 restores",
+    async () => {
+      const contexts = await adminSql.unsafe(
+        "SELECT name, context FROM pg_settings WHERE name IN ('lock_timeout', 'client_connection_check_interval') ORDER BY name",
       );
-      expect(who?.u).toBe(role);
-      expect(who?.su === true || who?.su === "t" || who?.su === "true").toBe(false);
-      const before = await w.sql.unsafe(B0);
-      expect(before).toEqual([{ lt: "0", cc: "0" }]);
-      const [set] = await w.sql.unsafe(B1, ["30000ms", "1000ms"]);
-      // set_config answers the normalised text, not the text it was given.
-      expect(set).toEqual({ lt: "30s", cc: "1s" });
-      expect(await w.sql.unsafe(B0)).toEqual([{ lt: "30s", cc: "1s" }]);
-      await w.sql.unsafe(B1, [before[0]?.lt, before[0]?.cc]);
-      expect(await w.sql.unsafe(B0)).toEqual(before);
-    } finally {
-      await w.close(1);
-      await adminSql.unsafe(`DROP ROLE "${role}"`);
-    }
-  });
+      expect(contexts).toEqual([
+        { name: "client_connection_check_interval", context: "user" },
+        { name: "lock_timeout", context: "user" },
+      ]);
+      const role = `rs_ds1_plain_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      await adminSql.unsafe(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER`);
+      const w = await openWaiter();
+      try {
+        await w.sql.unsafe(`SET ROLE "${role}"`);
+        const [who] = await w.sql.unsafe(
+          "SELECT current_user AS u, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS su",
+        );
+        expect(who?.u).toBe(role);
+        expect(who?.su === true || who?.su === "t" || who?.su === "true").toBe(false);
+        const before = await w.sql.unsafe(B0);
+        expect(before).toEqual([{ lt: "0", cc: "0" }]);
+        const [set] = await w.sql.unsafe(B1, ["30000ms", "1000ms"]);
+        // set_config answers the normalised text, not the text it was given.
+        expect(set).toEqual({ lt: "30s", cc: "1s" });
+        expect(await w.sql.unsafe(B0)).toEqual([{ lt: "30s", cc: "1s" }]);
+        await w.sql.unsafe(B1, [before[0]?.lt, before[0]?.cc]);
+        expect(await w.sql.unsafe(B0)).toEqual(before);
+      } finally {
+        await w.close(1);
+        await adminSql.unsafe(`DROP ROLE "${role}"`);
+      }
+    },
+  );
 
-  test("H7: pg_advisory_lock under lock_timeout raises 55P03, readable through pgCode", async () => {
-    const holder = openRaw();
-    await holder.sql.unsafe("SELECT pg_advisory_lock(hashtext($1))", ["alpha-sync"]);
-    const w = await openWaiter();
-    try {
-      await w.sql.unsafe(B1, ["300ms", "1000ms"]);
-      const started = performance.now();
-      const b2 = await pending(w.sql.unsafe(B2, ["alpha-sync"]));
-      const waited = performance.now() - started;
-      expect(b2.ok).toBe(false);
-      if (!b2.ok) expect(pgCode(b2.error)).toBe("55P03");
-      expect(waited).toBeGreaterThanOrEqual(280);
-      expect(waited).toBeLessThan(600);
-      // The session survives the timeout, with B1's values still set.
-      expect(await w.sql.unsafe(B0)).toEqual([{ lt: "300ms", cc: "1s" }]);
-    } finally {
-      await w.close(1);
-      await holder.end();
-    }
-  });
+  hypothesis(
+    "H7: pg_advisory_lock under lock_timeout raises 55P03, readable through pgCode",
+    async () => {
+      const holder = openRaw();
+      await holder.sql.unsafe("SELECT pg_advisory_lock(hashtext($1))", ["alpha-sync"]);
+      const w = await openWaiter();
+      try {
+        await w.sql.unsafe(B1, ["300ms", "1000ms"]);
+        const started = performance.now();
+        const b2 = await pending(w.sql.unsafe(B2, ["alpha-sync"]));
+        const waited = performance.now() - started;
+        expect(b2.ok).toBe(false);
+        if (!b2.ok) expect(pgCode(b2.error)).toBe("55P03");
+        expect(waited).toBeGreaterThanOrEqual(280);
+        expect(waited).toBeLessThan(600);
+        // The session survives the timeout, with B1's values still set.
+        expect(await w.sql.unsafe(B0)).toEqual([{ lt: "300ms", cc: "1s" }]);
+      } finally {
+        await w.close(1);
+        await holder.end();
+      }
+    },
+  );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H10: destroy() ends the client at once while B2 is in flight; B2 rejects; nothing is unhandled; the server hears the FIN at once",
     async () => {
       const unhandled: unknown[] = [];
@@ -268,7 +278,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H10 contrast: close({ timeout: 1 }) waits out the timeout with B2 in flight before it sends the FIN",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "100ms");
@@ -290,7 +300,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H6a: with client_connection_check_interval 1000ms, a destroyed waiter is ended within about 1 s, before it is granted",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -309,7 +319,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H6b: without it, a destroyed waiter stays blocked until granted, then exits when its reply fails; a second waiter is granted at once",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "0");
@@ -332,7 +342,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H6c (LB3's second bound): released just after the destroy, a second waiter is granted within checkIntervalMs + 200 ms",
     async () => {
       const { holder, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -352,7 +362,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(late)(
+  hypothesisIf(!late)(
     "H6d: through close() bounded by endTimeoutSeconds, the ghost window is endTimeoutSeconds + checkIntervalMs",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter("alpha-sync", "1000ms");
@@ -372,7 +382,7 @@ describe("D-S1 block-mode hypotheses (§14)", () => {
     },
   );
 
-  test.skipIf(!late)(
+  hypothesisIf(late)(
     "A38 (Bun.SQL before 1.4.4): destroy() waits for B2, which ends at lock_timeout; then the backend leaves and the holder keeps the lock",
     async () => {
       const { holder, holderPid, w, b2, unlock } = await blockedWaiter(
