@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { type UsageSliceInput, usageSlice } from "./slice.ts";
 
 const BASE: UsageSliceInput = {
-  callLog: { maxBuffered: 1000, maxBatch: 100 },
+  callLog: { maxBuffered: 1000, maxBatch: 100, retention: { keepDays: 90 } },
   keepArgs: true,
   keepOutput: false,
   spend: null,
@@ -24,20 +24,23 @@ describe("usageSlice", () => {
       table: { schema: "app_rs", name: "mcp_calls" },
       maxBuffered: 1000,
       maxBatch: 100,
+      retention: { keepDays: 90 },
     });
     expect([s.keepArgs, s.keepOutput, s.spend]).toEqual([true, false, null]);
     expect(Object.isFrozen(s)).toBe(true);
     expect(Object.isFrozen(s.callLog)).toBe(true);
+    expect(Object.isFrozen(s.callLog?.retention)).toBe(true);
     expect(usageSlice(BASE).callLog?.table.schema).toBe("rootstock");
   });
 
   test("a given table, no call log, and both store shapes", () => {
     const s = usageSlice({
       ...BASE,
-      callLog: { table: { schema: "public" }, maxBuffered: 10, maxBatch: 10 },
+      callLog: { table: { schema: "public" }, maxBuffered: 10, maxBatch: 10, retention: null },
       spend: { unit: "usd", ceiling: 2.5, store: { kind: "rootstock" } },
     });
     expect(s.callLog?.table).toEqual({ schema: "public", name: "mcp_calls" });
+    expect(s.callLog?.retention).toBeNull();
     expect(s.spend).toEqual({
       unit: "usd",
       ceiling: 2.5,
@@ -70,17 +73,20 @@ describe("usageSlice", () => {
     expect(refusal({ ...BASE, keepArgs: "yes" })).toBe(
       'usageSlice: keepArgs must be a boolean — got "yes"',
     );
-    expect(refusal({ ...BASE, callLog: { maxBuffered: 10 } })).toBe(
+    expect(refusal({ ...BASE, callLog: { maxBuffered: 10, retention: null } })).toBe(
       "usageSlice: callLog.maxBatch is required",
     );
-    expect(refusal({ ...BASE, callLog: { maxBuffered: 10, maxBatch: 11 } })).toBe(
+    expect(refusal({ ...BASE, callLog: { maxBuffered: 10, maxBatch: 11, retention: null } })).toBe(
       "usageSlice: callLog.maxBatch must be an integer from 1 to 10 — got 11",
     );
-    expect(refusal({ ...BASE, callLog: { maxBuffered: 0, maxBatch: 1 } })).toMatch(
+    expect(refusal({ ...BASE, callLog: { maxBuffered: 0, maxBatch: 1, retention: null } })).toMatch(
       /callLog\.maxBuffered/,
     );
     expect(
-      refusal({ ...BASE, callLog: { maxBuffered: 1, maxBatch: 1, table: { name: "Bad" } } }),
+      refusal({
+        ...BASE,
+        callLog: { maxBuffered: 1, maxBatch: 1, retention: null, table: { name: "Bad" } },
+      }),
     ).toMatch(/callLog\.table\.name must be an identifier/);
     expect(
       refusal({ ...BASE, spend: { unit: "eur", ceiling: 1, store: { kind: "rootstock" } } }),
@@ -123,5 +129,22 @@ describe("usageSlice", () => {
         spend: { unit: "tokens", ceiling: 1, store: { kind: "rootstock", table: "x" } },
       }),
     ).toBe("usageSlice: spend.store.table is not a known key");
+  });
+  test("callLog.retention: required, null or keepDays from 7 to 3650, no other keys", () => {
+    const log = (retention: unknown) =>
+      refusal({ ...BASE, callLog: { maxBuffered: 10, maxBatch: 10, retention } });
+    expect(refusal({ ...BASE, callLog: { maxBuffered: 10, maxBatch: 10 } })).toBe(
+      "usageSlice: callLog.retention is required",
+    );
+    expect(log({ keepDays: 7 })).toBe("parsed");
+    expect(log({ keepDays: 3650 })).toBe("parsed");
+    expect(log({ keepDays: 6 })).toMatch(
+      /callLog\.retention\.keepDays must be an integer from 7 to 3650/,
+    );
+    expect(log({ keepDays: 3651 })).toMatch(/callLog\.retention\.keepDays/);
+    expect(log({ keepDays: 30.5 })).toMatch(/callLog\.retention\.keepDays/);
+    expect(log({})).toBe("usageSlice: callLog.retention.keepDays is required");
+    expect(log({ keepDays: 30, everyHours: 1 })).toMatch(/callLog\.retention\.everyHours/);
+    expect(log(30)).toMatch(/callLog\.retention/);
   });
 });

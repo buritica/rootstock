@@ -10,7 +10,7 @@ import { PROJECTION, runsStatements } from "./statements.ts";
 // R-D2 (contract §13.2): the run record against a fake Sql that records every
 // statement it is sent and answers from a script.
 
-type Id = "R1" | "R2" | "R2b" | "R3" | "R4" | "R5";
+type Id = "R1" | "R2" | "R2b" | "R2c" | "R3" | "R4" | "R5";
 type Answer = Row[] | Error | ((params: readonly unknown[]) => Row[]);
 
 const HOLDER = "00000000-0000-4000-8000-0000000000aa";
@@ -67,11 +67,13 @@ function fakeSql(slice: RunsSlice): Fake {
     [s.snapshot, "R4"],
     [s.prune, "R5"],
     [s.settledOwn, "R2b"],
+    [s.overrides, "R2c"],
   ]);
   const defaults: Record<Id, Answer> = {
     R1: [{ inserted: true, started_at_ms: String(STARTED_MS), settled: "[]" }],
     R2: finishedRow,
     R2b: [],
+    R2c: [{ ok: 1 }],
     R3: [{ ok: 1 }],
     R4: [],
     R5: [{ deleted: "0" }],
@@ -1123,12 +1125,41 @@ describe("runsSnapshot and pruneRuns", () => {
   });
 });
 
+describe("recordOverride holds", () => {
+  const overridesAtFinish = (f: Fake) => JSON.parse(String(r2(f)[0]?.[17]));
+
+  test("a failed write lets go of a flag that no other call holds", async () => {
+    const { run, fake } = await setup();
+    fake.answer("R2c", new Error("boom"));
+    await expect(run.recordOverride("brake.a")).rejects.toThrow("boom");
+    await run.finish("ok");
+    expect(overridesAtFinish(fake)).toEqual([]);
+  });
+
+  test("a failed write keeps a flag that a concurrent write confirmed or override() gave", async () => {
+    const { run, fake } = await setup();
+    let release: (rows: Row[]) => void = () => {};
+    fake.answer("R2c", () => new Promise<Row[]>((r) => (release = r)) as never, [{ ok: 1 }]);
+    const first = run.recordOverride("brake.a");
+    const second = run.recordOverride("brake.a");
+    expect(await second).toBe(true);
+    release([]);
+    expect(await first).toBe(false);
+    run.override("brake.b");
+    fake.answer("R2c", new Error("boom"));
+    await expect(run.recordOverride("brake.b")).rejects.toThrow("boom");
+    await run.finish("ok");
+    expect(overridesAtFinish(fake)).toEqual(["brake.a", "brake.b"]);
+  });
+});
+
 describe("RR9: statements", () => {
   const T = runsStatements({ schema: "rs_a", name: "rr" }, { schema: "rs_b", name: "ll" });
   const ALL: [string, string, number][] = [
     ["R1", T.start, 5],
     ["R2", T.finish, 19],
     ["R2b", T.settledOwn, 2],
+    ["R2c", T.overrides, 3],
     ["R3", T.discard, 2],
     ["R4", T.snapshot, 1],
     ["R5", T.prune, 1],
@@ -1157,14 +1188,15 @@ describe("RR9: statements", () => {
   test("every call binds its statement's param count and no undefined", async () => {
     const { run, fake } = await setup();
     run.account(ACC);
+    await run.recordOverride("brake.a");
     await run.finish("ok");
     const d = await setup();
     await d.run.discard();
     await runsSnapshot(fake.sql, SLICE, ["alpha-sync"]);
     await pruneRuns(fake.sql, SLICE);
-    const counts: Record<Id, number> = { R1: 5, R2: 19, R2b: 2, R3: 2, R4: 1, R5: 1 };
+    const counts: Record<Id, number> = { R1: 5, R2: 19, R2b: 2, R2c: 3, R3: 2, R4: 1, R5: 1 };
     const calls = [...fake.calls, ...d.fake.calls];
-    expect(new Set(calls.map((c) => c.id))).toEqual(new Set(["R1", "R2", "R3", "R4", "R5"]));
+    expect(new Set(calls.map((c) => c.id))).toEqual(new Set(["R1", "R2c", "R2", "R3", "R4", "R5"]));
     for (const c of calls) {
       expect(c.params).toHaveLength(counts[c.id]);
       expect(c.params.includes(undefined)).toBe(false);

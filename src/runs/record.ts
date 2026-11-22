@@ -75,8 +75,22 @@ export interface Run {
   meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
   /** Sets the four buckets; the last call wins. Only for a reconciling job. */
   account(a: Accounting): void;
-  /** Records an override flag given for this run (e.g. a brake allowed). Deduplicated, in call order. */
+  /**
+   * Records an override flag given for this run (e.g. a brake allowed).
+   * Deduplicated, in call order. Held in memory until the run settles: a run
+   * killed first loses it. Use `recordOverride` before an act the flag allows.
+   */
   override(flag: string): void;
+  /**
+   * Writes this flag to the running row at once (no duplicate), then holds it
+   * like `override`, so a run killed before it settles still shows it (an
+   * interrupted row keeps it). Call it before the act the flag allows.
+   * Resolves false when the row is no longer running (settled elsewhere): the
+   * flag is not recorded and the caller should not act. Rejects on a bad flag,
+   * a run already settling, or a database error (emitting
+   * `runs.record_failed`); the flag is then not held either.
+   */
+  recordOverride(flag: string): Promise<boolean>;
   /** The scope this run covered, for the next run's scope guard. */
   scope(value: unknown, excluded?: unknown): void;
   /** Deletes the running row. For a run that turned out to have nothing to do. */
@@ -431,6 +445,10 @@ function makeRun(
   const counts = new Map<string, number>();
   const tokens = new Map<string, { input: number; output: number }>();
   const overrides: string[] = [];
+  /** Flags held for good: given to override() or written by recordOverride. */
+  const kept = new Set<string>();
+  /** recordOverride writes in flight, per flag. */
+  const inflight = new Map<string, number>();
   let estimated = false;
   let accounting: Accounting | null = null;
   let scopeJson: string | null = null;
@@ -553,6 +571,18 @@ function makeRun(
     return { written: true, ...settled };
   };
 
+  function checkOverride(flag: string, call: string): void {
+    open(call);
+    if (typeof flag !== "string" || !COUNTER.test(flag)) {
+      throw input(`${call}(${q(flag)}): flag must match [a-z0-9_.:-]{1,64}`);
+    }
+  }
+  function addOverride(flag: string): void {
+    checkOverride(flag, "override");
+    kept.add(flag);
+    if (!overrides.includes(flag)) overrides.push(flag);
+  }
+
   return Object.freeze({
     ...ids,
     count(name: string, n: number = 1) {
@@ -598,12 +628,33 @@ function makeRun(
       if (!decl.reconciles) throw input(`account(): ${job} is declared reconciles: false`);
       accounting = checkAccounting(a, job, slice.maxScopeBytes);
     },
-    override(flag: string) {
-      open("override");
-      if (typeof flag !== "string" || !COUNTER.test(flag)) {
-        throw input(`override(${q(flag)}): flag must match [a-z0-9_.:-]{1,64}`);
-      }
+    override: addOverride,
+    async recordOverride(flag: string): Promise<boolean> {
+      checkOverride(flag, "recordOverride");
+      // Held before the write, so a finish built while it is in flight keeps
+      // it; let go only when no override() or confirmed write holds it and
+      // no other write of it is still in flight.
       if (!overrides.includes(flag)) overrides.push(flag);
+      inflight.set(flag, (inflight.get(flag) ?? 0) + 1);
+      const settle = (taken: boolean) => {
+        const left = (inflight.get(flag) ?? 1) - 1;
+        if (left === 0) inflight.delete(flag);
+        else inflight.set(flag, left);
+        if (taken) kept.add(flag);
+        else if (left === 0 && !kept.has(flag) && settling === null) {
+          overrides.splice(overrides.indexOf(flag), 1);
+        }
+      };
+      let rows: Row[];
+      try {
+        rows = await sql.unsafe(statements.overrides, [id, holder, flag]);
+      } catch (error) {
+        settle(false);
+        emit({ type: "runs.record_failed", id, job, operation: "override", ...failure(error) });
+        throw error;
+      }
+      settle(rows.length > 0);
+      return rows.length > 0;
     },
     scope(value: unknown, excluded?: unknown) {
       open("scope");

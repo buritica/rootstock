@@ -10,6 +10,7 @@ import {
   markersOf,
   readSuites,
   type Suite,
+  selectMatrix,
   suitesFor,
   suitesUnder,
   TRANSACTORS,
@@ -119,4 +120,36 @@ test("the hypotheses workflow runs on a change to every hypotheses suite", async
     .filter((path) => !globs.some((g) => g.match(path)));
   expect(unwatched).toEqual([]);
   expect(globs.some((g) => g.match("src/lock/session.ts"))).toBe(true);
+});
+
+test("selectMatrix with no flags is the whole matrix", () => {
+  expect(selectMatrix([])).toEqual({
+    images: [...IMAGES],
+    transactors: [...TRANSACTORS],
+    hypotheses: false,
+  });
+});
+
+test("selectMatrix narrows to one image tag and one transactor", () => {
+  const picked = selectMatrix(["--image", "pg18", "--transactor", "drizzle"]);
+  expect(picked.images).toEqual([IMAGES[1]]);
+  expect(picked.transactors).toEqual(["drizzle"]);
+});
+
+test("selectMatrix --hypotheses runs the lock-driver kinds and refuses drizzle", () => {
+  expect(selectMatrix(["--hypotheses"]).transactors).toEqual([...HYPOTHESIS_TRANSACTORS]);
+  expect(selectMatrix(["--hypotheses", "--transactor", "bun-sql"]).transactors).toEqual([
+    "bun-sql",
+  ]);
+  expect(() => selectMatrix(["--hypotheses", "--transactor", "drizzle"])).toThrow(
+    "--transactor must be one of bun-sql, postgres-js",
+  );
+});
+
+test("selectMatrix refuses an unknown value instead of selecting nothing", () => {
+  expect(() => selectMatrix(["--image", "pg16"])).toThrow("--image must be one of pg17, pg18");
+  expect(() => selectMatrix(["--transactor", "knex"])).toThrow(
+    "--transactor must be one of bun-sql, postgres-js, drizzle",
+  );
+  expect(() => selectMatrix(["--bogus"])).toThrow();
 });

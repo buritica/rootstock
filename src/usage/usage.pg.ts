@@ -5,7 +5,8 @@ import { openTestTransactor, type TestTransactor } from "../db/transactor.pg-sup
 import { applyRootstockMigrations } from "../migrate/apply.ts";
 import { schemaFactory } from "../migrate/fixtures.pg-support.ts";
 import { migrateSlice } from "../migrate/slice.ts";
-import { postgresCallLog } from "./call-log.ts";
+import { PRUNE_BATCH, postgresCallLog } from "./call-log.ts";
+import { callLogRetentionStatus } from "./call-log-health.ts";
 import { callRecord, captureLog, manualClock } from "./fixtures.test-support.ts";
 import { createSpendCeiling, postgresSpendStore, type SpendStore } from "./spend.ts";
 
@@ -43,6 +44,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 100,
@@ -141,6 +143,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 1000,
@@ -185,6 +188,7 @@ describe("postgresCallLog", () => {
       await locked;
       const { log } = captureLog();
       const sink = postgresCallLog({
+        retention: null,
         sql,
         table: { schema: s, name: "mcp_calls" },
         maxBuffered: 10,
@@ -230,6 +234,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "mcp_calls" },
       maxBuffered: 100,
@@ -276,6 +281,7 @@ describe("postgresCallLog", () => {
     const s = await migrated();
     const { log, events } = captureLog();
     const sink = postgresCallLog({
+      retention: null,
       sql,
       table: { schema: s, name: "no_such_table" },
       maxBuffered: 10,
@@ -296,6 +302,175 @@ describe("postgresCallLog", () => {
         },
       },
     ]);
+  });
+  test("callLogRetentionStatus reads the lag and age by the server's clock", async () => {
+    const s = await migrated();
+    const table = { schema: s, name: "mcp_calls" };
+    const retention = { keepDays: 30 };
+    const insertAgo = (hours: number) =>
+      sql.unsafe(
+        `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+         VALUES (now() - make_interval(hours => ${hours}), 'c', 't', '{}'::jsonb, 1, true)`,
+      );
+    expect(await callLogRetentionStatus({ sql, table, retention })).toEqual({
+      keepDays: 30,
+      oldestAgeSeconds: null,
+      lagSeconds: null,
+      overdue: false,
+    });
+    // Quiet: rows 40 and 39 days old and nothing since. Old, little lag.
+    await insertAgo(40 * 24);
+    await insertAgo(39 * 24);
+    const quiet = await callLogRetentionStatus({ sql, table, retention });
+    expect(quiet.overdue).toBe(false);
+    expect(quiet.lagSeconds).toBeCloseTo(86_400, 0);
+    expect(quiet.oldestAgeSeconds).toBeGreaterThanOrEqual(40 * 86_400);
+    expect(quiet.oldestAgeSeconds).toBeLessThan(40 * 86_400 + 60);
+    // The first call after the quiet spell, before its pass: not yet counted.
+    await insertAgo(0);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(false);
+    // Nor is a row dated in the future.
+    await insertAgo(-24 * 365);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(false);
+    // A call two hours ago that did not prune: the lag is 40 days, past 30 + 2.
+    await insertAgo(2);
+    const behind = await callLogRetentionStatus({ sql, table, retention });
+    expect(behind.overdue).toBe(true);
+    expect(behind.lagSeconds).toBeCloseTo(40 * 86_400 - 7_200, 0);
+    expect((await callLogRetentionStatus({ sql, table, retention: null })).overdue).toBe(false);
+    expect((await callLogRetentionStatus({ sql, table, retention, slackDays: 15 })).overdue).toBe(
+      false,
+    );
+  });
+
+  test("a sink's own pass clears overdue; a sink with deletes refused leaves it", async () => {
+    const s = await migrated();
+    const table = { schema: s, name: "mcp_calls" };
+    const retention = { keepDays: 30 };
+    // Calls kept arriving (one 2h ago) while nothing pruned a 400-day row.
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(hours => h), 'c', 't', '{}'::jsonb, 1, true
+       FROM unnest(ARRAY[400 * 24, 20 * 24, 2]) AS h`,
+    );
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    const run = async (client: Sql) => {
+      const { log, events } = captureLog();
+      const sink = postgresCallLog({
+        sql: client,
+        table,
+        maxBuffered: 10,
+        maxBatch: 10,
+        retention,
+        clock: manualClock(),
+        log,
+      });
+      sink.record(callRecord({ tool: "fresh" }));
+      await eventually(() => events.length === 1);
+      await sink.idle();
+      return sink;
+    };
+    // Deletes refused: the pass fails and the table still reads overdue.
+    const refusing = {
+      unsafe: (statement: string, params?: unknown[]) =>
+        /delete/i.test(statement)
+          ? Promise.reject(new Error("permission denied"))
+          : sql.unsafe(statement, params as never[]),
+    } as unknown as Sql;
+    expect((await run(refusing)).pruneFailures()).toBe(1);
+    expect((await callLogRetentionStatus({ sql, table, retention })).overdue).toBe(true);
+    // A working sink's pass deletes the old row and the verdict clears.
+    expect((await run(sql)).pruned()).toBe(1);
+    const after = await callLogRetentionStatus({ sql, table, retention });
+    expect(after.overdue).toBe(false);
+    expect(after.lagSeconds).toBeCloseTo(20 * 86_400 - 7_200, 0);
+  });
+
+  test("retention deletes rows older than keepDays and keeps the rest", async () => {
+    const s = await migrated();
+    // Ages in days: three past a 30-day cutoff, two inside it.
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(days => d), 'c', 'aged-' || d, '{}'::jsonb, 1, true
+       FROM unnest(ARRAY[400, 90, 31, 29, 1]) AS d`,
+    );
+    const { log, events } = captureLog();
+    const sink = postgresCallLog({
+      sql,
+      table: { schema: s, name: "mcp_calls" },
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: { keepDays: 30 },
+      clock: manualClock(),
+      log,
+    });
+    sink.record(callRecord({ tool: "fresh" }));
+    await eventually(() => events.length === 1);
+    await sink.idle();
+    const left = await sql.unsafe<{ tool: string }>(
+      `SELECT tool FROM "${s}".mcp_calls ORDER BY tool`,
+    );
+    expect(left.map((r) => r.tool)).toEqual(["aged-1", "aged-29", "fresh"]);
+    expect(events).toEqual([
+      {
+        event: "usage.call_log_pruned",
+        fields: { deleted: 3, keepDays: 30, steps: 1, ms: 0, more: false, stopped: false },
+      },
+    ]);
+  });
+});
+
+/** Waits (real time, at most 5 s) until `cond` holds, then asserts it. */
+async function eventually(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !cond(); i++) await Bun.sleep(10);
+  expect(cond()).toBe(true);
+}
+
+describe("postgresCallLog retention across steps and processes", () => {
+  test("two sinks on one table work off a multi-step backlog oldest first, without failing or overlapping", async () => {
+    const s = await migrated();
+    const aged = PRUNE_BATCH * 3 + 7;
+    await sql.unsafe(
+      `INSERT INTO "${s}".mcp_calls (created_at, caller, tool, args, duration_ms, ok)
+       SELECT now() - make_interval(days => 40, secs => i), 'c', 'aged', '{}'::jsonb, 1, true
+       FROM generate_series(1, ${aged}) AS i`,
+    );
+    const second = openSecondClient();
+    const secondSql = (second.kind === "drizzle"
+      ? second.client.$client
+      : second.client) as unknown as Sql;
+    try {
+      const sinks = [sql, secondSql].map((client) => {
+        const { log, events } = captureLog();
+        const sink = postgresCallLog({
+          sql: client,
+          table: { schema: s, name: "mcp_calls" },
+          maxBuffered: 10,
+          maxBatch: 10,
+          retention: { keepDays: 30 },
+          clock: manualClock(),
+          log,
+        });
+        return { sink, events };
+      });
+      for (const { sink } of sinks) sink.record(callRecord({ tool: "fresh" }));
+      const counted = () =>
+        sinks.reduce(
+          (n, { events }) => n + events.reduce((m, e) => m + Number(e.fields.deleted ?? 0), 0),
+          0,
+        );
+      await eventually(() => counted() === aged);
+      for (const { sink } of sinks) await sink.idle();
+      const all = sinks.flatMap(({ events }) => events);
+      expect(all.every((e) => e.event === "usage.call_log_pruned")).toBe(true);
+      expect(sinks.reduce((n, { sink }) => n + sink.pruned(), 0)).toBe(aged);
+      const left = await sql.unsafe<{ tool: string; n: number }>(
+        `SELECT tool, count(*)::int AS n FROM "${s}".mcp_calls GROUP BY tool`,
+      );
+      expect(left).toEqual([{ tool: "fresh", n: 2 }]);
+    } finally {
+      await second.close();
+    }
   });
 });
 

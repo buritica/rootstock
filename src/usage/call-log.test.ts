@@ -1,8 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import type { Sql } from "../db/index.ts";
-import { callLogInsert, postgresCallLog, storableJson } from "./call-log.ts";
+import {
+  callLogInsert,
+  callLogPrune,
+  PRUNE_BATCH,
+  PRUNE_EVERY_MS,
+  PRUNE_SOON_MS,
+  PRUNE_STEPS,
+  postgresCallLog,
+  storableJson,
+} from "./call-log.ts";
 import { usageErrorCode } from "./errors.ts";
-import { callRecord, captureLog } from "./fixtures.test-support.ts";
+import { callRecord, captureLog, manualClock } from "./fixtures.test-support.ts";
 
 const TABLE = { schema: "rootstock", name: "mcp_calls" };
 
@@ -67,7 +76,14 @@ describe("postgresCallLog", () => {
   test("a blocked insert does not delay a call: record returns at once and later rows wait their turn", async () => {
     const db = gatedSql();
     const { log } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 10, maxBatch: 10, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      log,
+    });
     sink.record(callRecord({ tool: "slow" }));
     await until(() => db.sent.length === 1);
     // The insert never answers; every further record still returns synchronously.
@@ -93,7 +109,14 @@ describe("postgresCallLog", () => {
   test("calls that finish together share one INSERT, in batches of at most maxBatch", async () => {
     const db = gatedSql();
     const { log } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 100, maxBatch: 3, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 100,
+      maxBatch: 3,
+      log,
+    });
     for (let i = 0; i < 7; i++) sink.record(callRecord({ durationMs: i }));
     await drained(db, sink);
     expect(db.sent.map((s) => s.rows.length)).toEqual([3, 3, 1]);
@@ -103,7 +126,14 @@ describe("postgresCallLog", () => {
   test("overflow is dropped and counted: logged when a streak starts, every 100th, and on recovery", async () => {
     const db = gatedSql();
     const { log, events } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 2, maxBatch: 2, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 2,
+      maxBatch: 2,
+      log,
+    });
     sink.record(callRecord());
     await until(() => db.sent.length === 1); // the writer took the first row: the buffer is empty again
     sink.record(callRecord());
@@ -126,7 +156,14 @@ describe("postgresCallLog", () => {
   test("the row: every column, args never null, no message, no stage, whole milliseconds", async () => {
     const db = gatedSql();
     const { log } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 10, maxBatch: 10, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      log,
+    });
     sink.record(
       callRecord({
         stage: "rejected",
@@ -198,7 +235,14 @@ describe("postgresCallLog", () => {
   test("refused batches: logged when a streak starts and every 100th, counted, and the recovery logged", async () => {
     const db = gatedSql();
     const { log, events } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 300, maxBatch: 1, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 300,
+      maxBatch: 1,
+      log,
+    });
     db.failWith(Object.assign(new Error("relation does not exist: SECRET"), { code: "42P01" }));
     sink.record(callRecord({ tool: "echo" }));
     sink.record(callRecord({ tool: "slow" }));
@@ -242,7 +286,14 @@ describe("postgresCallLog", () => {
   test("a row that cannot serialize is logged and dropped alone", async () => {
     const db = gatedSql();
     const { log, events } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 10, maxBatch: 10, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      log,
+    });
     sink.record(callRecord({ tool: "boom", extra: { n: 1n } }));
     sink.record(callRecord());
     await drained(db, sink);
@@ -258,6 +309,7 @@ describe("postgresCallLog", () => {
   test("every NOT NULL column is coerced: a non-finite duration is 0, a huge one is capped, ok is a boolean", async () => {
     const db = gatedSql();
     const sink = postgresCallLog({
+      retention: null,
       sql: db.sql,
       table: TABLE,
       maxBuffered: 10,
@@ -287,7 +339,14 @@ describe("postgresCallLog", () => {
     const log = () => {
       throw new Error("logger down");
     };
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 1, maxBatch: 1, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 1,
+      maxBatch: 1,
+      log,
+    });
     db.failWith(new Error("refused"));
     sink.record(callRecord({ tool: "first" }));
     expect(() => sink.record(callRecord({ tool: "dropped" }))).not.toThrow(); // full: logs a drop
@@ -303,7 +362,14 @@ describe("postgresCallLog", () => {
   test("the tool name is cut at 200 characters in the row and in the drop log", async () => {
     const db = gatedSql();
     const { log, events } = captureLog();
-    const sink = postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered: 1, maxBatch: 1, log });
+    const sink = postgresCallLog({
+      retention: null,
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 1,
+      maxBatch: 1,
+      log,
+    });
     const long = "t".repeat(500);
     sink.record(callRecord({ tool: long }));
     sink.record(callRecord({ tool: long }));
@@ -315,6 +381,7 @@ describe("postgresCallLog", () => {
   test("idle resolves at once when nothing is buffered", async () => {
     const db = gatedSql();
     const sink = postgresCallLog({
+      retention: null,
       sql: db.sql,
       table: TABLE,
       maxBuffered: 1,
@@ -328,7 +395,14 @@ describe("postgresCallLog", () => {
   test("refuses buffer numbers out of range", () => {
     const db = gatedSql();
     const make = (maxBuffered: number, maxBatch: number) => () =>
-      postgresCallLog({ sql: db.sql, table: TABLE, maxBuffered, maxBatch, log: () => {} });
+      postgresCallLog({
+        retention: null,
+        sql: db.sql,
+        table: TABLE,
+        maxBuffered,
+        maxBatch,
+        log: () => {},
+      });
     for (const [b, n] of [
       [0, 1],
       [1.5, 1],
@@ -357,5 +431,300 @@ describe("storableJson", () => {
     });
     const out = storableJson(text);
     expect(JSON.parse(out)).toEqual({ a: "xy", b: "\\u0000", c: "�", d: "😀", e: "\\" });
+  });
+});
+
+/**
+ * A fake client for retention. Inserts answer with no rows; each prune step
+ * takes the next entry of `steps` (a count, or an error to throw; 0 once
+ * empty). With `gate`, every statement waits until `release()`.
+ */
+function pruneSql(steps: (number | Error)[] = [], gate = false) {
+  const sent: { kind: "insert" | "prune"; params: readonly unknown[] }[] = [];
+  const waiting: (() => void)[] = [];
+  const unsafe = (text: string, params: readonly unknown[] = []) => {
+    const kind = text.startsWith("insert") ? "insert" : "prune";
+    sent.push({ kind, params });
+    const answer = () => {
+      if (kind === "insert") return [];
+      const next = steps.shift() ?? 0;
+      if (next instanceof Error) throw next;
+      return [{ deleted: next }];
+    };
+    if (!gate) return Promise.resolve().then(answer);
+    return new Promise((resolve, reject) => {
+      waiting.push(() => {
+        try {
+          resolve(answer());
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  };
+  const sql = Object.assign(() => Promise.resolve([]), { unsafe }) as unknown as Sql;
+  return {
+    sql,
+    sent,
+    kinds: () => sent.map((x) => x.kind).join(","),
+    prunes: () => sent.filter((x) => x.kind === "prune").length,
+    release: () => {
+      for (const go of waiting.splice(0)) go();
+    },
+  };
+}
+
+const refused = (code: string) => Object.assign(new Error("SECRET-MESSAGE"), { code });
+
+describe("postgresCallLog retention", () => {
+  const make = (db: { sql: Sql }, clock = manualClock(), keepDays = 90, maxBatch = 100) => {
+    const { log, events } = captureLog();
+    const sink = postgresCallLog({
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 100,
+      maxBatch,
+      retention: { keepDays },
+      clock,
+      log,
+    });
+    return { sink, events, clock };
+  };
+  const pruned = (deleted: number, steps: number, more: boolean, stopped = false) => ({
+    event: "usage.call_log_pruned",
+    fields: { deleted, keepDays: 90, steps, ms: 0, more, stopped },
+  });
+
+  test("the prune statement: one bounded batch of the oldest rows past the cutoff, skipping locked rows, counted", () => {
+    expect(callLogPrune(TABLE)).toBe(
+      'with d as (delete from "rootstock"."mcp_calls" where id in (select id from "rootstock"."mcp_calls" where created_at < now() - make_interval(days => $1::int) order by created_at limit $2::int for update skip locked) returning 1) select count(*)::int as deleted from d',
+    );
+    expect(() => callLogPrune({ schema: 'x"; drop', name: "t" })).toThrow(/identifier/);
+  });
+
+  test("the first record prunes after its insert and always logs; not again within the hour; again after it, silent when it deletes nothing", async () => {
+    const db = pruneSql([0, 0, 3]);
+    const { sink, events, clock } = make(db);
+    sink.record(callRecord());
+    await until(() => events.length === 1);
+    await sink.idle();
+    expect(db.kinds()).toBe("insert,prune");
+    expect(db.sent[1]?.params).toEqual([90, PRUNE_BATCH]);
+    expect(events).toEqual([pruned(0, 1, false)]);
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS - 1);
+    sink.record(callRecord());
+    await sink.idle();
+    expect(db.kinds()).toBe("insert,prune,insert");
+    clock.set(clock.monotonic() + 1);
+    sink.record(callRecord());
+    await until(() => db.prunes() === 2);
+    await sink.idle();
+    expect(events.length).toBe(1);
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS);
+    sink.record(callRecord());
+    await until(() => events.length === 2);
+    expect(events[1]).toEqual(pruned(3, 1, false));
+    expect([sink.pruned(), sink.pruneFailures()]).toEqual([3, 0]);
+  });
+
+  test("a full batch takes another step; a pass stops at PRUNE_STEPS and the next is due PRUNE_SOON_MS later", async () => {
+    const db = pruneSql(Array(PRUNE_STEPS + 1).fill(PRUNE_BATCH));
+    const { sink, events, clock } = make(db);
+    sink.record(callRecord());
+    await until(() => events.length === 1);
+    expect(db.prunes()).toBe(PRUNE_STEPS);
+    expect(events).toEqual([pruned(PRUNE_BATCH * PRUNE_STEPS, PRUNE_STEPS, true)]);
+    // Not back to back: a record at once queues nothing.
+    sink.record(callRecord());
+    await sink.idle();
+    expect(db.prunes()).toBe(PRUNE_STEPS);
+    clock.set(clock.monotonic() + PRUNE_SOON_MS);
+    sink.record(callRecord());
+    await until(() => events.length === 2);
+    expect(db.prunes()).toBe(PRUNE_STEPS + 2);
+    expect(events[1]).toEqual(pruned(PRUNE_BATCH, 2, false));
+    expect(sink.pruned()).toBe(PRUNE_BATCH * (PRUNE_STEPS + 1));
+  });
+
+  test("steady traffic cannot starve a pass: one row a statement, inserts and steps take turns", async () => {
+    const db = pruneSql([PRUNE_BATCH, PRUNE_BATCH, PRUNE_BATCH, 0], true);
+    const { sink, events } = make(db);
+    sink.record(callRecord());
+    for (let i = 0; i < 8; i++) {
+      await until(() => db.sent.length === i + 1);
+      sink.record(callRecord());
+      db.release();
+    }
+    expect(db.kinds()).toBe("insert,prune,insert,prune,insert,prune,insert,prune");
+    await until(() => events.length === 1);
+    expect(events).toEqual([pruned(PRUNE_BATCH * 3, 4, false)]);
+  });
+
+  test("between two steps every row buffered during the first is written, not one batch", async () => {
+    const db = pruneSql([PRUNE_BATCH, 0], true);
+    const { sink, events } = make(db, manualClock(), 90, 2);
+    sink.record(callRecord());
+    await until(() => db.sent.length === 1);
+    db.release();
+    await until(() => db.kinds() === "insert,prune");
+    // Five rows land during the step: three batches of at most 2 before the next.
+    for (let i = 0; i < 5; i++) sink.record(callRecord());
+    for (let i = 0; i < 4; i++) {
+      db.release();
+      await until(() => db.sent.length === i + 3);
+    }
+    db.release();
+    expect(db.kinds()).toBe("insert,prune,insert,insert,insert,prune");
+    await until(() => events.length === 1);
+  });
+
+  test("idle drops a pending pass after its step in flight, and writes rows recorded meanwhile", async () => {
+    const db = pruneSql([PRUNE_BATCH, PRUNE_BATCH], true);
+    const { sink, events } = make(db);
+    sink.record(callRecord());
+    await until(() => db.sent.length === 1);
+    db.release();
+    await until(() => db.kinds() === "insert,prune");
+    let done = false;
+    const idle = sink.idle().then(() => {
+      done = true;
+    });
+    sink.record(callRecord());
+    await tick();
+    expect(done).toBe(false);
+    db.release();
+    await until(() => db.sent.length === 3);
+    db.release();
+    await idle;
+    expect(db.kinds()).toBe("insert,prune,insert");
+    expect(events).toEqual([pruned(PRUNE_BATCH, 1, true, true)]);
+  });
+
+  test("a refused step ends its pass with what it deleted and the streak, never throws, and the next pass waits the hour", async () => {
+    const db = pruneSql([PRUNE_BATCH, refused("57014"), refused("57014"), 0]);
+    const { sink, events, clock } = make(db);
+    sink.record(callRecord());
+    await until(() => events.length === 1);
+    expect(events).toEqual([
+      {
+        event: "usage.call_log_prune_failed",
+        fields: {
+          keepDays: 90,
+          deleted: PRUNE_BATCH,
+          steps: 1,
+          errorClass: "57014",
+          failedPasses: 1,
+        },
+      },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("SECRET");
+    sink.record(callRecord());
+    await sink.idle();
+    expect(db.kinds()).toBe("insert,prune,prune,insert");
+    expect([sink.failedBatches(), sink.pruneFailures(), sink.pruned()]).toEqual([
+      0,
+      1,
+      PRUNE_BATCH,
+    ]);
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS - 1);
+    sink.record(callRecord());
+    await sink.idle();
+    expect(db.prunes()).toBe(2);
+    clock.set(clock.monotonic() + 1);
+    sink.record(callRecord());
+    await until(() => events.length === 2);
+    expect(events[1]?.fields.failedPasses).toBe(2);
+    // A pass that ends cleanly resets the streak; it deleted nothing, so it is silent.
+    clock.set(clock.monotonic() + PRUNE_EVERY_MS);
+    sink.record(callRecord());
+    await until(() => db.prunes() === 4);
+    await sink.idle();
+    expect(events.length).toBe(2);
+    expect(sink.pruneFailures()).toBe(2);
+  });
+
+  test("a count the driver does not answer is a refused step, not a silent zero", async () => {
+    const { log, events } = captureLog();
+    const unsafe = async (text: string) => (text.startsWith("insert") ? [] : [{}]);
+    const sql = Object.assign(() => Promise.resolve([]), { unsafe }) as unknown as Sql;
+    const sink = postgresCallLog({
+      sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: { keepDays: 30 },
+      clock: manualClock(),
+      log,
+    });
+    sink.record(callRecord());
+    await until(() => events.length === 1);
+    expect(events[0]?.event).toBe("usage.call_log_prune_failed");
+  });
+
+  test("a throwing clock is logged once, record does not throw, and rows are still written", async () => {
+    const db = pruneSql();
+    const { log, events } = captureLog();
+    const sink = postgresCallLog({
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: { keepDays: 30 },
+      clock: {
+        monotonic: () => {
+          throw refused("clock");
+        },
+      },
+      log,
+    });
+    for (let i = 0; i < 3; i++) expect(sink.record(callRecord())).toBeUndefined();
+    await sink.idle();
+    expect(db.kinds()).toBe("insert");
+    expect(events.map((e) => e.event)).toEqual(["usage.call_log_prune_clock_failed"]);
+  });
+
+  test("retention null never prunes", async () => {
+    const db = pruneSql();
+    const { log } = captureLog();
+    const sink = postgresCallLog({
+      sql: db.sql,
+      table: TABLE,
+      maxBuffered: 10,
+      maxBatch: 10,
+      retention: null,
+      log,
+    });
+    sink.record(callRecord());
+    await sink.idle();
+    expect(db.kinds()).toBe("insert");
+  });
+
+  test("refuses retention out of range or without a clock", () => {
+    const db = pruneSql();
+    const make = (retention: unknown, clock: unknown) => () =>
+      postgresCallLog({
+        sql: db.sql,
+        table: TABLE,
+        maxBuffered: 10,
+        maxBatch: 10,
+        retention: retention as { keepDays: number },
+        clock: clock as ReturnType<typeof manualClock>,
+        log: () => {},
+      });
+    for (const [r, c] of [
+      [{ keepDays: 6 }, manualClock()],
+      [{ keepDays: 3651 }, manualClock()],
+      [{ keepDays: 1.5 }, manualClock()],
+      [{ keepDays: 30 }, undefined],
+      [undefined, manualClock()],
+    ] as const) {
+      let caught: unknown;
+      try {
+        make(r, c)();
+      } catch (err) {
+        caught = err;
+      }
+      expect(usageErrorCode(caught)).toBe("ERR_ROOTSTOCK_USAGE_CONFIG");
+    }
   });
 });

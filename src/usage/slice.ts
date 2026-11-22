@@ -3,6 +3,8 @@ import {
   bounded,
   identifier,
   isRecord,
+  KEEP_DAYS_MAX,
+  KEEP_DAYS_MIN,
   own,
   sliceBrand,
   sliceRefusals,
@@ -19,6 +21,12 @@ export interface UsageSliceInput {
     table?: { schema?: string; name?: string };
     maxBuffered: number;
     maxBatch: number;
+    /**
+     * Rows older than `keepDays` (7 to 3650) are deleted by
+     * `postgresCallLog`'s writer when the app passes this to it; null keeps
+     * every row. Required, so each consumer decides.
+     */
+    retention: { keepDays: number } | null;
   } | null;
   /** Keep each call's arguments in its record. */
   keepArgs: boolean;
@@ -39,6 +47,7 @@ export interface UsageSlice {
     readonly table: { readonly schema: string; readonly name: string };
     readonly maxBuffered: number;
     readonly maxBatch: number;
+    readonly retention: { readonly keepDays: number } | null;
   } | null;
   readonly keepArgs: boolean;
   readonly keepOutput: boolean;
@@ -52,7 +61,14 @@ export interface UsageSlice {
 const PARSER = "usageSlice";
 const REQUIRED = ["callLog", "keepArgs", "keepOutput", "spend"] as const;
 const KEYS: ReadonlySet<string> = new Set(REQUIRED);
-const CALL_LOG_KEYS: ReadonlySet<string> = new Set(["table", "maxBuffered", "maxBatch"]);
+const CALL_LOG_KEYS: ReadonlySet<string> = new Set([
+  "table",
+  "maxBuffered",
+  "maxBatch",
+  "retention",
+]);
+const RETENTION_KEYS: ReadonlySet<string> = new Set(["keepDays"]);
+
 const SPEND_KEYS: ReadonlySet<string> = new Set(["unit", "ceiling", "store"]);
 const ROOTSTOCK_STORE_KEYS: ReadonlySet<string> = new Set(["kind", "schema"]);
 const DAY_USER_FIELDS = ["schema", "table", "day", "user", "used"] as const;
@@ -72,7 +88,7 @@ function parseCallLog(raw: unknown, schema: string): UsageSlice["callLog"] {
   if (raw === null) return null;
   const c = refuse.record("callLog", raw);
   refuse.refuseUnknownKeys(c, CALL_LOG_KEYS, "callLog.");
-  for (const k of ["maxBuffered", "maxBatch"] as const) {
+  for (const k of ["maxBuffered", "maxBatch", "retention"] as const) {
     if (own(c, k) === undefined) throw refuse.required(`callLog.${k}`);
   }
   const table = tableRef(refuse, own(c, "table"), "callLog.", schema, "mcp_calls");
@@ -84,7 +100,28 @@ function parseCallLog(raw: unknown, schema: string): UsageSlice["callLog"] {
     MAX_BUFFERED,
   );
   const maxBatch = bounded(refuse, "callLog.maxBatch", own(c, "maxBatch"), 1, maxBuffered);
-  return Object.freeze({ table, maxBuffered, maxBatch });
+  return Object.freeze({
+    table,
+    maxBuffered,
+    maxBatch,
+    retention: parseRetention(own(c, "retention")),
+  });
+}
+
+function parseRetention(raw: unknown): NonNullable<UsageSlice["callLog"]>["retention"] {
+  if (raw === null) return null;
+  const r = refuse.record("callLog.retention", raw);
+  refuse.refuseUnknownKeys(r, RETENTION_KEYS, "callLog.retention.");
+  if (own(r, "keepDays") === undefined) throw refuse.required("callLog.retention.keepDays");
+  return Object.freeze({
+    keepDays: bounded(
+      refuse,
+      "callLog.retention.keepDays",
+      own(r, "keepDays"),
+      KEEP_DAYS_MIN,
+      KEEP_DAYS_MAX,
+    ),
+  });
 }
 
 function parseStore(raw: unknown, schema: string): NonNullable<UsageSlice["spend"]>["store"] {

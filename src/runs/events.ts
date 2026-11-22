@@ -57,7 +57,12 @@ export type RunsEvent =
       lockName: string;
       settled: number;
     }
-  | ({ type: "runs.record_failed"; id: string; job: string; operation: "finish" | "discard" } & Err)
+  | ({
+      type: "runs.record_failed";
+      id: string;
+      job: string;
+      operation: "finish" | "discard" | "override";
+    } & Err)
   | ({
       type: "runs.record_failed";
       job: string;

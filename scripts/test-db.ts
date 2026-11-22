@@ -1,4 +1,5 @@
 import { hostname } from "node:os";
+import { parseArgs } from "node:util";
 import { SQL } from "bun";
 import {
   HYPOTHESES_ENV,
@@ -91,6 +92,43 @@ export function suitesFor(kind: string, suites: readonly Suite[], hypotheses: bo
 }
 
 const ROOT = `${import.meta.dir}/..`;
+
+/**
+ * The slice of the matrix this run covers. With no flags it is the whole
+ * matrix; CI passes one `--image` (the tag, e.g. `pg17`) and one
+ * `--transactor` per job so the runs go in parallel. `--hypotheses` narrows the
+ * kinds to {@link HYPOTHESIS_TRANSACTORS}. An unknown value throws rather than
+ * selecting nothing, so a typo can never pass as an empty run.
+ */
+export function selectMatrix(args: string[]): {
+  images: string[];
+  transactors: string[];
+  hypotheses: boolean;
+} {
+  const { values } = parseArgs({
+    args,
+    options: {
+      image: { type: "string" },
+      transactor: { type: "string" },
+      hypotheses: { type: "boolean", default: false },
+    },
+    strict: true,
+  });
+  const hypotheses = values.hypotheses === true;
+  const tag = (image: string): string => image.split("@")[0]?.split(":").at(-1) ?? image;
+  const images =
+    values.image === undefined ? [...IMAGES] : IMAGES.filter((i) => tag(i) === values.image);
+  if (images.length === 0) {
+    throw new Error(`--image must be one of ${IMAGES.map(tag).join(", ")}, got ${values.image}`);
+  }
+  const kinds: readonly string[] = hypotheses ? HYPOTHESIS_TRANSACTORS : TRANSACTORS;
+  const transactors =
+    values.transactor === undefined ? [...kinds] : kinds.filter((k) => k === values.transactor);
+  if (transactors.length === 0) {
+    throw new Error(`--transactor must be one of ${kinds.join(", ")}, got ${values.transactor}`);
+  }
+  return { images, transactors, hypotheses };
+}
 
 function out(text: string): void {
   process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
@@ -283,6 +321,14 @@ async function databaseFor(url: string, kind: string): Promise<string> {
 async function main(): Promise<number> {
   process.on("SIGINT", () => onSignal("SIGINT", 130));
   process.on("SIGTERM", () => onSignal("SIGTERM", 143));
+  let matrix: ReturnType<typeof selectMatrix>;
+  try {
+    matrix = selectMatrix(Bun.argv.slice(2));
+  } catch (err) {
+    out(`test:db: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+  const { hypotheses } = matrix;
   const problem = await dockerProblem();
   if (problem !== null) {
     out(
@@ -290,7 +336,6 @@ async function main(): Promise<number> {
     );
     return 1;
   }
-  const hypotheses = process.argv.includes("--hypotheses");
   const all = await suitesUnder(ROOT);
   if (all.length === 0) {
     out("test:db: no src/**/*.pg.ts suite found — refusing to pass empty");
@@ -301,10 +346,10 @@ async function main(): Promise<number> {
     out(`test:db: suite markers disagree with their code:\n  ${problems.join("\n  ")}`);
     return 1;
   }
-  const kinds: readonly string[] = hypotheses ? HYPOTHESIS_TRANSACTORS : TRANSACTORS;
+  const kinds = matrix.transactors;
   out(`test:db: Bun ${Bun.version}${hypotheses ? ", hypotheses" : ""}, kinds: ${kinds.join(" ")}`);
   const failures: string[] = [];
-  for (const image of IMAGES) {
+  for (const image of matrix.images) {
     const name = image.split("@")[0];
     out(`\ntest:db: starting ${image}`);
     let pg: ThrowawayPostgres;
@@ -342,7 +387,7 @@ async function main(): Promise<number> {
     out(`\ntest:db: FAILED\n${failures.map((f) => `  ${f}`).join("\n")}`);
     return 1;
   }
-  out(`\ntest:db: ${IMAGES.length * kinds.length} runs passed`);
+  out(`\ntest:db: ${matrix.images.length * kinds.length} runs passed`);
   return 0;
 }
 

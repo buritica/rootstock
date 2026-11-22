@@ -133,6 +133,58 @@ export interface PullArgs<R extends PullRef, D extends PullDoc, N> {
   /** The quarantine reason for a fetched doc carrying another id; default rootstock's text. */
   mismatchReason?: (asked: string, got: unknown) => string;
   afterRun?: (row: RunRow) => void | Promise<void>;
+  /**
+   * Work that belongs to the run and needs its listing to be over, such as
+   * retracting what the source no longer lists. Called once, after every
+   * batch committed and the buckets balance, with the lock gated just before,
+   * while the row is still running: what it records (an override, a counter,
+   * tokens) lands on this run's row. Not called on a failed run. Called on an
+   * empty listing too, and on an incremental run whose listing started from a
+   * cursor: only the source knows whether its listing covered everything, so
+   * a hook that removes what was not listed checks that itself. The hook
+   * bounds its own time: one that never resolves keeps the row running and
+   * the lock held, and so does a gate or override it started and never
+   * awaited (they settle before the run does). A throw settles the run
+   * failed (`before-settle`), a refused `ctx.ensureExclusive()` settles it
+   * `lost-lock`; neither is rethrown. The gate before the hook does not fence
+   * the hook's own writes: see `ensureExclusive`.
+   */
+  beforeSettle?: (ctx: BeforeSettleContext) => void | Promise<void>;
+}
+
+/** What `beforeSettle` may read and record. Its calls refuse once the hook has returned. */
+export interface BeforeSettleContext {
+  readonly job: string;
+  readonly mode: string;
+  readonly runId: string;
+  /** True on a backfill: the listing covered a window, not the whole source. */
+  readonly backfill: boolean;
+  /** The run's buckets and counters as they will be settled: a frozen copy. */
+  readonly counts: Readonly<PullCounts>;
+  /**
+   * Records an override flag and writes it to the running row at once
+   * (`Run.recordOverride`), so a run killed mid-hook still shows it. Await it
+   * before the act the flag allows. Rejects on a bad flag, a database error,
+   * or a row no longer running: then do not act. A rejected override fails
+   * the run (`before-settle`) even when the hook catches it or never awaits it.
+   */
+  override(flag: string): Promise<void>;
+  /**
+   * Adds n (default 1) to a counter on the run row (`Run.count`). Unlike a
+   * load's `ctx.count`, a bad name or n throws, and so do the runner's own
+   * counters (`fetched`, `repointed`): what the hook records is the reason it
+   * exists.
+   */
+  count(name: string, n?: number): void;
+  /** Adds tokens for a model to the run row (`Run.meter`). A bad call throws. */
+  meter(model: string, input: number, output: number, opts?: { estimated?: boolean }): void;
+  /**
+   * The lock's gate. A refusal settles the run `lost-lock`, even when the hook
+   * catches it or never awaits it. The gate before the hook does not fence
+   * the hook's own writes: call this inside the hook's transaction, just
+   * before it commits, as the runner does for a batch.
+   */
+  ensureExclusive(): Promise<void>;
 }
 
 export type PullFailure =
@@ -143,6 +195,8 @@ export type PullFailure =
   | { kind: "quota"; count: number; externalId: string }
   | { kind: "cursor"; error: unknown }
   | { kind: "threw"; error: unknown }
+  /** `beforeSettle` threw (a lock refused at its `ensureExclusive` is `lost-lock`). */
+  | { kind: "before-settle"; error: unknown }
   /** Settled with no failure of the runner's own but the buckets do not balance; `runs` writes the reason. */
   | { kind: "identity" };
 
@@ -364,6 +418,16 @@ export type RunnerEvent =
       runId: string;
       call: "account" | "count" | "meter";
       error: unknown;
+    }
+  | { type: "runner.before_settle_started"; job: string; runId: string }
+  | {
+      type: "runner.before_settle_finished";
+      job: string;
+      runId: string;
+      outcome: "ok" | "before-settle" | "lost-lock";
+      ms: number;
+      /** What the hook threw, also when the lock's refusal decided the outcome. */
+      error?: unknown;
     }
   | {
       type: "runner.pull_finished";
