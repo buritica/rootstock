@@ -21,7 +21,7 @@ on:
         description: "Bun version for this job"
         required: false
         # Matches the Bun that writes bun.lock (lockfile v2 needs >= 1.4).
-        default: "1.4.2"
+        default: "1.4.4"
         type: string
 
 permissions:

@@ -796,8 +796,12 @@ describe("kill points (O10): each re-run converges", () => {
     );
     // A dead connection surfaces from the transaction itself; the stand-in's
     // division by zero (see dying()) from the file, which names itself.
+    // Bun.SQL up to 1.4.2 reports the closed socket; 1.4.4 reports the
+    // server's own FATAL (57P01) that closed it.
     if (main.transactor.id === "bun-sql") {
-      expect((err as Error).message).toContain("Connection closed");
+      expect((err as Error).message).toMatch(
+        /Connection closed|terminating connection due to administrator command/,
+      );
     } else {
       expect((err as Error).message).toStartWith("rootstock migrate: app/0001_b failed");
       expect(pgCode(err)).toBe("22012");
